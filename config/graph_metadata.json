@@ -149,7 +149,8 @@
       "p90_mAOD": 3.018,
       "amax_med": 3.748,
       "is_reservoir": 0,
-      "is_tidal": 0
+      "is_tidal": 0,
+      "has_discharge": false
     },
     {
       "ref": "19112",
@@ -318,6 +319,7 @@
       "amax_med": 61.335,
       "is_reservoir": 1,
       "is_tidal": 0,
+      "has_discharge": false,
       "datum_note": "Converted from Poolbeg to OSGM15 (Malin Head) using offset -2.7m. Original Poolbeg values: gauge_datum=2.7, p75=63.4, p90=63.64, amax_med=64.035."
     },
     {
@@ -333,6 +335,7 @@
       "amax_med": 46.175,
       "is_reservoir": 1,
       "is_tidal": 0,
+      "has_discharge": false,
       "datum_note": "Converted from Poolbeg to OSGM15 (Malin Head) using offset -2.7m. Original Poolbeg values: gauge_datum=2.7, p75=47.82, p90=48.24, amax_med=48.875."
     },
     {
@@ -375,7 +378,8 @@
       "p90_mAOD": 1.652,
       "amax_med": 2.67,
       "is_reservoir": 0,
-      "is_tidal": 0
+      "is_tidal": 0,
+      "has_discharge": false
     },
     {
       "ref": "19164",
@@ -389,7 +393,8 @@
       "p90_mAOD": null,
       "amax_med": null,
       "is_reservoir": 0,
-      "is_tidal": 1
+      "is_tidal": 1,
+      "has_discharge": false
     },
     {
       "ref": "19163",
@@ -403,7 +408,8 @@
       "p90_mAOD": null,
       "amax_med": null,
       "is_reservoir": 0,
-      "is_tidal": 1
+      "is_tidal": 1,
+      "has_discharge": false
     },
     {
       "ref": "19161",
@@ -417,7 +423,8 @@
       "p90_mAOD": null,
       "amax_med": null,
       "is_reservoir": 0,
-      "is_tidal": 1
+      "is_tidal": 1,
+      "has_discharge": false
     },
     {
       "ref": "19160",
@@ -431,7 +438,8 @@
       "p90_mAOD": null,
       "amax_med": null,
       "is_reservoir": 0,
-      "is_tidal": 1
+      "is_tidal": 1,
+      "has_discharge": false
     }
   ],
   "edges": [
