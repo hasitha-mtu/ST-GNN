@@ -14,11 +14,11 @@ from shapely.ops import linemerge
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).resolve().parent.parent.parent
-STATIONS_CSV   = BASE_DIR / "ST-GNN/data/metadata/waterlevel_stations.csv"
+STATIONS_CSV   = BASE_DIR / "ST-GNN/dataset/metadata/waterlevel_stations.csv"
 RIVER_SHP      = Path("/shapefiles/network/RiverNetwork/RiverNetwork.shp")
 CATCHMENT_SHP  = Path("/shapefiles/RiverLee/RiverLee.shp")
 LAKE_SHP       = Path("/shapefiles/lakes/LeeLakes/LeeLakes.shp")
-OUT_DIR        = BASE_DIR / "data/graph"
+OUT_DIR        = BASE_DIR / "dataset/graph"
 
 # ── Constants ──────────────────────────────────────────────────────────────
 DROPPED_REFS   = [19115]          # decommissioned / <50 % complete

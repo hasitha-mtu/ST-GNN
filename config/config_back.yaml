@@ -47,7 +47,7 @@ rainfall_stations: &all_rain
 # Excluded: 19069 (Sea), 19160/19161/19163 (tidal/no-threshold), 19164 (tidal)
 # Sorted upstream -> downstream by catchment area (km2)
 #
-# Per-station flood thresholds (mAOD) extracted from OPW percentile data:
+# Per-station flood thresholds (mAOD) extracted from OPW percentile dataset:
 #   p75_mAOD  — level exceeded 25% of time (elevated)
 #   p90_mAOD  — level exceeded 10% of time (high)
 #   amax_med  — median annual maximum (flood warning reference)
@@ -378,10 +378,10 @@ subsets:
 
 # -- Output --------------------------------------------------------------------
 output:
-  raw_rainfall_dir:    "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/rainfall"
-  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/water_level"
-  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/metadata"
-  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/processed"
+  raw_rainfall_dir:    "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/raw/rainfall"
+  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/raw/water_level"
+  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/metadata"
+  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/processed"
 
 # -- Logging -------------------------------------------------------------------
 logging:

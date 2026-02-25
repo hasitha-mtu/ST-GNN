@@ -12,7 +12,7 @@
 #   OPW publishes. Normalise before using as a GNN node feature.
 #
 # THRESHOLD VALUES (p75_mAOD, p90_mAOD, amax_med, amax_high)
-#   *** PLACEHOLDERS — must be recomputed from downloaded data ***
+#   *** PLACEHOLDERS — must be recomputed from downloaded dataset ***
 #   These are computed per-station from the 15-min timeseries as:
 #     p75_mAOD  = 75th percentile of all readings (proxy for elevated level)
 #     p90_mAOD  = 90th percentile               (proxy for high level)
@@ -20,7 +20,7 @@
 #     amax_high = maximum of yearly maxima       (extreme event reference)
 #   Run: python compute_thresholds.py  after downloading the full Lee dataset.
 #   The placeholder values below are approximate and should NOT be used for
-#   loss-function weighting until recomputed from real data.
+#   loss-function weighting until recomputed from real dataset.
 
 # =============================================================================
 
@@ -55,7 +55,7 @@ quality:
 excluded_stations:
   - ref: "19115"
     name: "Killamucky"
-    reason: "34.9% data completeness — decommissioned"
+    reason: "34.9% dataset completeness — decommissioned"
   - ref: "19069"
     name: "Ringaskiddy NMCI"
     reason: "Tidal/Sea — outside Lee catchment"
@@ -73,7 +73,7 @@ rainfall_stations: &all_rain
 # ==============================================================================
 # Water level stations — sorted upstream → downstream by catchment area
 # gauge_datum: from wl_info.txt (authoritative OPW values, Feb 2026)
-# p75/p90/amax: PLACEHOLDERS — recompute from downloaded data
+# p75/p90/amax: PLACEHOLDERS — recompute from downloaded dataset
 # ==============================================================================
 
 subsets:
@@ -535,11 +535,11 @@ subsets:
 
 # -- Output --------------------------------------------------------------------
 output:
-  raw_rainfall_dir:    "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/rainfall"
-  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/water_level"
-  raw_discharge_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/discharge"
-  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/metadata"
-  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/processed"
+  raw_rainfall_dir:    "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/raw/rainfall"
+  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/raw/water_level"
+  raw_discharge_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/raw/discharge"
+  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/metadata"
+  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/dataset/processed"
 
 # -- Logging -------------------------------------------------------------------
 logging:

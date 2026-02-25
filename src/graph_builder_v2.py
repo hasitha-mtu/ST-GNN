@@ -41,12 +41,12 @@ logger = logging.getLogger(__name__)
 
 # ── Paths  (adjust to your local layout) ──────────────────────────────────
 BASE_DIR      = Path(__file__).resolve().parent
-META_JSON     = BASE_DIR / "data/graph/graph_metadata.json"   # authoritative topology
-STATIONS_CSV  = BASE_DIR / "data/metadata/waterlevel_stations.csv"
-DISCHARGE_DIR = BASE_DIR / "data/raw/discharge"               # to detect has_discharge
-OUT_DIR       = BASE_DIR / "data/graph"
+META_JSON     = BASE_DIR / "dataset/graph/graph_metadata.json"   # authoritative topology
+STATIONS_CSV  = BASE_DIR / "dataset/metadata/waterlevel_stations.csv"
+DISCHARGE_DIR = BASE_DIR / "dataset/raw/discharge"               # to detect has_discharge
+OUT_DIR       = BASE_DIR / "dataset/graph"
 
-# ── Station refs that have Q data (20 non-tidal + none of the 4 level-only) ──
+# ── Station refs that have Q dataset (20 non-tidal + none of the 4 level-only) ──
 # Derived from wl_info_formatted.csv station_type == "Level & Flow"
 # or "Level & Historic Flow". Checked once; hard-coded here for reproducibility.
 HAS_DISCHARGE = {

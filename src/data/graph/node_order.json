@@ -1,0 +1,47 @@
+{
+  "node_refs": [
+    "19056",
+    "19057",
+    "19058",
+    "19059",
+    "19045",
+    "19110",
+    "19114",
+    "19113",
+    "19112",
+    "19054",
+    "19111",
+    "19055",
+    "19104",
+    "19107",
+    "19108",
+    "19103",
+    "19106",
+    "19105",
+    "19101",
+    "19095",
+    "19094",
+    "19109",
+    "19102",
+    "19162",
+    "19164",
+    "19163",
+    "19161",
+    "19160"
+  ],
+  "node_feature_names": [
+    "log_catchment_area_km2",
+    "gauge_datum_mOSGM15",
+    "p90_mAOD",
+    "amax_med_mAOD",
+    "is_reservoir",
+    "is_tidal",
+    "has_discharge"
+  ],
+  "edge_feature_names": [
+    "river_dist_km",
+    "area_ratio",
+    "elev_drop_m",
+    "same_tributary"
+  ]
+}
