@@ -1,0 +1,547 @@
+# =============================================================================
+# Flood Forecast Data Downloader Configuration
+# OPW - waterlevel.ie  (ZIP bulk download format)
+# Lee Catchment, South Western RBD, Ireland
+# =============================================================================
+#
+# DATUM NOTE — gauge_datum values
+#   All stations use Malin Head OSGM15 EXCEPT:
+#     19094 Inniscarra Headrace   — reports in mAOD Poolbeg
+#     19095 Carrigadrohid Headrace— reports in mAOD Poolbeg
+#   Poolbeg ≈ OSGM15 − 2.7 m (approx); the datum field below reflects what
+#   OPW publishes. Normalise before using as a GNN node feature.
+#
+# THRESHOLD VALUES (p75_mAOD, p90_mAOD, amax_med, amax_high)
+#   *** PLACEHOLDERS — must be recomputed from downloaded data ***
+#   These are computed per-station from the 15-min timeseries as:
+#     p75_mAOD  = 75th percentile of all readings (proxy for elevated level)
+#     p90_mAOD  = 90th percentile               (proxy for high level)
+#     amax_med  = median of yearly maxima        (flood reference)
+#     amax_high = maximum of yearly maxima       (extreme event reference)
+#   Run: python compute_thresholds.py  after downloading the full Lee dataset.
+#   The placeholder values below are approximate and should NOT be used for
+#   loss-function weighting until recomputed from real data.
+
+# =============================================================================
+
+# -- API Settings --------------------------------------------------------------
+api:
+  base_url: "https://waterlevel.ie"
+  waterlevel_zip_url: "https://waterlevel.ie/hydro-data/data/internet/stations/0/{station_no}/S/Waterlevel_complete.zip"
+  rainfall_zip_url:   "https://waterlevel.ie/hydro-data/data/internet/stations/0/{station_no}/Precip/Rainfall_complete.zip"
+  discharge_zip_url:   "https://waterlevel.ie/hydro-data/data/internet/stations/0/{station_no}/Q/Discharge_complete.zip"
+  zip_entry_name: "tsvalues.csv"
+  timeout: 120
+  max_retries: 3
+  retry_backoff: 2.0
+  rate_limit_delay: 1.0
+
+# -- Processing ----------------------------------------------------------------
+processing:
+  resample_freq: "15min"
+  hourly_freq: "h"
+
+# -- Data Quality --------------------------------------------------------------
+quality:
+  good_quality_code: 254
+  max_gap_hours: 6
+  min_record_fraction: 0.7
+  water_level_range: [0, 125]   # mAOD; covers full catchment range
+  discharge_range: [0, 175]   # mAOD; covers full catchment range
+  rainfall_range: [0, 100]      # mm per 15-min interval
+
+# -- Excluded stations ---------------------------------------------------------
+# These stations are present in the OPW network but excluded from modelling:
+excluded_stations:
+  - ref: "19115"
+    name: "Killamucky"
+    reason: "34.9% data completeness — decommissioned"
+  - ref: "19069"
+    name: "Ringaskiddy NMCI"
+    reason: "Tidal/Sea — outside Lee catchment"
+
+# -- Active subset -------------------------------------------------------------
+active_subset: "lee_full"
+
+# -- Rainfall stations ---------------------------------------------------------
+rainfall_stations: &all_rain
+  - {ref: "81901", name: "Crookstown",       lat: 51.8900, lon: -8.7900}   # PLACEHOLDER lat/lon
+  - {ref: "81902", name: "Rain Gauge 81902", lat: 51.9000, lon: -8.9000}   # PLACEHOLDER lat/lon
+  - {ref: "81903", name: "Ballingeary",      lat: 51.856816, lon: -9.233312}
+  - {ref: "81904", name: "Rain Gauge 81904", lat: 51.9200, lon: -8.6000}   # PLACEHOLDER lat/lon
+
+# ==============================================================================
+# Water level stations — sorted upstream → downstream by catchment area
+# gauge_datum: from wl_info.txt (authoritative OPW values, Feb 2026)
+# p75/p90/amax: PLACEHOLDERS — recompute from downloaded data
+# ==============================================================================
+
+subsets:
+
+  lee_full:
+    description: "Full Lee catchment — 30 active stations + 4 rain gauges"
+    water_level_stations:
+
+      # ── Glen / Northside Cork city ─────────────────────────────────────
+      - ref: "19056"
+        name: "Ballincolly"
+        water_body: "Glen Tributary"
+        catchment_area_km2: 3.65
+        lat: 51.92285
+        lon: -8.45611
+        gauge_datum: 55.603       # Malin Head OSGM15
+
+      - ref: "19059"
+        name: "Glennamought Bridge"
+        water_body: "Glen Tributary"
+        catchment_area_km2: 17.41
+        lat: 51.929203
+        lon: -8.477429
+        gauge_datum: 40.650       # Malin Head OSGM15
+
+      - ref: "19057"
+        name: "Glen Park"
+        water_body: "GLEN"
+        catchment_area_km2: 7.85
+        lat: 51.91294
+        lon: -8.45212
+        gauge_datum: 35.840       # Malin Head OSGM15
+
+      # ── Bride (Cork) — urban northside ────────────────────────────────
+      - ref: "19058"
+        name: "Blackpool Retail Park"
+        water_body: "Bride (Cork)"
+        catchment_area_km2: 10.76
+        lat: 51.91658
+        lon: -8.47343
+        gauge_datum: 10.508       # Malin Head OSGM15
+
+      # ── BLARNEY / Shournagh ───────────────────────────────────────────
+      - ref: "19045"
+        name: "Gothic Bridge"
+        water_body: "BLARNEY"
+        catchment_area_km2: 22.40
+        lat: 51.92805667
+        lon: -8.558214444
+        gauge_datum: 27.861       # Malin Head OSGM15
+
+      - ref: "19108"
+        name: "Bawnafinny Bridge"
+        water_body: "BLARNEY"
+        catchment_area_km2: 88.50
+        lat: 51.93005
+        lon: -8.58539
+        gauge_datum: 24.234       # Malin Head OSGM15
+
+      - ref: "19105"
+        name: "Muskerry"
+        water_body: "Shournagh"
+        catchment_area_km2: 209.13
+        lat: 51.914717
+        lon: -8.60186
+        gauge_datum: 16.168       # Malin Head OSGM15
+
+      # ── MARTIN ────────────────────────────────────────────────────────
+      - ref: "19044"
+        name: "Kilmona Bridge"
+        water_body: "MARTIN"
+        catchment_area_km2: 39.59
+        lat: 51.98953389
+        lon: -8.5885725
+        gauge_datum: 74.168       # Malin Head OSGM15
+
+      # ── Curragheen ────────────────────────────────────────────────────
+      - ref: "19114"
+        name: "Carrigrohane Bridge"
+        water_body: "Curragheen"
+        catchment_area_km2: 46.40
+        lat: 51.889797
+        lon: -8.540992
+        gauge_datum: 3.697        # Malin Head OSGM15
+
+      - ref: "19113"
+        name: "County Hall"
+        water_body: "Curragheen"
+        catchment_area_km2: 47.62
+        lat: 51.892643
+        lon: -8.509638
+        gauge_datum: 0.886        # Malin Head OSGM15
+
+      # ── TOON ──────────────────────────────────────────────────────────
+      - ref: "19110"
+        name: "Cooleen Bridge"
+        water_body: "TOON"
+        catchment_area_km2: 29.97
+        lat: 51.871
+        lon: -9.07412
+        gauge_datum: 67.784       # Malin Head OSGM15
+
+      # ── Bride (Cork) — county Bride ───────────────────────────────────
+      - ref: "19112"
+        name: "Coolmuckey Br"
+        water_body: "Bride (Cork)"
+        catchment_area_km2: 70.21
+        lat: 51.86084
+        lon: -8.783723
+        gauge_datum: 42.847       # Malin Head OSGM15
+
+      - ref: "19103"
+        name: "Ovens Bridge"
+        water_body: "Bride (Cork)"
+        catchment_area_km2: 117.82
+        lat: 51.880537
+        lon: -8.654934
+        gauge_datum: 20.973       # Malin Head OSGM15  [note: SOUTH EASTERN RBD in OPW]
+
+      # ── Sullane ───────────────────────────────────────────────────────
+      - ref: "19054"
+        name: "Ballyvourney"
+        water_body: "Sullane"
+        catchment_area_km2: 71.59
+        lat: 51.93931
+        lon: -9.16104
+        gauge_datum: 116.823      # Malin Head OSGM15
+
+      - ref: "19055"
+        name: "Ballymakera"
+        water_body: "Sullane"
+        catchment_area_km2: 75.24
+        lat: 51.934472
+        lon: -9.146258
+        gauge_datum: 111.938      # Malin Head OSGM15
+
+      - ref: "19101"
+        name: "Macroom Town Bridge"
+        water_body: "Sullane"
+        catchment_area_km2: 211.01
+        lat: 51.906031
+        lon: -8.962501
+        gauge_datum: 64.668       # Malin Head OSGM15
+
+      # ── Foherish ──────────────────────────────────────────────────────
+      - ref: "19111"
+        name: "Killaclug"
+        water_body: "Foherish"
+        catchment_area_km2: 74.83
+        lat: 51.911624
+        lon: -9.02315
+        gauge_datum: 77.182       # Malin Head OSGM15
+
+      # ── Laney ─────────────────────────────────────────────────────────
+      - ref: "19104"
+        name: "Morris's Bridge"
+        water_body: "Laney"
+        catchment_area_km2: 82.11
+        lat: 51.92933
+        lon: -8.93616
+        gauge_datum: 100.547      # Malin Head OSGM15
+
+      # ── Dripsey ───────────────────────────────────────────────────────
+      - ref: "19107"
+        name: "Dripsey Bridge"
+        water_body: "Dripsey"
+        catchment_area_km2: 82.17
+        lat: 51.915989
+        lon: -8.746053
+        gauge_datum: 46.401       # Malin Head OSGM15
+
+      # ── Kilta ───────────────────────────────────────────────────────
+      - ref: "19115"
+        name: "Killamucky"
+        water_body: "Kilta"
+        catchment_area_km2: 21.09
+        lat: 51.929182
+        lon: -8.05982899
+        gauge_datum: 16.079       # Malin Head OSGM15
+
+      # ── LEE main stem ─────────────────────────────────────────────────
+      - ref: "19106"
+        name: "Cooldaniel"
+        water_body: "LEE"
+        catchment_area_km2: 171.54
+        lat: 51.85761
+        lon: -9.02229
+        gauge_datum: 66.257       # Malin Head OSGM15
+
+      - ref: "19095"
+        name: "Carrigadrohid Headrace"
+        water_body: "LEE"
+        catchment_area_km2: 617.15
+        lat: 51.89700912
+        lon: -8.86418388
+        gauge_datum: 2.700        # Malin Head OSGM15
+
+      - ref: "19094"
+        name: "Inniscarra Headrace"
+        water_body: "LEE"
+        catchment_area_km2: 786.52
+        lat: 51.900141
+        lon: -8.661891
+        gauge_datum: 2.700        # Malin Head OSGM15
+
+      - ref: "19109"
+        name: "Inniscarra Tailrace"
+        water_body: "LEE"
+        catchment_area_km2: 791.14
+        lat: 51.89202
+        lon: -8.63343
+        gauge_datum: 11.343       # Malin Head OSGM15
+
+      # ── Lee tidal reach ───────────────────────────────────────────────
+      - ref: "19160"
+        name: "Currach Club"
+        water_body: "LEE"
+        catchment_area_km2: 0.00
+        lat: 51.901606
+        lon: -8.44391
+        gauge_datum: -2.199        # Malin Head OSGM15
+        station_type: "Tidal"
+
+      - ref: "19161"
+        name: "St. Patrick's Quay (East)"
+        water_body: "LEE"
+        catchment_area_km2: 0.00
+        lat: 51.900174
+        lon: -8.46393
+        gauge_datum: -4.804        # Malin Head OSGM15
+        station_type: "Tidal"
+
+      - ref: "19162"
+        name: "Fitzgerald's Park"
+        water_body: "LEE"
+        catchment_area_km2: 1185.00
+        lat: 51.896472
+        lon: -8.498278
+        gauge_datum: 0.151        # Malin Head OSGM15
+
+      - ref: "19163"
+        name: "Pope's Quay"
+        water_body: "LEE"
+        catchment_area_km2: 0.00
+        lat: 51.900999
+        lon: -8.473513
+        gauge_datum: -2.943        # Malin Head OSGM15
+
+      - ref: "19102"
+        name: "Waterworks Weir"
+        water_body: "LEE"
+        catchment_area_km2: 1185.00
+        lat: 51.893989
+        lon: -8.510053
+        gauge_datum: 2.000        # Malin Head OSGM15
+
+      - ref: "19164"
+        name: "Mercy Hospital"
+        water_body: "LEE"
+        catchment_area_km2: 0.00
+        lat: 51.90005
+        lon: -8.48383
+        gauge_datum: -2.954       # Malin Head OSGM15  (tidal — negative datum)
+        station_type: "Tidal"
+
+    discharge_stations:
+
+      # ── Glen / Northside Cork city ─────────────────────────────────────
+      - ref: "19056"
+        name: "Ballincolly"
+        water_body: "Glen Tributary"
+        catchment_area_km2: 3.65
+        lat: 51.92285
+        lon: -8.45611
+        gauge_datum: 55.603       # Malin Head OSGM15
+
+      - ref: "19059"
+        name: "Glennamought Bridge"
+        water_body: "Glen Tributary"
+        catchment_area_km2: 17.41
+        lat: 51.929203
+        lon: -8.477429
+        gauge_datum: 40.650       # Malin Head OSGM15
+
+      - ref: "19057"
+        name: "Glen Park"
+        water_body: "GLEN"
+        catchment_area_km2: 7.85
+        lat: 51.91294
+        lon: -8.45212
+        gauge_datum: 35.840       # Malin Head OSGM15
+
+      # ── Bride (Cork) — urban northside ────────────────────────────────
+      - ref: "19058"
+        name: "Blackpool Retail Park"
+        water_body: "Bride (Cork)"
+        catchment_area_km2: 10.76
+        lat: 51.91658
+        lon: -8.47343
+        gauge_datum: 10.508       # Malin Head OSGM15
+
+      # ── BLARNEY / Shournagh ───────────────────────────────────────────
+      - ref: "19045"
+        name: "Gothic Bridge"
+        water_body: "BLARNEY"
+        catchment_area_km2: 22.40
+        lat: 51.92805667
+        lon: -8.558214444
+        gauge_datum: 27.861       # Malin Head OSGM15
+
+      - ref: "19108"
+        name: "Bawnafinny Bridge"
+        water_body: "BLARNEY"
+        catchment_area_km2: 88.50
+        lat: 51.93005
+        lon: -8.58539
+        gauge_datum: 24.234       # Malin Head OSGM15
+
+      - ref: "19105"
+        name: "Muskerry"
+        water_body: "Shournagh"
+        catchment_area_km2: 209.13
+        lat: 51.914717
+        lon: -8.60186
+        gauge_datum: 16.168       # Malin Head OSGM15
+
+      # ── MARTIN ────────────────────────────────────────────────────────
+      - ref: "19044"
+        name: "Kilmona Bridge"
+        water_body: "MARTIN"
+        catchment_area_km2: 39.59
+        lat: 51.98953389
+        lon: -8.5885725
+        gauge_datum: 74.168       # Malin Head OSGM15
+
+      # ── Curragheen ────────────────────────────────────────────────────
+      - ref: "19114"
+        name: "Carrigrohane Bridge"
+        water_body: "Curragheen"
+        catchment_area_km2: 46.40
+        lat: 51.889797
+        lon: -8.540992
+        gauge_datum: 3.697        # Malin Head OSGM15
+
+      # ── TOON ──────────────────────────────────────────────────────────
+      - ref: "19110"
+        name: "Cooleen Bridge"
+        water_body: "TOON"
+        catchment_area_km2: 29.97
+        lat: 51.871
+        lon: -9.07412
+        gauge_datum: 67.784       # Malin Head OSGM15
+
+      # ── Bride (Cork) — county Bride ───────────────────────────────────
+      - ref: "19112"
+        name: "Coolmuckey Br"
+        water_body: "Bride (Cork)"
+        catchment_area_km2: 70.21
+        lat: 51.86084
+        lon: -8.783723
+        gauge_datum: 42.847       # Malin Head OSGM15
+
+      - ref: "19103"
+        name: "Ovens Bridge"
+        water_body: "Bride (Cork)"
+        catchment_area_km2: 117.82
+        lat: 51.880537
+        lon: -8.654934
+        gauge_datum: 20.973       # Malin Head OSGM15  [note: SOUTH EASTERN RBD in OPW]
+
+      # ── Sullane ───────────────────────────────────────────────────────
+      - ref: "19054"
+        name: "Ballyvourney"
+        water_body: "Sullane"
+        catchment_area_km2: 71.59
+        lat: 51.93931
+        lon: -9.16104
+        gauge_datum: 116.823      # Malin Head OSGM15
+
+      - ref: "19055"
+        name: "Ballymakera"
+        water_body: "Sullane"
+        catchment_area_km2: 75.24
+        lat: 51.934472
+        lon: -9.146258
+        gauge_datum: 111.938      # Malin Head OSGM15
+
+      - ref: "19101"
+        name: "Macroom Town Bridge"
+        water_body: "Sullane"
+        catchment_area_km2: 211.01
+        lat: 51.906031
+        lon: -8.962501
+        gauge_datum: 64.668       # Malin Head OSGM15
+
+      # ── Foherish ──────────────────────────────────────────────────────
+      - ref: "19111"
+        name: "Killaclug"
+        water_body: "Foherish"
+        catchment_area_km2: 74.83
+        lat: 51.911624
+        lon: -9.02315
+        gauge_datum: 77.182       # Malin Head OSGM15
+
+      # ── Laney ─────────────────────────────────────────────────────────
+      - ref: "19104"
+        name: "Morris's Bridge"
+        water_body: "Laney"
+        catchment_area_km2: 82.11
+        lat: 51.92933
+        lon: -8.93616
+        gauge_datum: 100.547      # Malin Head OSGM15
+
+      # ── Dripsey ───────────────────────────────────────────────────────
+      - ref: "19107"
+        name: "Dripsey Bridge"
+        water_body: "Dripsey"
+        catchment_area_km2: 82.17
+        lat: 51.915989
+        lon: -8.746053
+        gauge_datum: 46.401       # Malin Head OSGM15
+
+      # ── Kilta ───────────────────────────────────────────────────────
+      - ref: "19115"
+        name: "Killamucky"
+        water_body: "Kilta"
+        catchment_area_km2: 21.09
+        lat: 51.929182
+        lon: -8.05982899
+        gauge_datum: 16.079       # Malin Head OSGM15
+
+      # ── LEE main stem ─────────────────────────────────────────────────
+      - ref: "19106"
+        name: "Cooldaniel"
+        water_body: "LEE"
+        catchment_area_km2: 171.54
+        lat: 51.85761
+        lon: -9.02229
+        gauge_datum: 66.257       # Malin Head OSGM15
+
+      - ref: "19109"
+        name: "Inniscarra Tailrace"
+        water_body: "LEE"
+        catchment_area_km2: 791.14
+        lat: 51.89202
+        lon: -8.63343
+        gauge_datum: 11.343       # Malin Head OSGM15
+
+      # ── Lee tidal reach ───────────────────────────────────────────────
+      - ref: "19102"
+        name: "Waterworks Weir"
+        water_body: "LEE"
+        catchment_area_km2: 1185.00
+        lat: 51.893989
+        lon: -8.510053
+        gauge_datum: 2.000        # Malin Head OSGM15
+
+    rainfall_stations: *all_rain
+
+# -- Output --------------------------------------------------------------------
+output:
+  raw_rainfall_dir:    "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/rainfall"
+  raw_water_level_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/water_level"
+  raw_discharge_dir: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/raw/discharge"
+  metadata_dir:        "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/metadata"
+  processed_dir:       "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/data/processed"
+
+# -- Logging -------------------------------------------------------------------
+logging:
+  level: "INFO"
+  log_file: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/logs/downloader.log"
