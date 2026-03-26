@@ -34,7 +34,7 @@ import math
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
-
+import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 BASE_DIR      = Path(__file__).resolve().parent.parent
 print(BASE_DIR)
 META_JSON     = BASE_DIR / "dataset/graph/graph_metadata.json"   # authoritative topology
-STATIONS_CSV  = BASE_DIR / "dataset/metadata/waterlevel_stations.csv"
 DISCHARGE_DIR = BASE_DIR / "dataset/raw/discharge"               # to detect has_discharge
 OUT_DIR       = BASE_DIR / "dataset/graph"
 
@@ -301,16 +300,29 @@ def build_graph(
 
     # ── 6. Save ───────────────────────────────────────────────────────────
     if save:
-        np.save(OUT_DIR / 'edge_index.npy', edge_index)
-        np.save(OUT_DIR / 'edge_attr.npy',  edge_attr)
-        np.save(OUT_DIR / 'node_attr.npy',  node_attr)
+        # nodes.csv — one row per node, index == node index used in edge_index
+        node_rows = []
+        for i, s in enumerate(stations):
+            row = {'node_idx': i, 'ref': s['ref'], 'name': s['name']}
+            row.update(dict(zip(feature_names, node_attr[i].tolist())))
+            node_rows.append(row)
+        pd.DataFrame(node_rows).to_csv(OUT_DIR / 'nodes.csv', index=False)
 
-        node_order = [s['ref'] for s in stations]
-        with open(OUT_DIR / 'node_order.json', 'w') as f:
-            json.dump({'node_refs': node_order, 'node_feature_names': feature_names,
-                       'edge_feature_names': ['river_dist_km','area_ratio','elev_drop_m','same_tributary']}, f, indent=2)
+        # edges.csv — one row per edge, human-readable src/dst refs alongside indices
+        edge_rows = []
+        node_list = [s['ref'] for s in stations]
+        edge_feature_names = ['river_dist_km', 'area_ratio', 'elev_drop_m', 'same_tributary']
+        for j in range(edge_index.shape[1]):
+            si, di = edge_index[0, j], edge_index[1, j]
+            row = {
+                'src_idx': si, 'src_ref': node_list[si],
+                'dst_idx': di, 'dst_ref': node_list[di],
+            }
+            row.update(dict(zip(edge_feature_names, edge_attr[j].tolist())))
+            edge_rows.append(row)
+        pd.DataFrame(edge_rows).to_csv(OUT_DIR / 'edges.csv', index=False)
 
-        logger.info("  Saved edge_index.npy, edge_attr.npy, node_attr.npy, node_order.json → %s", OUT_DIR)
+        logger.info("  Saved nodes.csv, edges.csv → %s", OUT_DIR)
 
     # ── 7. Plot ───────────────────────────────────────────────────────────
     if plot:
