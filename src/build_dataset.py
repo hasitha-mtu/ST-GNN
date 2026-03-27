@@ -50,8 +50,8 @@ OUT_DIR       = BASE_DIR / "dataset/processed"
 TIMESTEP       = "15min"    # OPW native resolution
 ROLLING_WINDOW = "7D"       # baseline window for stage_anomaly
 GAP_FILL_STEPS = 6          # forward-fill limit (6 × 15 min = 90 min)
-START_DATE     = "2010-01-01"
-END_DATE       = "2024-12-31"
+START_DATE     = "2023-01-01"   # ← was 2010-01-01
+END_DATE       = "2026-03-25"   # ← extend to yesterday
 
 # Dynamic feature names — must match X tensor column order exactly
 DYNAMIC_FEATURES = [
@@ -105,17 +105,24 @@ def _load_csv_series(path: Path, value_hints: list[str], resample_how: str, freq
     df = df.set_index(dt_candidates[0])
     df.index.name = "datetime"
 
-    # ── Quality filter ───────────────────────────────────────────────────
-    # Mask readings flagged as bad before any feature computation.
-    # quality_ok == False means the OPW sensor reported a suspect value.
-    if "quality_ok" in df.columns:
-        bad_mask = df["quality_ok"].astype(str).str.strip().str.lower() == "false"
-        bad_count = bad_mask.sum()
-        if bad_count > 0:
-            logger.debug("    Masking %d bad-quality readings in %s", bad_count, path.name)
-        df.loc[bad_mask, [c for c in df.columns if c != "quality_ok"]] = np.nan
-
     val_col = _find_value_column(df, value_hints)
+    # ── DEBUG ─────────────────────────────────────────────────────────────
+    logger.info("    DEBUG %s: total_rows=%d  val_col=%s  notna_before_filter=%d",
+                path.name, len(df), val_col, df[val_col].notna().sum())
+    # ── Quality filter ───────────────────────────────────────────────────
+    BAD_QUALITY_CODES = {-1, 32, 101}
+
+    if "quality_code" in df.columns:
+        bad_mask = pd.to_numeric(df["quality_code"], errors="coerce").isin(BAD_QUALITY_CODES)
+        df.loc[bad_mask, val_col] = np.nan
+        logger.info("    DEBUG %s: masked=%d  notna_after_filter=%d",
+                    path.name, bad_mask.sum(), df[val_col].notna().sum())
+
+    # ── Check if quality_ok filter is ALSO still active (likely culprit) ──
+    if "quality_ok" in df.columns:
+        logger.warning("    DEBUG %s: quality_ok column present — is it still being filtered?",
+                       path.name)
+
     s = pd.to_numeric(df[val_col], errors="coerce")
     s = s.sort_index()
     s = s[~s.index.duplicated(keep="first")]
@@ -134,10 +141,19 @@ def _load_csv_series(path: Path, value_hints: list[str], resample_how: str, freq
 # ── Individual loaders ─────────────────────────────────────────────────────
 
 def load_water_level(ref: str, freq: str = TIMESTEP) -> pd.Series | None:
-    path = WL_DIR / f"wl_{ref}.csv"          # ← fix prefix
+    path = WL_DIR / f"wl_{ref}.csv"
     s = _load_csv_series(path, ["value", "level", "stage", "wl"], "mean", freq)
     if s is None:
         logger.warning("  No water level file for ref %s", ref)
+        return None
+
+    # ── DEBUG: remove after diagnosis ────────────────────────────────
+    window = s["2023-01-01":"2026-03-25"]
+    total = len(pd.date_range("2023-01-01", "2026-03-25", freq=freq))
+    logger.info("  DEBUG ref=%s  notna=%d / %d  (%.1f%%)",
+                ref, window.notna().sum(), total,
+                window.notna().sum() / total * 100)
+    # ─────────────────────────────────────────────────────────────────
     return s
 
 
@@ -156,27 +172,22 @@ def load_discharge(ref: str, freq: str = TIMESTEP) -> pd.Series | None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def assign_rainfall_to_nodes(nodes_df: pd.DataFrame) -> dict[str, str | None]:
-    """
-    Returns dict: wl_ref (str) → rain_ref (str | None).
-    Falls back gracefully if RAIN_META is missing.
-    """
     if not RAIN_META.exists():
-        logger.warning("rainfall_stations.csv not found — rainfall feature will be 0 for all nodes")
+        logger.warning("rainfall_stations.csv not found — rainfall will be 0 for all nodes")
+        return {str(r): None for r in nodes_df["ref"]}
+
+    if "lat" not in nodes_df.columns or "lon" not in nodes_df.columns:
+        logger.error("nodes.csv is missing lat/lon columns — re-run graph_builder.py first")
         return {str(r): None for r in nodes_df["ref"]}
 
     rain_meta = pd.read_csv(RAIN_META)
-
-    # Expect columns: ref, lat, lon  (adjust if your CSV uses different names)
-    lat_col = _find_value_column(rain_meta, ["lat"])
-    lon_col = _find_value_column(rain_meta, ["lon"])
-    ref_col = _find_value_column(rain_meta, ["ref", "id", "station"])
-
-    rain_meta = rain_meta.rename(columns={lat_col: "lat", lon_col: "lon", ref_col: "ref"})
-
     assignment = {}
+
     for _, row in nodes_df.iterrows():
         wl_ref = str(row["ref"])
-        if "lat" not in nodes_df.columns or pd.isna(row.get("lat")):
+
+        if pd.isna(row["lat"]) or pd.isna(row["lon"]):
+            logger.warning("  Node %s has no coordinates — skipping rainfall assignment", wl_ref)
             assignment[wl_ref] = None
             continue
 
@@ -187,7 +198,7 @@ def assign_rainfall_to_nodes(nodes_df: pd.DataFrame) -> dict[str, str | None]:
         rain_ref    = str(rain_meta.loc[nearest_idx, "ref"])
         dist_km     = dists[nearest_idx]
         assignment[wl_ref] = rain_ref
-        logger.debug("    Node %s → rain gauge %s (%.1f km)", wl_ref, rain_ref, dist_km)
+        logger.info("    Node %s → rain gauge %s (%.1f km)", wl_ref, rain_ref, dist_km)
 
     return assignment
 
@@ -267,30 +278,24 @@ def compute_node_features(
 
 # ── Save CSV helper ────────────────────────────────────────────────────────
 def save_dataset_csv(
-    X:          np.ndarray,
-    y:          np.ndarray,
-    timestamps: pd.DatetimeIndex,
-    node_refs:  list[str],
-    out_dir:    Path,
+    X:           np.ndarray,
+    y:           np.ndarray,
+    valid_mask:  np.ndarray,        # ← add parameter
+    timestamps:  pd.DatetimeIndex,
+    node_refs:   list[str],
+    out_dir:     Path,
 ) -> None:
-    """
-    Save the dynamic dataset as a long-format CSV:
-      timestamp | node_ref | stage_anomaly | normalized_stage | dh_dt | discharge_m3s | rainfall_mm | target_y
-
-    Long format is chosen over wide format because:
-      - Wide format would give 28 × 5 = 140 value columns — unreadable
-      - Long format keeps one clear row per (timestep, node) observation
-      - Easy to filter by node_ref or slice by timestamp in any tool
-    """
-    T, N, F = X.shape
     records = []
 
     for i, ref in enumerate(node_refs):
         df = pd.DataFrame(X[:, i, :], columns=DYNAMIC_FEATURES, index=timestamps)
         df.index.name = "timestamp"
-        df["target_y"]  = y[:, i]
-        df["node_ref"]  = ref
-        df = df.reset_index()[["timestamp", "node_ref"] + DYNAMIC_FEATURES + ["target_y"]]
+        df["target_y"]   = y[:, i]
+        df["valid"]      = valid_mask[:, i].astype(int)   # ← 1=real, 0=imputed
+        df["node_ref"]   = ref
+        df = df.reset_index()[
+            ["timestamp", "node_ref"] + DYNAMIC_FEATURES + ["target_y", "valid"]
+        ]
         records.append(df)
 
     long_df = pd.concat(records, ignore_index=True)
@@ -399,14 +404,7 @@ def build_dataset(
             "rain_gauge_ref":   rain_ref,
         })
 
-    # ── 5. Build target y ────────────────────────────────────────────────
-    # y[t] = stage_anomaly[t+1]  — 1-step ahead (15 min horizon)
-    # Adjust HORIZON here if you want multi-step targets.
-    HORIZON = 1
-    y = np.roll(X[:, :, 0], shift=-HORIZON, axis=0).astype(np.float32)
-    y[-HORIZON:, :] = np.nan   # last HORIZON steps have no future
-
-    # ── 6. Gap imputation ────────────────────────────────────────────────
+    # ── 5. Gap imputation ────────────────────────────────────────────────
     # Short gaps (≤ GAP_FILL_STEPS = 90 min): forward-fill (physically sensible
     # for slowly-varying water levels).  Longer gaps: zero-fill and rely on
     # the coverage flag to mask them during loss computation.
@@ -417,6 +415,13 @@ def build_dataset(
             s = s.ffill(limit=GAP_FILL_STEPS)
             s = s.fillna(0.0)
             X[:, i, f] = s.values
+
+    # ── 6. Build target y ────────────────────────────────────────────────
+     # y[t] = stage_anomaly[t+1]  — 1-step ahead (15 min horizon)
+    # Adjust HORIZON here if you want multi-step targets.
+    HORIZON = 1
+    y = np.roll(X[:, :, 0], shift=-HORIZON, axis=0).astype(np.float32)
+    y[-HORIZON:, :] = np.nan  # last HORIZON steps have no future
 
     # ── 7. Summary stats ─────────────────────────────────────────────────
     nan_pct = np.isnan(y).mean() * 100
@@ -429,26 +434,32 @@ def build_dataset(
     # ── 8. Save ───────────────────────────────────────────────────────────
     node_refs = nodes_df["ref"].astype(str).tolist()
 
+    valid_mask = np.zeros((T, N), dtype=np.float32)
+
+    for i, row in nodes_df.iterrows():
+        ref = str(row["ref"])
+        wl = load_water_level(ref)
+        if wl is not None:
+            wl_aligned = wl.reindex(common_index)
+            valid_mask[:, i] = wl_aligned.notna().astype(np.float32)
+
     if save:
         np.save(OUT_DIR / "X.npy",          X)
         np.save(OUT_DIR / "y.npy",          y)
+        np.save(OUT_DIR / "valid_mask.npy", valid_mask)
         np.save(OUT_DIR / "timestamps.npy", np.array(common_index, dtype="datetime64[ns]"))
-        save_dataset_csv(X, y, common_index, node_refs, OUT_DIR)  # ← add this
+        save_dataset_csv(X, y, valid_mask, common_index, node_refs, OUT_DIR)  # ← add this
 
-        meta = {
-            "start_date":      str(common_index[0]),
-            "end_date":        str(common_index[-1]),
-            "timestep":        TIMESTEP,
-            "n_timesteps":     int(T),
-            "n_nodes":         int(N),
-            "n_features":      int(F),
-            "horizon_steps":   HORIZON,
-            "rolling_window":  ROLLING_WINDOW,
-            "gap_fill_steps":  GAP_FILL_STEPS,
-            "dynamic_features": DYNAMIC_FEATURES,
-            "node_refs":       node_refs,
-            "coverage":        coverage_stats,
-        }
+        meta = {"start_date": str(common_index[0]), "end_date": str(common_index[-1]), "timestep": TIMESTEP,
+                "n_timesteps": int(T), "n_nodes": int(N), "n_features": int(F), "horizon_steps": HORIZON,
+                "rolling_window": ROLLING_WINDOW, "gap_fill_steps": GAP_FILL_STEPS,
+                "dynamic_features": DYNAMIC_FEATURES, "node_refs": node_refs, "coverage": coverage_stats,
+                "rainfall_assignment_method": "nearest_neighbour", "rainfall_note": (
+                "Thiessen polygon weighting not implemented — only 4 rain gauges "
+                "across the catchment produce near-identical assignments to nearest-neighbour. "
+                "True per-station Thiessen requires sub-catchment delineations per OPW station, "
+                "available from OPW hydrology portal or EPA national catchment dataset."
+            )}
         with open(OUT_DIR / "dataset_metadata.json", "w") as fp:
             json.dump(meta, fp, indent=2, default=str)
 
@@ -465,7 +476,6 @@ def inspect_dataset(processed_dir: Path = OUT_DIR) -> None:
     """
     X          = np.load(processed_dir / "X.npy")
     y          = np.load(processed_dir / "y.npy")
-    timestamps = np.load(processed_dir / "timestamps.npy", allow_pickle=True)
 
     with open(processed_dir / "dataset_metadata.json") as f:
         meta = json.load(f)
@@ -495,7 +505,129 @@ def inspect_dataset(processed_dir: Path = OUT_DIR) -> None:
               f"rain={c.get('rain_gauge_ref','–')}")
     print(f"{'─'*55}\n")
 
+def diagnose(ref):
+    BAD_QUALITY_CODES = {-1, 32, 101}
+    df = pd.read_csv(WL_DIR / f"wl_{ref}.csv")
+    print(f"\n── Station {ref} ──────────────────────")
+    print(f"  Total rows:       {len(df)}")
+    print(f"  Columns:          {df.columns.tolist()}")
+    print(f"\n  Quality codes:")
+    print(df["quality_code"].value_counts().to_string())
+
+    # Datetime parsing
+    df["dt"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    n_failed = df["dt"].isna().sum()
+    print(f"\n  Datetime parse failures: {n_failed}")
+
+    # After quality masking
+    bad = pd.to_numeric(df["quality_code"], errors="coerce").isin(BAD_QUALITY_CODES)
+    good = df[~bad].dropna(subset=["dt"])
+    good["dt"] = good["dt"].dt.tz_localize(None)
+    good = good.set_index("dt")["value"]
+    good = good.resample("15min").mean()
+
+    # Coverage within 2023-2026
+    window = good["2023-01-01":"2026-03-25"]
+    total_steps = len(pd.date_range("2023-01-01", "2026-03-25", freq="15min"))
+    print(f"\n  Good rows (2023–2026): {window.notna().sum()} / {total_steps}")
+    print(f"  Coverage:              {window.notna().sum() / total_steps * 100:.1f}%")
+    print(f"  First reading:         {window.first_valid_index()}")
+    print(f"  Last reading:          {window.last_valid_index()}")
+
+    # Gap analysis
+    gaps = window.isna()
+    gap_runs = (gaps != gaps.shift()).cumsum()[gaps]
+    if len(gap_runs):
+        largest_gap = gap_runs.value_counts().max()
+        print(f"  Largest single gap:    {largest_gap} steps ({largest_gap * 15 / 60:.1f} hrs)")
+
 
 if __name__ == "__main__":
     build_dataset(save=True)
     inspect_dataset()
+
+# if __name__ == "__main__":
+#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
+#
+#     for ref in ["19163", "19160", "19161", "19164", "19058", "19045"]:
+#         df = pd.read_csv(WL_DIR / f"wl_{ref}.csv")
+#         df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+#         df = df.dropna(subset=["datetime"])
+#
+#         # Check coverage specifically in 2023-2026
+#         mask = (df["datetime"] >= "2023-01-01") & (df["datetime"] < "2026-03-26")
+#         window = df[mask]
+#         total_5min = len(pd.date_range("2023-01-01", "2026-03-25", freq="5min"))
+#         total_15min = len(pd.date_range("2023-01-01", "2026-03-25", freq="15min"))
+#         notna = window["value"].notna().sum()
+#         print(f"{ref}:  valid_rows={notna:,}  "
+#               f"pct_of_5min={notna / total_5min * 100:.1f}%  "
+#               f"pct_of_15min={notna / total_15min * 100:.1f}%")
+
+# if __name__ == "__main__":
+#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
+#
+#     for ref in ["19056", "19058", "19045", "19105"]:
+#         df = pd.read_csv(WL_DIR / f"wl_{ref}.csv", usecols=["datetime"])
+#         df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+#         df = df.dropna().sort_values("datetime")
+#         diffs = df["datetime"].diff().dt.total_seconds() / 60  # minutes
+#         print(f"\n{ref}:")
+#         print(diffs.value_counts().head(5).to_string())
+#
+#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19163.csv")
+#     print(df[df["value"].isna()]["quality_code"].value_counts())
+#     print(df[df["value"].isna()].head(3))
+
+# if __name__ == "__main__":
+#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
+#     BAD_QUALITY_CODES = {-1, 32, 101}
+#     # One known-good, one known-bad
+#     diagnose("19054")  # ✓ 99.7%
+#     diagnose("19045")  # ✗ 37.4%
+#     diagnose("19160")  # ✗ 18.0%  tidal
+
+# if __name__ == "__main__":
+#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
+#
+#     rows = []
+#     for f in sorted(WL_DIR.glob("wl_*.csv")):
+#         df = pd.read_csv(f, usecols=["datetime", "quality_code"])
+#         df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+#         df = df.dropna(subset=["datetime"])
+#         good = df[pd.to_numeric(df["quality_code"], errors="coerce").isin([31, 41, 254])]
+#         rows.append({
+#             "ref": f.stem.replace("wl_", ""),
+#             "first_good": good["datetime"].min().strftime("%Y-%m-%d") if len(good) else "–",
+#             "last_good": good["datetime"].max().strftime("%Y-%m-%d") if len(good) else "–",
+#             "good_count": len(good),
+#         })
+#
+#     df_out = pd.DataFrame(rows)
+#     print(df_out.to_string(index=False))
+
+# if __name__ == "__main__":
+#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19045.csv")
+#     print(f'For station 19045')
+#     print(df['quality_ok'].value_counts())
+#     print(df['quality_code'].value_counts().head(10))
+#
+#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19094.csv")
+#     print(f'For station 19094')
+#     print(df['quality_ok'].value_counts())
+#     print(df['quality_code'].value_counts().head(10))
+#
+#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19103.csv")
+#     print(f'For station 19103')
+#     print(df['quality_ok'].value_counts())
+#     print(df['quality_code'].value_counts().head(10))
+#
+#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19111.csv")
+#     print(f'For station 19111')
+#     print(df['quality_ok'].value_counts())
+#     print(df['quality_code'].value_counts().head(10))
+#
+#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19163.csv")
+#     print(f'For station 19163')
+#     print(df['quality_ok'].value_counts())
+#     print(df['quality_code'].value_counts().head(10))

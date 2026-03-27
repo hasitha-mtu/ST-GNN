@@ -303,7 +303,13 @@ def build_graph(
         # nodes.csv — one row per node, index == node index used in edge_index
         node_rows = []
         for i, s in enumerate(stations):
-            row = {'node_idx': i, 'ref': s['ref'], 'name': s['name']}
+            row = {
+                'node_idx': i,
+                'ref': s['ref'],
+                'name': s['name'],
+                'lat': s.get('lat'),
+                'lon': s.get('lon'),
+            }
             row.update(dict(zip(feature_names, node_attr[i].tolist())))
             node_rows.append(row)
         pd.DataFrame(node_rows).to_csv(OUT_DIR / 'nodes.csv', index=False)
