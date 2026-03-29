@@ -1,0 +1,183 @@
+======================================================================
+  LEE CATCHMENT -- EDA SUMMARY
+  Analysis window: 2022-04-01 -> 2025-12-31
+======================================================================
+
+DATA COMPLETENESS
+----------------------------------------
+  WL  19056    Ballincolly (19056)         complete= 99.8%  range=55.494 - 56.398 mAOD
+  WL  19059    Glennamought Bridge (190..  complete= 98.1%  range=40.988 - 42.086 mAOD
+  WL  19057    Glen Park (19057)           complete= 98.8%  range=35.830 - 37.138 mAOD
+  WL  19058    Blackpool Retail Park (1..  complete=100.0%  range=10.596 - 12.469 mAOD
+  WL  19045    Gothic Bridge (19045)       complete= 98.9%  range=27.922 - 29.259 mAOD
+  WL  19108    Bawnafinny Bridge (19108..  complete= 99.7%  range=24.494 - 26.082 mAOD
+  WL  19105    Muskerry (19105)            complete= 99.6%  range=16.203 - 18.626 mAOD
+  WL  19044    Kilmona Bridge (19044)      complete= 97.1%  range=74.442 - 76.123 mAOD
+  WL  19114    Carrigrohane Bridge (191..  complete= 99.2%  range=4.255 - 6.746 mAOD
+  WL  19113    County Hall (19113)         complete=100.0%  range=1.698 - 4.124 mAOD
+  WL  19110    Cooleen Bridge (19110)      complete= 99.6%  range=67.636 - 69.281 mAOD
+  WL  19112    Coolmuckey Br (19112)       complete= 99.1%  range=42.981 - 44.658 mAOD
+  WL  19103    Ovens Bridge (19103)        complete=100.0%  range=20.942 - 22.256 mAOD
+  WL  19054    Ballyvourney (19054)        complete= 99.6%  range=117.077 - 118.769 mAOD
+  WL  19055    Ballymakera (19055)         complete=100.0%  range=112.375 - 114.592 mAOD
+  WL  19101    Macroom Town Bridge (191..  complete= 99.8%  range=64.989 - 68.237 mAOD
+  WL  19111    Killaclug (19111)           complete=100.0%  range=77.424 - 79.768 mAOD
+  WL  19104    Morris's Bridge (19104)     complete= 99.5%  range=100.641 - 102.676 mAOD
+  WL  19107    Dripsey Bridge (19107)      complete= 98.1%  range=46.462 - 47.920 mAOD
+  WL  19115    Killamucky (19115)          complete= 34.9%  range=16.161 - 16.797 mAOD
+  WL  19106    Cooldaniel (19106)          complete=100.0%  range=66.553 - 68.478 mAOD
+  WL  19095    Carrigadrohid Headrace (..  complete= 96.4%  range=60.638 - 64.245 mAOD
+  WL  19094    Inniscarra Headrace (190..  complete=100.0%  range=45.318 - 49.000 mAOD
+  WL  19109    Inniscarra Tailrace (191..  complete= 99.5%  range=11.462 - 14.029 mAOD
+  WL  19160    Currach Club (19160)        complete= 54.4%  range=0.000 - 2.551 mAOD
+  WL  19161    St. Patrick's Quay (East..  complete= 53.5%  range=0.000 - 2.525 mAOD
+  WL  19162    Fitzgerald's Park (19162..  complete= 99.8%  range=0.625 - 2.706 mAOD
+  WL  19163    Pope's Quay (19163)         complete= 55.1%  range=0.000 - 2.538 mAOD
+  WL  19102    Waterworks Weir (19102)     complete= 99.1%  range=1.772 - 3.824 mAOD
+  WL  19164    Mercy Hospital (19164)      complete= 54.5%  range=0.000 - 2.567 mAOD
+  Rain 81901   Crookstown (81901)          complete=100.0%  total=5324 mm
+  Rain 81902   Rain Gauge 81902 (81902)    complete=100.0%  total=5729 mm
+  Rain 81903   Ballingeary (81903)         complete=100.0%  total=7809 mm
+  Rain 81904   Rain Gauge 81904 (81904)    complete= 94.5%  total=7350 mm
+
+FLOOD EVENTS (exceeding AMAX Median threshold)
+----------------------------------------
+  No flood events detected in analysis window.
+
+RAINFALL-RUNOFF LAG (hours)
+----------------------------------------
+  (= recommended minimum GNN temporal input window)
+  Max observed lag          : 10 hours
+  Recommended input_seq_len : >= 24 hours
+
+  Ballingeary          -> Carrigadrohid Headrace :  10 h
+  Crookstown           -> Carrigadrohid Headrace :   9 h
+  Rain Gauge 81902     -> Carrigadrohid Headrace :   9 h
+  Rain Gauge 81904     -> Carrigadrohid Headrace :   9 h
+  Crookstown           -> Inniscarra Headrace    :   9 h
+  Ballingeary          -> Inniscarra Headrace    :   9 h
+  Rain Gauge 81902     -> Inniscarra Headrace    :   8 h
+  Rain Gauge 81904     -> Inniscarra Headrace    :   8 h
+  Ballingeary          -> Cooleen Bridge         :   5 h
+  Crookstown           -> Ovens Bridge           :   5 h
+  Ballingeary          -> Ovens Bridge           :   5 h
+  Ballingeary          -> Macroom Town Bridge    :   5 h
+  Rain Gauge 81904     -> Macroom Town Bridge    :   5 h
+  Ballingeary          -> Gothic Bridge          :   4 h
+  Rain Gauge 81904     -> Gothic Bridge          :   4 h
+  Ballingeary          -> Muskerry               :   4 h
+  Rain Gauge 81904     -> Muskerry               :   4 h
+  Crookstown           -> Cooleen Bridge         :   4 h
+  Rain Gauge 81902     -> Cooleen Bridge         :   4 h
+  Rain Gauge 81904     -> Cooleen Bridge         :   4 h
+  Rain Gauge 81902     -> Ovens Bridge           :   4 h
+  Rain Gauge 81904     -> Ovens Bridge           :   4 h
+  Crookstown           -> Macroom Town Bridge    :   4 h
+  Rain Gauge 81902     -> Macroom Town Bridge    :   4 h
+  Ballingeary          -> Dripsey Bridge         :   4 h
+  Rain Gauge 81904     -> Dripsey Bridge         :   4 h
+  Rain Gauge 81902     -> Currach Club           :   4 h
+  Rain Gauge 81902     -> St. Patrick's Quay (East) :   4 h
+  Rain Gauge 81902     -> Fitzgerald's Park      :   4 h
+  Rain Gauge 81902     -> Pope's Quay            :   4 h
+  Rain Gauge 81902     -> Mercy Hospital         :   4 h
+  Crookstown           -> Gothic Bridge          :   3 h
+  Rain Gauge 81902     -> Gothic Bridge          :   3 h
+  Crookstown           -> Bawnafinny Bridge      :   3 h
+  Rain Gauge 81902     -> Bawnafinny Bridge      :   3 h
+  Ballingeary          -> Bawnafinny Bridge      :   3 h
+  Rain Gauge 81904     -> Bawnafinny Bridge      :   3 h
+  Crookstown           -> Muskerry               :   3 h
+  Rain Gauge 81902     -> Muskerry               :   3 h
+  Ballingeary          -> County Hall            :   3 h
+  Rain Gauge 81904     -> County Hall            :   3 h
+  Ballingeary          -> Coolmuckey Br          :   3 h
+  Rain Gauge 81904     -> Coolmuckey Br          :   3 h
+  Crookstown           -> Killaclug              :   3 h
+  Rain Gauge 81902     -> Killaclug              :   3 h
+  Ballingeary          -> Killaclug              :   3 h
+  Rain Gauge 81904     -> Killaclug              :   3 h
+  Crookstown           -> Dripsey Bridge         :   3 h
+  Rain Gauge 81902     -> Dripsey Bridge         :   3 h
+  Crookstown           -> Killamucky             :   3 h
+  Rain Gauge 81902     -> Killamucky             :   3 h
+  Ballingeary          -> Killamucky             :   3 h
+  Rain Gauge 81904     -> Killamucky             :   3 h
+  Crookstown           -> Cooldaniel             :   3 h
+  Ballingeary          -> Cooldaniel             :   3 h
+  Rain Gauge 81904     -> Cooldaniel             :   3 h
+  Ballingeary          -> Waterworks Weir        :   3 h
+  Rain Gauge 81904     -> Waterworks Weir        :   3 h
+  Crookstown           -> Glennamought Bridge    :   2 h
+  Rain Gauge 81902     -> Glennamought Bridge    :   2 h
+  Ballingeary          -> Glennamought Bridge    :   2 h
+  Rain Gauge 81904     -> Glennamought Bridge    :   2 h
+  Ballingeary          -> Blackpool Retail Park  :   2 h
+  Crookstown           -> Kilmona Bridge         :   2 h
+  Rain Gauge 81902     -> Kilmona Bridge         :   2 h
+  Ballingeary          -> Kilmona Bridge         :   2 h
+  Rain Gauge 81904     -> Kilmona Bridge         :   2 h
+  Crookstown           -> Carrigrohane Bridge    :   2 h
+  Rain Gauge 81902     -> Carrigrohane Bridge    :   2 h
+  Ballingeary          -> Carrigrohane Bridge    :   2 h
+  Rain Gauge 81904     -> Carrigrohane Bridge    :   2 h
+  Crookstown           -> Coolmuckey Br          :   2 h
+  Rain Gauge 81902     -> Coolmuckey Br          :   2 h
+  Ballingeary          -> Ballyvourney           :   2 h
+  Rain Gauge 81904     -> Ballyvourney           :   2 h
+  Ballingeary          -> Ballymakera            :   2 h
+  Rain Gauge 81904     -> Ballymakera            :   2 h
+  Crookstown           -> Morris's Bridge        :   2 h
+  Rain Gauge 81902     -> Morris's Bridge        :   2 h
+  Ballingeary          -> Morris's Bridge        :   2 h
+  Rain Gauge 81904     -> Morris's Bridge        :   2 h
+  Rain Gauge 81902     -> Cooldaniel             :   2 h
+  Rain Gauge 81904     -> Currach Club           :   2 h
+  Rain Gauge 81904     -> St. Patrick's Quay (East) :   2 h
+  Rain Gauge 81904     -> Pope's Quay            :   2 h
+  Crookstown           -> Waterworks Weir        :   2 h
+  Rain Gauge 81902     -> Waterworks Weir        :   2 h
+  Rain Gauge 81904     -> Mercy Hospital         :   2 h
+  Ballingeary          -> Ballincolly            :   1 h
+  Rain Gauge 81904     -> Ballincolly            :   1 h
+  Crookstown           -> Glen Park              :   1 h
+  Ballingeary          -> Glen Park              :   1 h
+  Rain Gauge 81904     -> Glen Park              :   1 h
+  Crookstown           -> Blackpool Retail Park  :   1 h
+  Rain Gauge 81902     -> Blackpool Retail Park  :   1 h
+  Rain Gauge 81904     -> Blackpool Retail Park  :   1 h
+  Crookstown           -> County Hall            :   1 h
+  Rain Gauge 81902     -> County Hall            :   1 h
+  Crookstown           -> Ballyvourney           :   1 h
+  Rain Gauge 81902     -> Ballyvourney           :   1 h
+  Crookstown           -> Ballymakera            :   1 h
+  Rain Gauge 81902     -> Ballymakera            :   1 h
+  Crookstown           -> Inniscarra Tailrace    :   1 h
+  Rain Gauge 81902     -> Inniscarra Tailrace    :   1 h
+  Ballingeary          -> Inniscarra Tailrace    :   1 h
+  Rain Gauge 81904     -> Inniscarra Tailrace    :   1 h
+  Ballingeary          -> Currach Club           :   1 h
+  Ballingeary          -> St. Patrick's Quay (East) :   1 h
+  Ballingeary          -> Fitzgerald's Park      :   1 h
+  Rain Gauge 81904     -> Fitzgerald's Park      :   1 h
+  Ballingeary          -> Pope's Quay            :   1 h
+  Ballingeary          -> Mercy Hospital         :   1 h
+  Crookstown           -> Ballincolly            :   0 h
+  Rain Gauge 81902     -> Ballincolly            :   0 h
+  Rain Gauge 81902     -> Glen Park              :   0 h
+  Crookstown           -> Currach Club           :   0 h
+  Crookstown           -> St. Patrick's Quay (East) :   0 h
+  Crookstown           -> Fitzgerald's Park      :   0 h
+  Crookstown           -> Pope's Quay            :   0 h
+  Crookstown           -> Mercy Hospital         :   0 h
+
+GNN DESIGN IMPLICATIONS
+----------------------------------------
+  Total WL stations         : 30
+  Total rainfall stations   : 4
+  15-min timesteps in window: 131521
+  Hourly timesteps in window: 32881
+  Suggested input_seq_len   : 24 hours (96 x 15-min steps)
+  Suggested forecast horizon: 2, 4, 6, 12, 24 hours
+
+======================================================================
