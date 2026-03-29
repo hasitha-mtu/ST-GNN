@@ -1,0 +1,23 @@
+ref,name,water_body,catchment_area_km2,lat,lon,gauge_datum
+19056,Ballincolly,Glen Tributary,3.65,51.92285,-8.45611,55.603
+19059,Glennamought Bridge,Glen Tributary,17.41,51.929203,-8.477429,40.65
+19057,Glen Park,GLEN,7.85,51.91294,-8.45212,35.84
+19058,Blackpool Retail Park,Bride (Cork),10.76,51.91658,-8.47343,10.508
+19045,Gothic Bridge,BLARNEY,22.4,51.92805667,-8.558214444,27.861
+19108,Bawnafinny Bridge,BLARNEY,88.5,51.93005,-8.58539,24.234
+19105,Muskerry,Shournagh,209.13,51.914717,-8.60186,16.168
+19044,Kilmona Bridge,MARTIN,39.59,51.98953389,-8.5885725,74.168
+19114,Carrigrohane Bridge,Curragheen,46.4,51.889797,-8.540992,3.697
+19110,Cooleen Bridge,TOON,29.97,51.871,-9.07412,67.784
+19112,Coolmuckey Br,Bride (Cork),70.21,51.86084,-8.783723,42.847
+19103,Ovens Bridge,Bride (Cork),117.82,51.880537,-8.654934,20.973
+19054,Ballyvourney,Sullane,71.59,51.93931,-9.16104,116.823
+19055,Ballymakera,Sullane,75.24,51.934472,-9.146258,111.938
+19101,Macroom Town Bridge,Sullane,211.01,51.906031,-8.962501,64.668
+19111,Killaclug,Foherish,74.83,51.911624,-9.02315,77.182
+19104,Morris's Bridge,Laney,82.11,51.92933,-8.93616,100.547
+19107,Dripsey Bridge,Dripsey,82.17,51.915989,-8.746053,46.401
+19115,Killamucky,Kilta,21.09,51.929182,-8.05982899,16.079
+19106,Cooldaniel,LEE,171.54,51.85761,-9.02229,66.257
+19109,Inniscarra Tailrace,LEE,791.14,51.89202,-8.63343,11.343
+19102,Waterworks Weir,LEE,1185.0,51.893989,-8.510053,2.0
