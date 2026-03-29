@@ -543,5 +543,9 @@ output:
 
 # -- Logging -------------------------------------------------------------------
 logging:
-  level: "INFO"
-  log_file: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/logs/downloader.log"
+  downloader:
+    level: "INFO"
+    log_file: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/logs/downloader.log"
+  train:
+    level: "INFO"
+    log_file: "C:/Users/AdikariAdikari/PycharmProjects/ST-GNN/logs/train.log"
