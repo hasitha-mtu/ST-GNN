@@ -1,5 +1,5 @@
 """
-train_model.py  v1  –  ST-GNN flood forecasting for the Lee catchment
+train_model.py  v2  –  ST-GNN flood forecasting for the Lee catchment
 ======================================================================
 Architecture:
   1. Node embedding   Linear([F_dyn + F_static]) → hidden_dim
@@ -9,10 +9,22 @@ Architecture:
 
 Input window:   T_in  = 32 steps  (8 hours)
 Output horizon: T_out =  4 steps  (1 hour, multi-step)
-Target:         stage_anomaly  (feature index 0 in X)
+
+Target (v2):    DELTA stage_anomaly — the model predicts the CHANGE from
+                the last observed value rather than the absolute level.
+                  delta[h] = stage_anomaly[t+h] - stage_anomaly[t]
+                Absolute predictions are recovered at evaluation time:
+                  abs_pred[h] = last_obs + delta_pred[h]
+                An output of 0.0 is now equivalent to persistence, so
+                the model is explicitly penalised for lazy forecasting.
+
+Loss (v2):      Horizon-weighted masked MSE — later steps in the forecast
+                window receive proportionally more weight.
+                  h+1: weight 1×,  h+2: 2×,  h+3: 3×,  h+4: 4×
+                This forces the model to focus on the harder long-horizon
+                predictions where persistence degrades most.
 
 Train / val / test split: chronological 70 / 15 / 15 with T_in+T_out purge gaps
-Loss:           MSE masked by valid_mask (ignores zero-filled gaps)
 """
 
 import json
@@ -310,12 +322,36 @@ class STGNNFloodModel(nn.Module):
 def masked_mse(pred: torch.Tensor, target: torch.Tensor,
                mask: torch.Tensor) -> torch.Tensor:
     """
-    MSE computed only over positions where mask == 1 (real observations).
+    Uniform MSE over valid positions. Kept for persistence baseline
+    evaluation where horizon weighting would distort the comparison.
     pred, target, mask: [B, T_out, N]
     """
     err = (pred - target) ** 2 * mask
     denom = mask.sum().clamp(min=1.0)
     return err.sum() / denom
+
+
+def masked_mse_horizon_weighted(pred: torch.Tensor, target: torch.Tensor,
+                                mask: torch.Tensor) -> torch.Tensor:
+    """
+    Horizon-weighted MSE over valid positions.
+
+    Later forecast steps receive higher weight so the model is penalised
+    more for errors at h+4 (60 min) than at h+1 (15 min). The weights
+    increase linearly and are normalised to mean=1, keeping the overall
+    loss scale comparable to plain MSE.
+
+      h+1: 0.4x   h+2: 0.8x   h+3: 1.2x   h+4: 1.6x  (T_out=4 example)
+
+    pred, target, mask: [B, T_out, N]
+    """
+    T_out = pred.shape[1]
+    # Linear ramp 1, 2, ..., T_out — normalised to mean = 1
+    ramp = torch.arange(1, T_out + 1, dtype=torch.float32, device=pred.device)
+    ramp = ramp / ramp.mean()                       # [T_out]
+    w = ramp.view(1, T_out, 1) * mask               # [B, T_out, N]
+    err = (pred - target) ** 2 * w
+    return err.sum() / w.sum().clamp(min=1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -359,16 +395,29 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
 
 def train_epoch(model, loader, optimiser, edge_index, edge_attr,
                 node_attr) -> float:
+    """
+    One training epoch using delta (residual) prediction.
+
+    The model predicts delta_stage_anomaly[h] = stage_anomaly[t+h] - stage_anomaly[t].
+    The horizon-weighted loss penalises later forecast steps more heavily,
+    preventing the model from collapsing to a near-zero-delta (persistence) solution.
+    """
     model.train()
     total_loss = 0.0
     for x_seq, y_seq, mask in loader:
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
-        mask = mask.to(DEVICE)
+        mask  = mask.to(DEVICE)
+
+        # ── Compute delta targets ──────────────────────────────────────
+        # last_obs: stage_anomaly at the final input timestep [B, N]
+        # delta_target[h] = stage_anomaly[t+h] - stage_anomaly[t]
+        last_obs     = x_seq[:, -1, :, 0]                        # [B, N]
+        delta_target = y_seq - last_obs.unsqueeze(1)              # [B, T_out, N]
 
         optimiser.zero_grad()
-        pred = model(x_seq, node_attr, edge_index, edge_attr)
-        loss = masked_mse(pred, y_seq, mask)
+        delta_pred = model(x_seq, node_attr, edge_index, edge_attr)  # [B, T_out, N]
+        loss = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
@@ -379,36 +428,56 @@ def train_epoch(model, loader, optimiser, edge_index, edge_attr,
 
 @torch.no_grad()
 def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
+    """
+    Evaluation epoch.
+
+    The model outputs delta predictions. Absolute predictions are
+    reconstructed as abs_pred = last_obs + delta_pred before computing
+    all metrics, so RMSE, MAE, and NSE are in the original stage_anomaly
+    space and directly comparable across runs.
+
+    The training loss logged here uses the same horizon-weighted delta
+    loss as train_epoch for a consistent comparison. Persistence metrics
+    use plain masked_mse on absolute values — no horizon weighting — to
+    give an honest baseline.
+    """
     model.eval()
     total_loss = 0.0
-    all_pred, all_tgt, all_mask = [], [], []
+    all_abs_pred, all_tgt, all_mask = [], [], []
     all_persist = []
 
     for x_seq, y_seq, mask in loader:
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
-        mask = mask.to(DEVICE)
+        mask  = mask.to(DEVICE)
 
-        pred = model(x_seq, node_attr, edge_index, edge_attr)
-        total_loss += masked_mse(pred, y_seq, mask).item()
+        # ── Delta prediction → absolute reconstruction ─────────────────
+        last_obs     = x_seq[:, -1, :, 0]                        # [B, N]
+        delta_target = y_seq - last_obs.unsqueeze(1)              # [B, T_out, N]
+        delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
+        abs_pred     = last_obs.unsqueeze(1) + delta_pred         # [B, T_out, N]
 
-        all_pred.append(pred.cpu())
+        # Training-consistent loss (horizon-weighted, delta space)
+        total_loss += masked_mse_horizon_weighted(
+            delta_pred, delta_target, mask
+        ).item()
+
+        all_abs_pred.append(abs_pred.cpu())
         all_tgt.append(y_seq.cpu())
         all_mask.append(mask.cpu())
 
-        # Persistence: repeat last input stage_anomaly for all T_out steps
-        # x_seq[:, -1, :, 0] = stage_anomaly at last input timestep
-        last_obs = x_seq[:, -1, :, 0].cpu()  # [B, N]
-        persist = last_obs.unsqueeze(1).expand(  # [B, T_out, N]
-            -1, y_seq.shape[1], -1
-        )
+        # Persistence baseline: predict last_obs at every horizon
+        persist = last_obs.unsqueeze(1).expand(-1, y_seq.shape[1], -1).cpu()
         all_persist.append(persist)
 
-    metrics = compute_metrics(
-        torch.cat(all_pred), torch.cat(all_tgt), torch.cat(all_mask)
-    )
+    cat_abs_pred = torch.cat(all_abs_pred)
+    cat_tgt      = torch.cat(all_tgt)
+    cat_mask     = torch.cat(all_mask)
+
+    # Metrics on absolute predictions — horizon-uniform so NSE is comparable
+    metrics = compute_metrics(cat_abs_pred, cat_tgt, cat_mask)
     persist_metrics = compute_metrics(
-        torch.cat(all_persist), torch.cat(all_tgt), torch.cat(all_mask)
+        torch.cat(all_persist), cat_tgt, cat_mask
     )
     return total_loss / len(loader), metrics, persist_metrics
 
@@ -581,23 +650,36 @@ def train(logger):
 
     # Collect all predictions in one pass
     model.eval()
-    all_pred, all_tgt, all_mask = [], [], []
+    all_abs_pred, all_tgt, all_mask = [], [], []
     with torch.no_grad():
         for x_seq, y_seq, mask in test_loader:
-            x_seq = x_seq.to(DEVICE)
-            pred = model(x_seq, node_attr, edge_index, edge_attr)
-            all_pred.append(pred.cpu())
+            x_seq    = x_seq.to(DEVICE)
+            last_obs = x_seq[:, -1, :, 0]                        # [B, N]
+            delta_pred = model(x_seq, node_attr, edge_index, edge_attr)
+            abs_pred   = last_obs.unsqueeze(1) + delta_pred       # [B, T_out, N]
+            all_abs_pred.append(abs_pred.cpu())
             all_tgt.append(y_seq)
             all_mask.append(mask)
 
-    cat_pred = torch.cat(all_pred)
-    cat_tgt = torch.cat(all_tgt)
+    cat_pred = torch.cat(all_abs_pred)
+    cat_tgt  = torch.cat(all_tgt)
     cat_mask = torch.cat(all_mask)
 
     # Aggregate metrics
-    test_loss = masked_mse(cat_pred.to(DEVICE),
-                           cat_tgt.to(DEVICE),
-                           cat_mask.to(DEVICE)).item()
+    # Test loss: horizon-weighted delta-space loss (consistent with training)
+    with torch.no_grad():
+        delta_losses = []
+        for x_seq, y_seq, mask in test_loader:
+            x_seq    = x_seq.to(DEVICE)
+            y_seq_d  = y_seq.to(DEVICE)
+            mask_d   = mask.to(DEVICE)
+            last_obs = x_seq[:, -1, :, 0]
+            delta_target = y_seq_d - last_obs.unsqueeze(1)
+            delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
+            delta_losses.append(
+                masked_mse_horizon_weighted(delta_pred, delta_target, mask_d).item()
+            )
+    test_loss    = float(np.mean(delta_losses))
     test_metrics = compute_metrics(cat_pred, cat_tgt, cat_mask)
 
     logger.info(
@@ -616,12 +698,12 @@ def train(logger):
     pn_df["name"] = nodes_df["name"].values
 
     # Skill score vs persistence per node
-    # Proper persistence: last input step stage_anomaly
+    # Persistence: last observed stage_anomaly held constant across all horizons
     all_persist = []
     with torch.no_grad():
         for x_seq, y_seq, mask in test_loader:
-            last_obs = x_seq[:, -1, :, 0]
-            persist = last_obs.unsqueeze(1).expand(-1, T_OUT, -1)
+            last_obs = x_seq[:, -1, :, 0]                        # [B, N]
+            persist  = last_obs.unsqueeze(1).expand(-1, T_OUT, -1)
             all_persist.append(persist)
 
     cat_persist = torch.cat(all_persist)
