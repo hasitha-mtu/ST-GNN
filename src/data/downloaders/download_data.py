@@ -22,7 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import yaml
+# import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -31,26 +31,29 @@ from src.data.downloaders.waterlevel_downloader import WaterLevelDownloader
 from src.data.downloaders.discharge_downloader import DischargeDownloader
 from src.data.processors.timeseries_processor  import TimeSeriesProcessor
 
-
-def setup_logging(log_cfg: dict):
-    log_dir = Path(log_cfg["log_file"]).parent
-    log_dir.mkdir(parents=True, exist_ok=True)
-    level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
-    fmt   = "%(asctime)s  %(levelname)-8s  %(message)s"
-
-    # Force UTF-8 on both handlers so Windows cp1252 terminals don't break
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.stream.reconfigure(encoding="utf-8", errors="replace") if hasattr(stream_handler.stream, "reconfigure") else None
-
-    file_handler = logging.FileHandler(log_cfg["log_file"], encoding="utf-8")
-
-    logging.basicConfig(level=level, format=fmt,
-                        handlers=[stream_handler, file_handler])
+from src.utils.config import load_config
+from src.utils.logger import get_logger
 
 
-def load_config(path: Path) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+# def setup_logging(log_cfg: dict):
+#     log_dir = Path(log_cfg["log_file"]).parent
+#     log_dir.mkdir(parents=True, exist_ok=True)
+#     level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
+#     fmt   = "%(asctime)s  %(levelname)-8s  %(message)s"
+#
+#     # Force UTF-8 on both handlers so Windows cp1252 terminals don't break
+#     stream_handler = logging.StreamHandler(sys.stdout)
+#     stream_handler.stream.reconfigure(encoding="utf-8", errors="replace") if hasattr(stream_handler.stream, "reconfigure") else None
+#
+#     file_handler = logging.FileHandler(log_cfg["log_file"], encoding="utf-8")
+#
+#     logging.basicConfig(level=level, format=fmt,
+#                         handlers=[stream_handler, file_handler])
+
+
+# def load_config(path: Path) -> dict:
+#     with open(path) as f:
+#         return yaml.safe_load(f)
 
 
 def get_subset(config: dict, name: str = None) -> tuple[str, dict]:
@@ -86,9 +89,7 @@ def main():
     args = ap.parse_args()
 
     config = load_config(Path(args.config))
-    setup_logging(config["logging"])
-    logger = logging.getLogger(__name__)
-
+    logger = get_logger(config["logging"]["downloader"])
     subset_name, subset = get_subset(config, args.subset)
     start_date = args.start or "2020-01-01"  # ZIPs contain full history; this window is for processing only
     end_date   = args.end   or "2025-12-31"
