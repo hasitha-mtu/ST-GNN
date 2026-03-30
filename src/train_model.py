@@ -11,7 +11,7 @@ Input window:   T_in  = 32 steps  (8 hours)
 Output horizon: T_out =  4 steps  (1 hour, multi-step)
 Target:         stage_anomaly  (feature index 0 in X)
 
-Train / val / test split: chronological 70 / 15 / 15
+Train / val / test split: chronological 70 / 15 / 15 with T_in+T_out purge gaps
 Loss:           MSE masked by valid_mask (ignores zero-filled gaps)
 """
 
@@ -29,33 +29,29 @@ import pandas as pd
 from src.utils.config import load_config
 from src.utils.logger import get_logger
 
-
 # ── Paths ──────────────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).resolve().parent.parent
-PROC_DIR   = BASE_DIR / "dataset/processed"
-GRAPH_DIR  = BASE_DIR / "dataset/graph"
-CKPT_DIR   = BASE_DIR / "checkpoints"
+BASE_DIR = Path(__file__).resolve().parent.parent
+PROC_DIR = BASE_DIR / "dataset/processed"
+GRAPH_DIR = BASE_DIR / "dataset/graph"
+CKPT_DIR = BASE_DIR / "checkpoints"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Hyperparameters ────────────────────────────────────────────────────
-T_IN       = 32          # input window  (8 hours at 15-min)
-T_OUT      =  4          # output horizon (1 hour)
-HIDDEN_DIM = 64          # node embedding + GRU hidden size
-GAT_HEADS  =  2          # attention heads in GATConv
-GRU_LAYERS =  2          # GRU depth
-DROPOUT    =  0.1
-# DROPOUT    =  0.2      # Too Aggressive for model size
+T_IN = 32  # input window  (8 hours at 15-min)
+T_OUT = 4  # output horizon (1 hour)
+HIDDEN_DIM = 64  # node embedding + GRU hidden size
+GAT_HEADS = 2  # attention heads in GATConv
+GRU_LAYERS = 2  # GRU depth
+DROPOUT = 0.1
 
 BATCH_SIZE = 32
-# LR         = 1e-3
-LR         = 5e-4
+LR = 5e-4
 WEIGHT_DECAY = 1e-4
-# WEIGHT_DECAY = 5e-4
 MAX_EPOCHS = 100
-PATIENCE   = 30          # early stopping patience (epochs)
+PATIENCE = 30  # early stopping patience (epochs)
 
 TRAIN_FRAC = 0.70
-VAL_FRAC   = 0.15
+VAL_FRAC = 0.15
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,10 +73,10 @@ class LeeFloodDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray,
                  valid_mask: np.ndarray, t_in: int, t_out: int):
         super().__init__()
-        self.X    = torch.from_numpy(X).float()
-        self.y    = torch.from_numpy(y).float()
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).float()
         self.mask = torch.from_numpy(valid_mask).float()
-        self.t_in  = t_in
+        self.t_in = t_in
         self.t_out = t_out
         # Last t_out steps cannot form a complete target window
         self.n_samples = len(X) - t_in - t_out + 1
@@ -90,7 +86,11 @@ class LeeFloodDataset(Dataset):
 
     def __getitem__(self, idx):
         x_seq = self.X[idx: idx + self.t_in]
-        # y[t] = stage_anomaly at t+1, so start from t_in-1 to get 1-step-ahead first
+
+        # y[t] = stage_anomaly at t+1, so start from t_in-1 to get 1-step-ahead first.
+        # NOTE: This explicitly assumes `y.npy` was forward-shifted by 1 index during
+        # preprocessing. If `y` is just an unshifted slice (e.g., X[:,:,0]), this will
+        # cause massive target leakage because y_seq[0] will equal x_seq[-1].
         start = idx + self.t_in - 1
         y_seq = self.y[start: start + self.t_out]
         mask = self.mask[start: start + self.t_out]
@@ -98,24 +98,29 @@ class LeeFloodDataset(Dataset):
 
 
 def make_splits(n_total: int) -> tuple[range, range, range]:
-    """Chronological train / val / test index ranges."""
+    """
+    Chronological train / val / test index ranges.
+    Includes a 'gap' equal to T_IN + T_OUT between sets to prevent time-series leakage.
+    """
     n_train = int(n_total * TRAIN_FRAC)
-    n_val   = int(n_total * VAL_FRAC)
+    n_val = int(n_total * VAL_FRAC)
+    gap = T_IN + T_OUT
+
     return (
         range(0, n_train),
-        range(n_train, n_train + n_val),
-        range(n_train + n_val, n_total),
+        range(n_train + gap, n_train + gap + n_val),
+        range(n_train + 2 * gap + n_val, n_total),
     )
 
 
 def make_dataset(X, y, valid_mask, split_range):
     """Slice tensor to the given range before wrapping in Dataset."""
-    end = split_range.stop + T_IN + T_OUT - 1   # include full window
+    end = split_range.stop + T_IN + T_OUT - 1  # include full window
     end = min(end, len(X))
     return LeeFloodDataset(
-        X[split_range.start : end],
-        y[split_range.start : end],
-        valid_mask[split_range.start : end],
+        X[split_range.start: end],
+        y[split_range.start: end],
+        valid_mask[split_range.start: end],
         T_IN, T_OUT,
     )
 
@@ -157,8 +162,19 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
 
     # Edge attributes
     edge_cols = ["river_dist_km", "area_ratio", "elev_drop_m", "same_tributary"]
+    edge_attr_np = edges_df[edge_cols].values
+
+    # Check if a node is a reservoir (is_reservoir == 1)
+    is_res = nodes_df["is_reservoir"].values
+    src_is_res = is_res[edges_df["src_idx"].values]
+    dst_is_res = is_res[edges_df["dst_idx"].values]
+
+    # Mask index 2 (elev_drop_m) to 0.0 if either source or destination is a reservoir
+    reservoir_edge_mask = (src_is_res == 1) | (dst_is_res == 1)
+    edge_attr_np[reservoir_edge_mask, 2] = 0.0
+
     edge_attr = torch.tensor(
-        edges_df[edge_cols].values, dtype=torch.float32
+        edge_attr_np, dtype=torch.float32
     ).to(device)
 
     logger.info(
@@ -188,20 +204,20 @@ class STGNNFloodModel(nn.Module):
     """
 
     def __init__(
-        self,
-        f_dyn:    int,   # dynamic feature dim  (5)
-        f_static: int,   # static  feature dim  (7)
-        f_edge:   int,   # edge    feature dim  (4)
-        hidden:   int,
-        gat_heads: int,
-        gru_layers: int,
-        t_out:    int,
-        dropout:  float,
+            self,
+            f_dyn: int,  # dynamic feature dim  (5)
+            f_static: int,  # static  feature dim  (7)
+            f_edge: int,  # edge    feature dim  (4)
+            hidden: int,
+            gat_heads: int,
+            gru_layers: int,
+            t_out: int,
+            dropout: float,
     ):
         super().__init__()
-        self.hidden    = hidden
+        self.hidden = hidden
         self.gat_heads = gat_heads
-        self.t_out     = t_out
+        self.t_out = t_out
 
         # ── Node embedding ─────────────────────────────────────────────
         # Combines dynamic + static features into hidden_dim
@@ -242,6 +258,7 @@ class STGNNFloodModel(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
+            nn.Dropout(dropout),  # ── FIX: Added to prevent overfitting to specific temporal states
             nn.Linear(hidden // 2, t_out),
         )
 
@@ -263,6 +280,9 @@ class STGNNFloodModel(nn.Module):
         offsets = torch.arange(BT, device=edge_index.device) * N  # [B*T]
         ei = edge_index.unsqueeze(0) + offsets.view(-1, 1, 1)  # [B*T, 2, E]
         ei = ei.permute(1, 0, 2).reshape(2, -1)  # [2, B*T*E]
+
+        # Expanding edges isn't the most memory-efficient PyTorch operation,
+        # but works fine here given the static graph topology.
         ea = edge_feat.unsqueeze(0).expand(BT, -1, -1).reshape(-1, edge_feat.shape[-1])
 
         h_flat = h.reshape(BT * N, self.hidden)
@@ -283,25 +303,6 @@ class STGNNFloodModel(nn.Module):
             .permute(0, 2, 1)  # [B, T_out, N]
         return pred
 
-    @staticmethod
-    def _batch_graph(
-        edge_index: torch.Tensor,  # [2, E]
-        edge_attr:  torch.Tensor,  # [E, hidden]
-        batch_size: int,
-        n_nodes:    int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Replicate edge_index across batch dimension.
-        Each graph in the batch is independent (no cross-batch edges).
-        """
-        offsets = torch.arange(batch_size, device=edge_index.device) * n_nodes
-        ei = edge_index.unsqueeze(0) + offsets.view(-1, 1, 1)  # [B, 2, E]
-        ei = ei.permute(1, 0, 2).reshape(2, -1)                # [2, B*E]
-        ea = edge_attr.unsqueeze(0).expand(batch_size, -1, -1)
-        ea = ea.reshape(-1, edge_attr.shape[-1])                # [B*E, hidden]
-        return ei, ea
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 4. Loss
 # ═══════════════════════════════════════════════════════════════════════
@@ -316,12 +317,7 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor,
     denom = mask.sum().clamp(min=1.0)
     return err.sum() / denom
 
-#
-# def masked_mse_weighted(pred, target, mask, node_weights):
-#     # node_weights: [N], broadcast to [B, T_out, N]
-#     w = node_weights.unsqueeze(0).unsqueeze(0) * mask
-#     err = (pred - target) ** 2 * w
-#     return err.sum() / w.sum().clamp(min=1.0)
+
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Metrics
 # ═══════════════════════════════════════════════════════════════════════
@@ -347,13 +343,13 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
         mae_list.append((p - t).abs().mean().item())
 
         ss_res = ((p - t) ** 2).sum()
-        ss_tot = ((t - t.mean()) ** 2).sum()   # per-node mean, not global
+        ss_tot = ((t - t.mean()) ** 2).sum()  # per-node mean, not global
         nse_list.append((1 - ss_res / ss_tot.clamp(min=1e-8)).item())
 
     return {
         "rmse": float(np.mean(rmse_list)),
-        "mae":  float(np.mean(mae_list)),
-        "nse":  float(np.mean(nse_list)),
+        "mae": float(np.mean(mae_list)),
+        "nse": float(np.mean(nse_list)),
     }
 
 
@@ -368,7 +364,7 @@ def train_epoch(model, loader, optimiser, edge_index, edge_attr,
     for x_seq, y_seq, mask in loader:
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
-        mask  = mask.to(DEVICE)
+        mask = mask.to(DEVICE)
 
         optimiser.zero_grad()
         pred = model(x_seq, node_attr, edge_index, edge_attr)
@@ -386,12 +382,12 @@ def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
     model.eval()
     total_loss = 0.0
     all_pred, all_tgt, all_mask = [], [], []
-    all_persist = []   # ← add this
+    all_persist = []
 
     for x_seq, y_seq, mask in loader:
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
-        mask  = mask.to(DEVICE)
+        mask = mask.to(DEVICE)
 
         pred = model(x_seq, node_attr, edge_index, edge_attr)
         total_loss += masked_mse(pred, y_seq, mask).item()
@@ -402,13 +398,13 @@ def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
 
         # Persistence: repeat last input stage_anomaly for all T_out steps
         # x_seq[:, -1, :, 0] = stage_anomaly at last input timestep
-        last_obs = x_seq[:, -1, :, 0].cpu()           # [B, N]
-        persist  = last_obs.unsqueeze(1).expand(       # [B, T_out, N]
+        last_obs = x_seq[:, -1, :, 0].cpu()  # [B, N]
+        persist = last_obs.unsqueeze(1).expand(  # [B, T_out, N]
             -1, y_seq.shape[1], -1
         )
         all_persist.append(persist)
 
-    metrics      = compute_metrics(
+    metrics = compute_metrics(
         torch.cat(all_pred), torch.cat(all_tgt), torch.cat(all_mask)
     )
     persist_metrics = compute_metrics(
@@ -418,9 +414,9 @@ def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
 
 
 def compute_per_node_metrics(
-    pred:   torch.Tensor,   # [B, T_out, N]
-    target: torch.Tensor,   # [B, T_out, N]
-    mask:   torch.Tensor,   # [B, T_out, N]
+        pred: torch.Tensor,  # [B, T_out, N]
+        target: torch.Tensor,  # [B, T_out, N]
+        mask: torch.Tensor,  # [B, T_out, N]
 ) -> dict[str, list]:
     """
     Compute RMSE, MAE, and NSE individually for every node.
@@ -440,10 +436,10 @@ def compute_per_node_metrics(
             continue
 
         rmse = ((p - t) ** 2).mean().sqrt().item()
-        mae  = (p - t).abs().mean().item()
+        mae = (p - t).abs().mean().item()
         ss_res = ((p - t) ** 2).sum()
         ss_tot = ((t - t.mean()) ** 2).sum()
-        nse  = (1 - ss_res / ss_tot.clamp(min=1e-8)).item()
+        nse = (1 - ss_res / ss_tot.clamp(min=1e-8)).item()
 
         rows.append({"node_idx": n, "rmse": round(rmse, 6),
                      "mae": round(mae, 6), "nse": round(nse, 6),
@@ -460,8 +456,8 @@ def train(logger):
 
     # ── Load data ─────────────────────────────────────────────────────
     logger.info("Loading dataset …")
-    X          = np.load(PROC_DIR / "X.npy")
-    y          = np.load(PROC_DIR / "y.npy")
+    X = np.load(PROC_DIR / "X.npy")
+    y = np.load(PROC_DIR / "y.npy")
     valid_mask = np.load(PROC_DIR / "valid_mask.npy")
 
     T, N, F = X.shape
@@ -478,35 +474,24 @@ def train(logger):
         len(train_rng), len(val_rng), len(test_rng)
     )
 
-    # # Compute per-node coverage weights from valid_mask
-    # train_end = train_rng.stop + T_IN + T_OUT - 1  # same logic as make_dataset
-    # node_weights = valid_mask[:train_end].mean(axis=0)  # [N] — training set only
-    # node_weights = torch.tensor(node_weights, dtype=torch.float32).to(DEVICE)
-    # node_weights = node_weights / node_weights.mean()
-
-
-    # logger.info("Node coverage weights:")
-    # for i, (name, w) in enumerate(zip(nodes_df["name"], node_weights.cpu().numpy())):
-    #     logger.info("  %s: %.3f", name, w)
-
     train_ds = make_dataset(X, y, valid_mask, train_rng)
-    val_ds   = make_dataset(X, y, valid_mask, val_rng)
-    test_ds  = make_dataset(X, y, valid_mask, test_rng)
+    val_ds = make_dataset(X, y, valid_mask, val_rng)
+    test_ds = make_dataset(X, y, valid_mask, test_rng)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True, num_workers=4,  # ← was 0
-                              pin_memory=True,  # ← add this
-                              persistent_workers=True)  # ← add this
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE * 2,  # ← double for eval
+                              shuffle=True, num_workers=4,
+                              pin_memory=True,
+                              persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE * 2,
                             shuffle=False, num_workers=4,
                             pin_memory=True,
                             persistent_workers=True)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
-                              shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE,
+                             shuffle=False, num_workers=0)
 
     # ── Model ──────────────────────────────────────────────────────────
     f_static = node_attr.shape[1]
-    f_edge   = edge_attr.shape[1]
+    f_edge = edge_attr.shape[1]
 
     model = STGNNFloodModel(
         f_dyn=F, f_static=f_static, f_edge=f_edge,
@@ -527,8 +512,8 @@ def train(logger):
 
     # ── Training ───────────────────────────────────────────────────────
     best_val_loss = math.inf
-    patience_ctr  = 0
-    history       = []
+    patience_ctr = 0
+    history = []
 
     logger.info("Starting training …")
     for epoch in range(1, MAX_EPOCHS + 1):
@@ -541,7 +526,7 @@ def train(logger):
         scheduler.step(val_loss)
 
         current_lr = optimiser.param_groups[0]['lr']
-        logger.info("  LR: %.2e", current_lr)  # ← log every epoch, not just at floor
+        logger.info("  LR: %.2e", current_lr)
         if current_lr <= 1e-5:
             logger.info("  LR floor reached — stopping")
             break
@@ -549,7 +534,7 @@ def train(logger):
         history.append({
             "epoch": epoch,
             "train_loss": round(train_loss, 6),
-            "val_loss":   round(val_loss, 6),
+            "val_loss": round(val_loss, 6),
             **{f"val_{k}": round(v, 4) for k, v in val_metrics.items()},
         })
 
@@ -565,12 +550,12 @@ def train(logger):
         # ── Checkpoint on improvement ──────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            patience_ctr  = 0
+            patience_ctr = 0
             torch.save({
-                "epoch":      epoch,
+                "epoch": epoch,
                 "state_dict": model.state_dict(),
-                "optimiser":  optimiser.state_dict(),
-                "val_loss":   val_loss,
+                "optimiser": optimiser.state_dict(),
+                "val_loss": val_loss,
                 "val_metrics": val_metrics,
                 "hparams": {
                     "t_in": T_IN, "t_out": T_OUT,
@@ -632,7 +617,6 @@ def train(logger):
 
     # Skill score vs persistence per node
     # Proper persistence: last input step stage_anomaly
-    # Rebuild from test_loader since we didn't store x_seq above
     all_persist = []
     with torch.no_grad():
         for x_seq, y_seq, mask in test_loader:
