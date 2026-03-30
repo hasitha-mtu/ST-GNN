@@ -1,7 +1,7 @@
 {
   "num_nodes": 27,
-  "num_edges": 26,
-  "node_feature_dim": 6,
+  "num_edges": 28,
+  "node_feature_dim": 7,
   "edge_feature_dim": 4,
   "reservoir_refs": [
     19094,
@@ -20,12 +20,13 @@
     19164
   ],
   "node_feature_names": [
-    "log_catchment_area",
-    "gauge_datum_m",
-    "p75_mAOD",
+    "log_catchment_area_km2",
+    "gauge_datum_mOSGM15",
     "p90_mAOD",
     "amax_med_mAOD",
-    "is_reservoir"
+    "is_reservoir",
+    "is_tidal",
+    "has_discharge"
   ],
   "edge_feature_names": [
     "river_dist_km",
@@ -651,6 +652,8 @@
     {
       "src_ref": "19057",
       "dst_ref": "19056",
+      "src_idx": 1,
+      "dst_idx": 0,
       "river_dist_km": 1.1354,
       "area_ratio": 0.526,
       "elev_drop_m": -19.763,
@@ -659,6 +662,8 @@
     {
       "src_ref": "19058",
       "dst_ref": "19059",
+      "src_idx": 2,
+      "dst_idx": 3,
       "river_dist_km": 1.4302,
       "area_ratio": 1.565,
       "elev_drop_m": -30.142,
