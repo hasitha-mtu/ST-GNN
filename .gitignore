@@ -1,5 +1,6 @@
 .idea/
-dataset/
+dataset/processed
+dataset/raw
 logs/
 src/data/__pycache__/
 src/data/downloaders/__pycache__/
