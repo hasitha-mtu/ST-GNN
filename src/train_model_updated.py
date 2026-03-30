@@ -1,5 +1,5 @@
 """
-train_model.py  v1  –  ST-GNN flood forecasting for the Lee catchment
+train_model.py  v2  –  ST-GNN flood forecasting for the Lee catchment
 ======================================================================
 Architecture:
   1. Node embedding   Linear([F_dyn + F_static]) → hidden_dim
@@ -9,10 +9,22 @@ Architecture:
 
 Input window:   T_in  = 32 steps  (8 hours)
 Output horizon: T_out =  4 steps  (1 hour, multi-step)
-Target:         stage_anomaly  (feature index 0 in X)
+
+Target (v2):    DELTA stage_anomaly — the model predicts the CHANGE from
+                the last observed value rather than the absolute level.
+                  delta[h] = stage_anomaly[t+h] - stage_anomaly[t]
+                Absolute predictions are recovered at evaluation time:
+                  abs_pred[h] = last_obs + delta_pred[h]
+                An output of 0.0 is now equivalent to persistence, so
+                the model is explicitly penalised for lazy forecasting.
+
+Loss (v2):      Horizon-weighted masked MSE — later steps in the forecast
+                window receive proportionally more weight.
+                  h+1: weight 1×,  h+2: 2×,  h+3: 3×,  h+4: 4×
+                This forces the model to focus on the harder long-horizon
+                predictions where persistence degrades most.
 
 Train / val / test split: chronological 70 / 15 / 15 with T_in+T_out purge gaps
-Loss:           MSE masked by valid_mask (ignores zero-filled gaps)
 """
 
 import json
@@ -87,7 +99,6 @@ class LeeFloodDataset(Dataset):
     def __getitem__(self, idx):
         x_seq = self.X[idx: idx + self.t_in]
 
-        # ── 🚨 ALIGNMENT WARNING ──
         # y[t] = stage_anomaly at t+1, so start from t_in-1 to get 1-step-ahead first.
         # NOTE: This explicitly assumes `y.npy` was forward-shifted by 1 index during
         # preprocessing. If `y` is just an unshifted slice (e.g., X[:,:,0]), this will
@@ -165,7 +176,6 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
     edge_cols = ["river_dist_km", "area_ratio", "elev_drop_m", "same_tributary"]
     edge_attr_np = edges_df[edge_cols].values
 
-    # ── 🌍 FIX: Mask unreliable elev_drop_m for reservoir edges ──
     # Check if a node is a reservoir (is_reservoir == 1)
     is_res = nodes_df["is_reservoir"].values
     src_is_res = is_res[edges_df["src_idx"].values]
@@ -187,132 +197,13 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
     return edge_index, edge_attr, node_attr
 
 
-# # ═══════════════════════════════════════════════════════════════════════
-# # 3. Model
-# # ═══════════════════════════════════════════════════════════════════════
-#
-# class STGNNFloodModel(nn.Module):
-#     """
-#     Spatio-Temporal GNN for flood stage-anomaly forecasting.
-#
-#     Forward pass:
-#       x_seq      [B, T_in, N, F_dyn]
-#       node_attr  [N, F_static]
-#       edge_index [2, E]
-#       edge_attr  [E, F_edge]
-#
-#     Returns:
-#       pred       [B, T_out, N]   predicted stage_anomaly
-#     """
-#
-#     def __init__(
-#             self,
-#             f_dyn: int,  # dynamic feature dim  (5)
-#             f_static: int,  # static  feature dim  (7)
-#             f_edge: int,  # edge    feature dim  (4)
-#             hidden: int,
-#             gat_heads: int,
-#             gru_layers: int,
-#             t_out: int,
-#             dropout: float,
-#     ):
-#         super().__init__()
-#         self.hidden = hidden
-#         self.gat_heads = gat_heads
-#         self.t_out = t_out
-#
-#         # ── Node embedding ─────────────────────────────────────────────
-#         # Combines dynamic + static features into hidden_dim
-#         self.node_embed = nn.Sequential(
-#             nn.Linear(f_dyn + f_static, hidden),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),
-#         )
-#
-#         # ── Edge embedding (project edge_attr to hidden_dim for GAT) ──
-#         self.edge_embed = nn.Linear(f_edge, hidden)
-#
-#         # ── Spatial: 2-head GAT ────────────────────────────────────────
-#         # concat=True → output dim = hidden * gat_heads
-#         # We project back to hidden after GAT
-#         self.gat = GATConv(
-#             in_channels=hidden,
-#             out_channels=hidden // gat_heads,
-#             heads=gat_heads,
-#             concat=True,
-#             edge_dim=hidden,
-#             dropout=dropout,
-#             add_self_loops=True,
-#         )
-#         self.gat_norm = nn.LayerNorm(hidden)
-#         self.gat_drop = nn.Dropout(dropout)
-#
-#         # ── Temporal: GRU ──────────────────────────────────────────────
-#         self.gru = nn.GRU(
-#             input_size=hidden,
-#             hidden_size=hidden,
-#             num_layers=gru_layers,
-#             batch_first=True,
-#             dropout=dropout if gru_layers > 1 else 0.0,
-#         )
-#
-#         # ── Output head ────────────────────────────────────────────────
-#         self.head = nn.Sequential(
-#             nn.Linear(hidden, hidden // 2),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),  # ── FIX: Added to prevent overfitting to specific temporal states
-#             nn.Linear(hidden // 2, t_out),
-#         )
-#
-#     def forward(self, x_seq, node_attr, edge_index, edge_attr):
-#         B, T, N, _ = x_seq.shape
-#
-#         # ── Edge embedding (once) ────────────────────────────────────────
-#         edge_feat = self.edge_embed(edge_attr)  # [E, hidden]
-#
-#         # ── Node embedding (all timesteps at once) ───────────────────────
-#         static_exp = node_attr.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-#         combined = torch.cat([x_seq, static_exp], dim=-1)  # [B, T, N, F]
-#         h = self.node_embed(combined.reshape(B * T * N, -1))
-#         h = h.view(B * T, N, self.hidden)  # [B*T, N, hidden]
-#
-#         # ── ONE batched GAT call across B*T graphs ───────────────────────
-#         # Build edge index once — offset by N for each of the B*T graphs
-#         BT = B * T
-#         offsets = torch.arange(BT, device=edge_index.device) * N  # [B*T]
-#         ei = edge_index.unsqueeze(0) + offsets.view(-1, 1, 1)  # [B*T, 2, E]
-#         ei = ei.permute(1, 0, 2).reshape(2, -1)  # [2, B*T*E]
-#
-#         # Expanding edges isn't the most memory-efficient PyTorch operation,
-#         # but works fine here given the static graph topology.
-#         ea = edge_feat.unsqueeze(0).expand(BT, -1, -1).reshape(-1, edge_feat.shape[-1])
-#
-#         h_flat = h.reshape(BT * N, self.hidden)
-#         gat_out = self.gat(h_flat, ei, ea)  # one call
-#         gat_out = self.gat_norm(gat_out + h_flat)
-#         gat_out = self.gat_drop(gat_out)
-#
-#         # ── GRU ─────────────────────────────────────────────────────────
-#         # [B*T, N, hidden] → [B, N, T, hidden] → [B*N, T, hidden]
-#         gru_in = gat_out.view(B, T, N, self.hidden) \
-#             .permute(0, 2, 1, 3) \
-#             .reshape(B * N, T, self.hidden)
-#         _, h_n = self.gru(gru_in)  # [layers, B*N, hidden]
-#
-#         # ── Output ──────────────────────────────────────────────────────
-#         pred = self.head(h_n[-1]) \
-#             .view(B, N, self.t_out) \
-#             .permute(0, 2, 1)  # [B, T_out, N]
-#         return pred
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 3. Model
 # ═══════════════════════════════════════════════════════════════════════
 
 class STGNNFloodModel(nn.Module):
     """
-    Spatio-Temporal GNN for flood stage-anomaly forecasting (Residual Architecture).
+    Spatio-Temporal GNN for flood stage-anomaly forecasting.
 
     Forward pass:
       x_seq      [B, T_in, N, F_dyn]
@@ -321,7 +212,7 @@ class STGNNFloodModel(nn.Module):
       edge_attr  [E, F_edge]
 
     Returns:
-      pred       [B, T_out, N]   predicted stage_anomaly (last_obs + delta)
+      pred       [B, T_out, N]   predicted stage_anomaly
     """
 
     def __init__(
@@ -341,6 +232,7 @@ class STGNNFloodModel(nn.Module):
         self.t_out = t_out
 
         # ── Node embedding ─────────────────────────────────────────────
+        # Combines dynamic + static features into hidden_dim
         self.node_embed = nn.Sequential(
             nn.Linear(f_dyn + f_static, hidden),
             nn.ReLU(),
@@ -351,6 +243,8 @@ class STGNNFloodModel(nn.Module):
         self.edge_embed = nn.Linear(f_edge, hidden)
 
         # ── Spatial: 2-head GAT ────────────────────────────────────────
+        # concat=True → output dim = hidden * gat_heads
+        # We project back to hidden after GAT
         self.gat = GATConv(
             in_channels=hidden,
             out_channels=hidden // gat_heads,
@@ -372,16 +266,16 @@ class STGNNFloodModel(nn.Module):
             dropout=dropout if gru_layers > 1 else 0.0,
         )
 
-        # ── Output head (Now predicts DELTA) ───────────────────────────
+        # ── Output head ────────────────────────────────────────────────
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout),  # ── FIX: Added to prevent overfitting to specific temporal states
             nn.Linear(hidden // 2, t_out),
         )
 
     def forward(self, x_seq, node_attr, edge_index, edge_attr):
-        B, T, N, F = x_seq.shape
+        B, T, N, _ = x_seq.shape
 
         # ── Edge embedding (once) ────────────────────────────────────────
         edge_feat = self.edge_embed(edge_attr)  # [E, hidden]
@@ -393,11 +287,14 @@ class STGNNFloodModel(nn.Module):
         h = h.view(B * T, N, self.hidden)  # [B*T, N, hidden]
 
         # ── ONE batched GAT call across B*T graphs ───────────────────────
+        # Build edge index once — offset by N for each of the B*T graphs
         BT = B * T
         offsets = torch.arange(BT, device=edge_index.device) * N  # [B*T]
         ei = edge_index.unsqueeze(0) + offsets.view(-1, 1, 1)  # [B*T, 2, E]
         ei = ei.permute(1, 0, 2).reshape(2, -1)  # [2, B*T*E]
 
+        # Expanding edges isn't the most memory-efficient PyTorch operation,
+        # but works fine here given the static graph topology.
         ea = edge_feat.unsqueeze(0).expand(BT, -1, -1).reshape(-1, edge_feat.shape[-1])
 
         h_flat = h.reshape(BT * N, self.hidden)
@@ -406,28 +303,17 @@ class STGNNFloodModel(nn.Module):
         gat_out = self.gat_drop(gat_out)
 
         # ── GRU ─────────────────────────────────────────────────────────
+        # [B*T, N, hidden] → [B, N, T, hidden] → [B*N, T, hidden]
         gru_in = gat_out.view(B, T, N, self.hidden) \
             .permute(0, 2, 1, 3) \
             .reshape(B * N, T, self.hidden)
         _, h_n = self.gru(gru_in)  # [layers, B*N, hidden]
 
-        # ── Output (Delta Prediction) ───────────────────────────────────
-        # pred_delta shape: [B, T_out, N]
-        pred_delta = self.head(h_n[-1]) \
+        # ── Output ──────────────────────────────────────────────────────
+        pred = self.head(h_n[-1]) \
             .view(B, N, self.t_out) \
-            .permute(0, 2, 1)
-
-        # ── Residual Connection (The Fix) ───────────────────────────────
-        # Extract the stage_anomaly at the final input timestep (index 0 of F_dyn)
-        last_obs = x_seq[:, -1, :, 0]  # Shape: [B, N]
-
-        # Expand it to match the prediction horizon shape [B, T_out, N]
-        baseline = last_obs.unsqueeze(1).expand(-1, self.t_out, -1)
-
-        # Final prediction is baseline + learned delta
-        final_pred = baseline + pred_delta
-
-        return final_pred
+            .permute(0, 2, 1)  # [B, T_out, N]
+        return pred
 
 # ═══════════════════════════════════════════════════════════════════════
 # 4. Loss
@@ -436,12 +322,36 @@ class STGNNFloodModel(nn.Module):
 def masked_mse(pred: torch.Tensor, target: torch.Tensor,
                mask: torch.Tensor) -> torch.Tensor:
     """
-    MSE computed only over positions where mask == 1 (real observations).
+    Uniform MSE over valid positions. Kept for persistence baseline
+    evaluation where horizon weighting would distort the comparison.
     pred, target, mask: [B, T_out, N]
     """
     err = (pred - target) ** 2 * mask
     denom = mask.sum().clamp(min=1.0)
     return err.sum() / denom
+
+
+def masked_mse_horizon_weighted(pred: torch.Tensor, target: torch.Tensor,
+                                mask: torch.Tensor) -> torch.Tensor:
+    """
+    Horizon-weighted MSE over valid positions.
+
+    Later forecast steps receive higher weight so the model is penalised
+    more for errors at h+4 (60 min) than at h+1 (15 min). The weights
+    increase linearly and are normalised to mean=1, keeping the overall
+    loss scale comparable to plain MSE.
+
+      h+1: 0.4x   h+2: 0.8x   h+3: 1.2x   h+4: 1.6x  (T_out=4 example)
+
+    pred, target, mask: [B, T_out, N]
+    """
+    T_out = pred.shape[1]
+    # Linear ramp 1, 2, ..., T_out — normalised to mean = 1
+    ramp = torch.arange(1, T_out + 1, dtype=torch.float32, device=pred.device)
+    ramp = ramp / ramp.mean()                       # [T_out]
+    w = ramp.view(1, T_out, 1) * mask               # [B, T_out, N]
+    err = (pred - target) ** 2 * w
+    return err.sum() / w.sum().clamp(min=1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -485,16 +395,29 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
 
 def train_epoch(model, loader, optimiser, edge_index, edge_attr,
                 node_attr) -> float:
+    """
+    One training epoch using delta (residual) prediction.
+
+    The model predicts delta_stage_anomaly[h] = stage_anomaly[t+h] - stage_anomaly[t].
+    The horizon-weighted loss penalises later forecast steps more heavily,
+    preventing the model from collapsing to a near-zero-delta (persistence) solution.
+    """
     model.train()
     total_loss = 0.0
     for x_seq, y_seq, mask in loader:
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
-        mask = mask.to(DEVICE)
+        mask  = mask.to(DEVICE)
+
+        # ── Compute delta targets ──────────────────────────────────────
+        # last_obs: stage_anomaly at the final input timestep [B, N]
+        # delta_target[h] = stage_anomaly[t+h] - stage_anomaly[t]
+        last_obs     = x_seq[:, -1, :, 0]                        # [B, N]
+        delta_target = y_seq - last_obs.unsqueeze(1)              # [B, T_out, N]
 
         optimiser.zero_grad()
-        pred = model(x_seq, node_attr, edge_index, edge_attr)
-        loss = masked_mse(pred, y_seq, mask)
+        delta_pred = model(x_seq, node_attr, edge_index, edge_attr)  # [B, T_out, N]
+        loss = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
@@ -505,36 +428,56 @@ def train_epoch(model, loader, optimiser, edge_index, edge_attr,
 
 @torch.no_grad()
 def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
+    """
+    Evaluation epoch.
+
+    The model outputs delta predictions. Absolute predictions are
+    reconstructed as abs_pred = last_obs + delta_pred before computing
+    all metrics, so RMSE, MAE, and NSE are in the original stage_anomaly
+    space and directly comparable across runs.
+
+    The training loss logged here uses the same horizon-weighted delta
+    loss as train_epoch for a consistent comparison. Persistence metrics
+    use plain masked_mse on absolute values — no horizon weighting — to
+    give an honest baseline.
+    """
     model.eval()
     total_loss = 0.0
-    all_pred, all_tgt, all_mask = [], [], []
+    all_abs_pred, all_tgt, all_mask = [], [], []
     all_persist = []
 
     for x_seq, y_seq, mask in loader:
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
-        mask = mask.to(DEVICE)
+        mask  = mask.to(DEVICE)
 
-        pred = model(x_seq, node_attr, edge_index, edge_attr)
-        total_loss += masked_mse(pred, y_seq, mask).item()
+        # ── Delta prediction → absolute reconstruction ─────────────────
+        last_obs     = x_seq[:, -1, :, 0]                        # [B, N]
+        delta_target = y_seq - last_obs.unsqueeze(1)              # [B, T_out, N]
+        delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
+        abs_pred     = last_obs.unsqueeze(1) + delta_pred         # [B, T_out, N]
 
-        all_pred.append(pred.cpu())
+        # Training-consistent loss (horizon-weighted, delta space)
+        total_loss += masked_mse_horizon_weighted(
+            delta_pred, delta_target, mask
+        ).item()
+
+        all_abs_pred.append(abs_pred.cpu())
         all_tgt.append(y_seq.cpu())
         all_mask.append(mask.cpu())
 
-        # Persistence: repeat last input stage_anomaly for all T_out steps
-        # x_seq[:, -1, :, 0] = stage_anomaly at last input timestep
-        last_obs = x_seq[:, -1, :, 0].cpu()  # [B, N]
-        persist = last_obs.unsqueeze(1).expand(  # [B, T_out, N]
-            -1, y_seq.shape[1], -1
-        )
+        # Persistence baseline: predict last_obs at every horizon
+        persist = last_obs.unsqueeze(1).expand(-1, y_seq.shape[1], -1).cpu()
         all_persist.append(persist)
 
-    metrics = compute_metrics(
-        torch.cat(all_pred), torch.cat(all_tgt), torch.cat(all_mask)
-    )
+    cat_abs_pred = torch.cat(all_abs_pred)
+    cat_tgt      = torch.cat(all_tgt)
+    cat_mask     = torch.cat(all_mask)
+
+    # Metrics on absolute predictions — horizon-uniform so NSE is comparable
+    metrics = compute_metrics(cat_abs_pred, cat_tgt, cat_mask)
     persist_metrics = compute_metrics(
-        torch.cat(all_persist), torch.cat(all_tgt), torch.cat(all_mask)
+        torch.cat(all_persist), cat_tgt, cat_mask
     )
     return total_loss / len(loader), metrics, persist_metrics
 
@@ -566,9 +509,10 @@ def compute_per_node_metrics(
         ss_res = ((p - t) ** 2).sum()
         ss_tot = ((t - t.mean()) ** 2).sum()
         nse = (1 - ss_res / ss_tot.clamp(min=1e-8)).item()
-
+        mbe = (p - t).mean().item()
         rows.append({"node_idx": n, "rmse": round(rmse, 6),
                      "mae": round(mae, 6), "nse": round(nse, 6),
+                     "mbe": round(mbe, 6),
                      "n_valid": int(m.sum())})
     return rows
 
@@ -707,30 +651,51 @@ def train(logger):
 
     # Collect all predictions in one pass
     model.eval()
-    all_pred, all_tgt, all_mask = [], [], []
+    all_abs_pred, all_tgt, all_mask = [], [], []
     with torch.no_grad():
         for x_seq, y_seq, mask in test_loader:
-            x_seq = x_seq.to(DEVICE)
-            pred = model(x_seq, node_attr, edge_index, edge_attr)
-            all_pred.append(pred.cpu())
+            x_seq    = x_seq.to(DEVICE)
+            last_obs = x_seq[:, -1, :, 0]                        # [B, N]
+            delta_pred = model(x_seq, node_attr, edge_index, edge_attr)
+            abs_pred   = last_obs.unsqueeze(1) + delta_pred       # [B, T_out, N]
+            all_abs_pred.append(abs_pred.cpu())
             all_tgt.append(y_seq)
             all_mask.append(mask)
 
-    cat_pred = torch.cat(all_pred)
-    cat_tgt = torch.cat(all_tgt)
+    cat_pred = torch.cat(all_abs_pred)
+    cat_tgt  = torch.cat(all_tgt)
     cat_mask = torch.cat(all_mask)
 
     # Aggregate metrics
-    test_loss = masked_mse(cat_pred.to(DEVICE),
-                           cat_tgt.to(DEVICE),
-                           cat_mask.to(DEVICE)).item()
+    # Test loss: horizon-weighted delta-space loss (consistent with training)
+    with torch.no_grad():
+        delta_losses = []
+        for x_seq, y_seq, mask in test_loader:
+            x_seq    = x_seq.to(DEVICE)
+            y_seq_d  = y_seq.to(DEVICE)
+            mask_d   = mask.to(DEVICE)
+            last_obs = x_seq[:, -1, :, 0]
+            delta_target = y_seq_d - last_obs.unsqueeze(1)
+            delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
+            delta_losses.append(
+                masked_mse_horizon_weighted(delta_pred, delta_target, mask_d).item()
+            )
+    test_loss    = float(np.mean(delta_losses))
     test_metrics = compute_metrics(cat_pred, cat_tgt, cat_mask)
+
+    # ── Mean Bias Error ────────────────────────────────────────────────
+    # MBE = mean(pred - target) over all valid positions
+    # Near-zero MBE confirms the delta formulation removed systematic bias.
+    # Positive MBE = model over-predicts, negative = under-predicts.
+    m_all = cat_mask.bool()
+    mbe_global = (cat_pred[m_all] - cat_tgt[m_all]).mean().item()
 
     logger.info(
         "\n✓ Test results:\n"
-        "  Loss: %.4f\n  RMSE: %.4f\n  MAE:  %.4f\n  NSE:  %.4f",
+        "  Loss: %.4f\n  RMSE: %.4f\n  MAE:  %.4f\n  NSE:  %.4f\n  MBE:  %.4f m",
         test_loss,
         test_metrics["rmse"], test_metrics["mae"], test_metrics["nse"],
+        mbe_global,
     )
 
     # ── Per-node metrics ───────────────────────────────────────────────
@@ -742,12 +707,12 @@ def train(logger):
     pn_df["name"] = nodes_df["name"].values
 
     # Skill score vs persistence per node
-    # Proper persistence: last input step stage_anomaly
+    # Persistence: last observed stage_anomaly held constant across all horizons
     all_persist = []
     with torch.no_grad():
         for x_seq, y_seq, mask in test_loader:
-            last_obs = x_seq[:, -1, :, 0]
-            persist = last_obs.unsqueeze(1).expand(-1, T_OUT, -1)
+            last_obs = x_seq[:, -1, :, 0]                        # [B, N]
+            persist  = last_obs.unsqueeze(1).expand(-1, T_OUT, -1)
             all_persist.append(persist)
 
     cat_persist = torch.cat(all_persist)
@@ -759,7 +724,7 @@ def train(logger):
     ).round(4)
 
     # Reorder columns for readability
-    pn_df = pn_df[["ref", "name", "n_valid", "rmse", "mae",
+    pn_df = pn_df[["ref", "name", "n_valid", "rmse", "mae", "mbe",
                    "nse", "persist_nse", "skill"]]
     pn_df.to_csv(CKPT_DIR / "per_node_metrics.csv", index=False)
     logger.info("  Saved per_node_metrics.csv")
@@ -773,7 +738,11 @@ def train(logger):
 
     # Save aggregate test metrics
     with open(CKPT_DIR / "test_metrics.json", "w") as f:
-        json.dump({"test_loss": test_loss, **test_metrics}, f, indent=2)
+        json.dump({
+            "test_loss": test_loss,
+            **test_metrics,
+            "mbe": round(mbe_global, 6),
+        }, f, indent=2)
 
     return model, test_metrics
 
