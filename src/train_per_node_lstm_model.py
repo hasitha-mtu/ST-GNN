@@ -545,7 +545,7 @@ def train(logger):
         for x_seq, y_seq, mask in test_loader:
             x_seq    = x_seq.to(DEVICE)
             last_obs = x_seq[:, -1, :, 0]                        # [B, N]
-            delta_pred = model(x_seq, node_attr, edge_index, edge_attr)
+            delta_pred = model(x_seq, node_attr)
             abs_pred   = last_obs.unsqueeze(1) + delta_pred       # [B, T_out, N]
             all_abs_pred.append(abs_pred.cpu())
             all_tgt.append(y_seq)
