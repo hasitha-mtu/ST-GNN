@@ -565,7 +565,7 @@ def train(logger):
             mask_d   = mask.to(DEVICE)
             last_obs = x_seq[:, -1, :, 0]
             delta_target = y_seq_d - last_obs.unsqueeze(1)
-            delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
+            delta_pred   = model(x_seq, node_attr)
             delta_losses.append(
                 masked_mse_horizon_weighted(delta_pred, delta_target, mask_d).item()
             )
