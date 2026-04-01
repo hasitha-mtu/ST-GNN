@@ -389,6 +389,62 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
     }
 
 
+def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
+                              mask: torch.Tensor) -> list[dict]:
+    """
+    Compute RMSE, MAE, and NSE at each individual forecast step h,
+    averaged across all nodes.
+
+    Tensors shape: [B, T_out, N]
+
+    Returns a list of T_out dicts, one per step:
+        [{"step": 1, "rmse": ..., "mae": ..., "nse": ...}, ...]
+
+    This enables the per-step horizon analysis recommended by
+    Gao et al. (2022): graph models should show growing advantage
+    over non-graph baselines as h increases, because upstream
+    routing signals take time to propagate to downstream nodes.
+    The advantage at h+1 (15 min) is expected to be small; at h+4
+    (1 hr) it should be most pronounced when T_out=4.
+
+    The mask is sliced to [:, h, :] for step h because valid_mask
+    may differ by step (e.g., tidal stations flagged at certain
+    steps due to data gaps).
+    """
+    T_out = pred.shape[1]
+    N     = pred.shape[2]
+    results = []
+
+    for h in range(T_out):
+        # Slice to step h: [B, N]
+        pred_h = pred[:, h, :]
+        tgt_h  = target[:, h, :]
+        mask_h = mask[:, h, :]
+
+        rmse_list, mae_list, nse_list = [], [], []
+        for n in range(N):
+            m = mask_h[:, n].bool()
+            p = pred_h[:, n][m].cpu().float()
+            t = tgt_h[:,  n][m].cpu().float()
+            if len(t) < 2:
+                continue
+            rmse_list.append(((p - t) ** 2).mean().sqrt().item())
+            mae_list.append((p - t).abs().mean().item())
+            ss_res = ((p - t) ** 2).sum()
+            ss_tot = ((t - t.mean()) ** 2).sum()
+            nse_list.append((1 - ss_res / ss_tot.clamp(min=1e-8)).item())
+
+        results.append({
+            "step":  h + 1,                               # 1-indexed
+            "lead_min": (h + 1) * 15,                     # minutes ahead
+            "rmse": float(np.mean(rmse_list)) if rmse_list else float("nan"),
+            "mae":  float(np.mean(mae_list))  if mae_list  else float("nan"),
+            "nse":  float(np.mean(nse_list))  if nse_list  else float("nan"),
+        })
+
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 6. Training loop
 # ═══════════════════════════════════════════════════════════════════════
@@ -730,6 +786,30 @@ def train(logger):
     # Save aggregate test metrics
     with open(CKPT_DIR / "test_metrics.json", "w") as f:
         json.dump({"test_loss": test_loss, **test_metrics}, f, indent=2)
+
+    # ── Per-step metrics (h+1 … h+T_out) ──────────────────────────────
+    # Saves RMSE, MAE, NSE at each individual forecast step so the
+    # analysis script can test whether the ST-GNN advantage grows with
+    # horizon (Gao et al. 2022).
+    per_step = compute_per_step_metrics(cat_pred, cat_tgt, cat_mask)
+
+    # Also compute per-step persistence metrics for skill score
+    per_step_persist = compute_per_step_metrics(cat_persist, cat_tgt, cat_mask)
+    for h_dict, p_dict in zip(per_step, per_step_persist):
+        persist_nse = p_dict["nse"]
+        model_nse   = h_dict["nse"]
+        if not (np.isnan(persist_nse) or np.isnan(model_nse)) and persist_nse < 1.0:
+            h_dict["persist_nse"] = round(persist_nse, 6)
+            h_dict["skill"] = round(
+                (model_nse - persist_nse) / (1 - persist_nse), 4
+            )
+        else:
+            h_dict["persist_nse"] = float("nan")
+            h_dict["skill"]       = float("nan")
+
+    with open(CKPT_DIR / "per_step_metrics.json", "w") as f:
+        json.dump(per_step, f, indent=2)
+    logger.info("  Saved per_step_metrics.json (%d steps)", len(per_step))
 
     return model, test_metrics
 
