@@ -39,6 +39,7 @@ import pandas as pd
 
 from src.utils.config import load_config
 from src.utils.logger import get_logger
+from src.utils.common_utils import seed_everything
 
 from src.models.baseline_gru import PerNodeGRU
 
@@ -638,6 +639,7 @@ def train(logger):
 
 
 if __name__ == "__main__":
+    seed_everything(42)
     config_path = r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\config\config.yaml"
     config = load_config(Path(config_path))
     logger = get_logger(config["logging"]["train"])
