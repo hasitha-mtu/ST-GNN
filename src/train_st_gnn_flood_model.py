@@ -45,6 +45,7 @@ from src.utils.train_utils import make_dataset
 from src.utils.train_utils import load_graph
 from src.utils.train_utils import compute_metrics
 from src.utils.train_utils import masked_mse_horizon_weighted
+from src.utils.train_utils import compute_per_step_metrics
 
 from src.models.st_gnn_flood import STGNNFloodModel
 
@@ -426,6 +427,30 @@ def train(logger, seed, t_in, t_out, max_epochs):
             **test_metrics,
             "mbe": round(mbe_global, 6),
         }, f, indent=2)
+
+        # ── Per-step metrics (h+1 … h+T_out) ──────────────────────────────
+        # Saves RMSE, MAE, NSE at each individual forecast step so the
+        # analysis script can test whether the ST-GNN advantage grows with
+        # horizon (Gao et al. 2022).
+        per_step = compute_per_step_metrics(cat_pred, cat_tgt, cat_mask)
+
+        # Also compute per-step persistence metrics for skill score
+        per_step_persist = compute_per_step_metrics(cat_persist, cat_tgt, cat_mask)
+        for h_dict, p_dict in zip(per_step, per_step_persist):
+            persist_nse = p_dict["nse"]
+            model_nse = h_dict["nse"]
+            if not (np.isnan(persist_nse) or np.isnan(model_nse)) and persist_nse < 1.0:
+                h_dict["persist_nse"] = round(persist_nse, 6)
+                h_dict["skill"] = round(
+                    (model_nse - persist_nse) / (1 - persist_nse), 4
+                )
+            else:
+                h_dict["persist_nse"] = float("nan")
+                h_dict["skill"] = float("nan")
+
+        with open(ckpt_dir / "per_step_metrics.json", "w") as f:
+            json.dump(per_step, f, indent=2)
+        logger.info("  Saved per_step_metrics.json (%d steps)", len(per_step))
 
     return model, test_metrics
 

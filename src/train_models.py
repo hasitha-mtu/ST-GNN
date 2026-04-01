@@ -1,10 +1,10 @@
-from src.train_per_node_gru_model import train as train_gru
-from src.train_per_node_lstm_model import train as train_lstm
-from src.train_st_gnn_flood_model import train as train_st_gnn
+from train_per_node_gru_model import train as train_gru
+from train_per_node_lstm_model import train as train_lstm
+from train_st_gnn_flood_model import train as train_st_gnn
 
-from src.utils.common_utils import seed_everything
-from src.utils.config import load_config
-from src.utils.logger import get_logger
+from utils.common_utils import seed_everything
+from utils.config import load_config
+from utils.logger import get_logger
 
 from pathlib import Path
 
