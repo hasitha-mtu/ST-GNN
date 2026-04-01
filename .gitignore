@@ -2,6 +2,9 @@
 dataset/processed
 dataset/raw
 logs/
+src/__pycache__/
 src/data/__pycache__/
+src/models/__pycache__/
+src/utils/__pycache__/
 src/data/downloaders/__pycache__/
 src/data/processors/__pycache__/
