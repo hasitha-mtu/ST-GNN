@@ -207,3 +207,58 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
         "mae": float(np.mean(mae_list)),
         "nse": float(np.mean(nse_list)),
     }
+
+def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
+                              mask: torch.Tensor) -> list[dict]:
+    """
+    Compute RMSE, MAE, and NSE at each individual forecast step h,
+    averaged across all nodes.
+
+    Tensors shape: [B, T_out, N]
+
+    Returns a list of T_out dicts, one per step:
+        [{"step": 1, "rmse": ..., "mae": ..., "nse": ...}, ...]
+
+    This enables the per-step horizon analysis recommended by
+    Gao et al. (2022): graph models should show growing advantage
+    over non-graph baselines as h increases, because upstream
+    routing signals take time to propagate to downstream nodes.
+    The advantage at h+1 (15 min) is expected to be small; at h+4
+    (1 hr) it should be most pronounced when T_out=4.
+
+    The mask is sliced to [:, h, :] for step h because valid_mask
+    may differ by step (e.g., tidal stations flagged at certain
+    steps due to data gaps).
+    """
+    T_out = pred.shape[1]
+    N     = pred.shape[2]
+    results = []
+
+    for h in range(T_out):
+        # Slice to step h: [B, N]
+        pred_h = pred[:, h, :]
+        tgt_h  = target[:, h, :]
+        mask_h = mask[:, h, :]
+
+        rmse_list, mae_list, nse_list = [], [], []
+        for n in range(N):
+            m = mask_h[:, n].bool()
+            p = pred_h[:, n][m].cpu().float()
+            t = tgt_h[:,  n][m].cpu().float()
+            if len(t) < 2:
+                continue
+            rmse_list.append(((p - t) ** 2).mean().sqrt().item())
+            mae_list.append((p - t).abs().mean().item())
+            ss_res = ((p - t) ** 2).sum()
+            ss_tot = ((t - t.mean()) ** 2).sum()
+            nse_list.append((1 - ss_res / ss_tot.clamp(min=1e-8)).item())
+
+        results.append({
+            "step":  h + 1,                               # 1-indexed
+            "lead_min": (h + 1) * 15,                     # minutes ahead
+            "rmse": float(np.mean(rmse_list)) if rmse_list else float("nan"),
+            "mae":  float(np.mean(mae_list))  if mae_list  else float("nan"),
+            "nse":  float(np.mean(nse_list))  if nse_list  else float("nan"),
+        })
+
+    return results

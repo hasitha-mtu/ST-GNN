@@ -128,7 +128,25 @@ def load_all() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     global_df = pd.DataFrame(global_rows)
     node_df   = pd.concat(node_rows, ignore_index=True) if node_rows else pd.DataFrame()
-    return global_df, node_df
+
+    # ── Per-step metrics (per_step_metrics.json) ───────────────────────
+    step_rows = []
+    for model in MODELS:
+        for seed in SEEDS:
+            for hz in HORIZONS:
+                d  = CKPT_DIR / model / str(seed) / str(hz)
+                ps = d / "per_step_metrics.json"
+                if not ps.exists():
+                    continue
+                with open(ps) as f:
+                    steps = json.load(f)
+                for s in steps:
+                    step_rows.append({
+                        "model": model, "seed": seed, "horizon": hz,
+                        **s,
+                    })
+    step_df = pd.DataFrame(step_rows)
+    return global_df, node_df, step_df
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -427,28 +445,24 @@ def _find_nse_col(h: pd.DataFrame, path: Path) -> tuple:
 
     Returns (values_array, y_label, used_fallback).
     """
-    # ['epoch', 'train_loss', 'val_loss', 'val_rmse', 'val_mae', 'val_nse']
-    # for candidate in ('epoch', 'train_loss', 'val_loss', 'val_rmse', 'val_mae', 'val_nse'):
-    #     if candidate in h.columns:
-    #         print(f'_find_nse_col|candidate: {candidate}')
-    #         return h[candidate].values, "Validation NSE", False
-    #
-    # # Fallback: normalise val_loss to a 0→1 scale (inverted, so higher=better)
-    # if "val_loss" in h.columns:
-    #     vl = h["val_loss"].values.astype(float)
-    #     lo, hi = np.nanmin(vl), np.nanmax(vl)
-    #     if hi > lo:
-    #         normed = 1.0 - (vl - lo) / (hi - lo)
-    #     else:
-    #         normed = np.zeros_like(vl)
-    #     print(f"  [warn] no NSE column in {path.parent.name}/"
-    #           f"{path.name} — plotting normalised val_loss")
-    #     return normed, "Normalised val_loss (proxy, not NSE)", True
-    #
-    # print(f"  [warn] no usable column in {path} — skipping")
-    # return None, None, False
+    for candidate in ("val_nse", "nse", "val_metric"):
+        if candidate in h.columns:
+            return h[candidate].values, "Validation NSE", False
 
-    return h['val_nse'].values, "Validation NSE", False
+    # Fallback: normalise val_loss to a 0→1 scale (inverted, so higher=better)
+    if "val_loss" in h.columns:
+        vl = h["val_loss"].values.astype(float)
+        lo, hi = np.nanmin(vl), np.nanmax(vl)
+        if hi > lo:
+            normed = 1.0 - (vl - lo) / (hi - lo)
+        else:
+            normed = np.zeros_like(vl)
+        print(f"  [warn] no NSE column in {path.parent.name}/"
+              f"{path.name} — plotting normalised val_loss")
+        return normed, "Normalised val_loss (proxy, not NSE)", True
+
+    print(f"  [warn] no usable column in {path} — skipping")
+    return None, None, False
 
 
 def plot_training_curves_overlay(horizon: int = 4) -> None:
@@ -474,19 +488,12 @@ def plot_training_curves_overlay(horizon: int = 4) -> None:
                 print(f"  [warn] missing: {path}")
                 continue
             h = pd.read_csv(path)
-            if len(h) <= 1:
-                print(f"  [warn] {path} has only {len(h)} row(s) — "
-                      f"training script wrote to root checkpoints/ not subdir. "
-                      f"Re-run training with --model/--seed/--t_out args to fix.")
-                continue
             vals, col_label, fallback = _find_nse_col(h, path)
             if vals is None:
-                print(f"  [warn] missing: {vals}")
                 continue
             if fallback:
                 y_label = col_label
             all_vals.append(vals)
-            print(f' all_vals : {all_vals}')
             max_ep = max(max_ep, len(vals))
             ax.plot(range(1, len(vals) + 1), vals,
                     color=MODEL_COLORS[model], lw=0.7, alpha=0.35)
@@ -497,7 +504,6 @@ def plot_training_curves_overlay(horizon: int = 4) -> None:
             for i, arr in enumerate(all_vals):
                 padded[i, :len(arr)] = arr
             mean_vals = np.nanmean(padded, axis=0)
-            print(f' {model} : {mean_vals}')
             ax.plot(range(1, max_ep + 1), mean_vals,
                     color=MODEL_COLORS[model], lw=2.5,
                     label=MODEL_LABELS[model])
@@ -526,6 +532,87 @@ def plot_training_curves_overlay(horizon: int = 4) -> None:
                 dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: training_curves_hz{horizon}.png")
+
+
+def plot_per_step_advantage(step_df: pd.DataFrame) -> None:
+    """
+    For each T_out configuration, plot NSE at every individual forecast
+    step h+1 … h+T_out for all three models (mean ± std across seeds).
+
+    This directly tests Gao et al. (2022): graph models should show a
+    growing advantage over the no-graph GRU baseline as h increases,
+    because upstream flood wave propagation takes time — the graph edge
+    weights encode routing distance and the ST-GNN can exploit upstream
+    readings more effectively at longer leads.
+
+    A pattern where ST-GNN ≈ GRU at h+1 but ST-GNN > GRU at h+3/h+4
+    is the mechanistically correct signature of spatial value in the
+    graph, even if the globally-aggregated NSE shows no difference.
+    """
+    if step_df.empty:
+        print("  [skip] per_step_metrics.json not found in any directory.")
+        print("         Re-run train_model.py to generate per-step metrics.")
+        return
+
+    for hz in HORIZONS:
+        sub = step_df[step_df["horizon"] == hz]
+        if sub.empty:
+            continue
+
+        steps_present = sorted(sub["step"].unique())
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+        fig.patch.set_facecolor("white")
+
+        for model in MODELS:
+            nse_means, nse_stds = [], []
+            skill_means, skill_stds = [], []
+            for h in steps_present:
+                row = sub[(sub["model"] == model) & (sub["step"] == h)]
+                nse_means.append(row["nse"].mean())
+                nse_stds.append(row["nse"].std(ddof=1) if len(row) > 1 else 0)
+                if "skill" in row.columns:
+                    skill_means.append(row["skill"].mean())
+                    skill_stds.append(row["skill"].std(ddof=1) if len(row) > 1 else 0)
+
+            labels = [f"h+{s}" for s in steps_present]
+            c  = MODEL_COLORS[model]
+            mk = MODEL_MARKERS[model]
+
+            ax1.errorbar(labels, nse_means, yerr=nse_stds,
+                         color=c, marker=mk, ms=7, lw=2, capsize=4,
+                         label=MODEL_LABELS[model])
+            if skill_means:
+                ax2.errorbar(labels, skill_means, yerr=skill_stds,
+                             color=c, marker=mk, ms=7, lw=2, capsize=4,
+                             label=MODEL_LABELS[model])
+
+        ax1.axhline(PERSIST_NSE, color="#888780", lw=1.2, ls="--",
+                    label=f"Persistence ({PERSIST_NSE})")
+        ax1.set_xlabel("Forecast step", fontsize=10)
+        ax1.set_ylabel("NSE (mean ± std, 3 seeds)", fontsize=10)
+        ax1.set_title(f"NSE per forecast step  |  T_out={hz} ({HZ_LABEL[hz]})",
+                      fontsize=11)
+        ax1.legend(fontsize=8.5)
+        ax1.tick_params(labelsize=9)
+
+        ax2.axhline(0, color="#888780", lw=1.0, ls="--", alpha=0.7)
+        ax2.set_xlabel("Forecast step", fontsize=10)
+        ax2.set_ylabel("Skill score vs persistence", fontsize=10)
+        ax2.set_title(f"Skill per forecast step  |  T_out={hz} ({HZ_LABEL[hz]})",
+                      fontsize=11)
+        ax2.legend(fontsize=8.5)
+        ax2.tick_params(labelsize=9)
+
+        fig.suptitle(
+            f"Per-step horizon analysis  |  T_out={hz} ({HZ_LABEL[hz]}) | "
+            f"ST-GNN advantage should grow with step index (Gao et al. 2022)",
+            fontsize=10, y=1.01,
+        )
+        fig.tight_layout()
+        fig.savefig(OUT_DIR / f"per_step_hz{hz}.png",
+                    dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: per_step_hz{hz}.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -596,7 +683,7 @@ def print_conclusion(global_df: pd.DataFrame,
 
 def main():
     print("Loading experiment results …")
-    global_df, node_df = load_all()
+    global_df, node_df, step_df = load_all()
     print(f"  Loaded {len(global_df)} global records, "
           f"{len(node_df)} node records")
 
@@ -613,6 +700,7 @@ def main():
     print("\nGenerating figures …")
     plot_horizon_curves(global_df)
     plot_seed_stability(global_df)
+    plot_per_step_advantage(step_df)
     for hz in HORIZONS:
         plot_node_advantage(node_df, hz)
     plot_skill_violin(node_df)
@@ -628,6 +716,4 @@ def main():
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("./../checkpoints/gru/42/4/training_history.csv", nrows=1)
-    print(df.columns.tolist())
     main()
