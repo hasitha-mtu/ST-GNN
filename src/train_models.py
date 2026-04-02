@@ -8,7 +8,7 @@ from utils.logger import get_logger
 
 from pathlib import Path
 
-MAX_EPOCHS = 1
+MAX_EPOCHS = 100
 
 if __name__ == "__main__":
     seeds = [42, 123, 456]
