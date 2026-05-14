@@ -286,6 +286,7 @@ def categorise_node(raw: str) -> str:
 def categorise_edge(raw: str) -> str:
     """Map raw 'Edge Type' cell to a broad category."""
     if pd.isna(raw):
+        print(f'categorise_temporal|raw: {raw}')
         return "Other"
     s = str(raw).lower()
     if "attention" in s and "dynamic" in s:
@@ -296,20 +297,23 @@ def categorise_edge(raw: str) -> str:
         return "Knowledge graph"
     if "correlation" in s:
         return "Statistical correlation"
-    if "physical distance" in s or "flow direction" in s or "physical flow" in s:
+    if "physical distance" in s or "flow direction" in s or "physical flow" in s or "physical interaction" in s:
         return "Physical flow direction"
-    if "spatial relation" in s or "adjacency" in s:
+    if "spatial relation" in s or "adjacency" in s or "spatial dependency" in s or "adjacent" in s:
         return "Spatial adjacency"
     if "topographic" in s or "physics-based" in s:
         return "Physics-routed"
-    if "adaptive" in s:
+    if "adaptive" in s or "functional" in s or "weighted" in s:
         return "Adaptive / hybrid"
     if "interdepend" in s or "inter-series" in s:
         return "Inter-series dependency"
     if "connectivity" in s or "connection" in s:
         return "Physical connectivity"
+    if "river reacher" in s:
+        return "River reach"
     if "distance" in s:
         return "Physical flow direction"
+    print(f'categorise_temporal|s: {s}')
     return "Other"
 
 
@@ -1159,10 +1163,10 @@ def main():
 
     # ── Generate figures ──────────────────────────────────────────────────
     print("\nGenerating figures …\n")
-    print(f'df_arch original: {list(df_arch.columns.values)}')
+    print(f'df_gc original: {list(df_gc.columns.values)}')
     # fig2_overview(df_general, outdir, formats)
-    fig3_arch_matrix(df_arch, outdir, formats)
-    # fig4_graph_construction(df_gc, outdir, formats)
+    # fig3_arch_matrix(df_arch, outdir, formats)
+    fig4_graph_construction(df_gc, outdir, formats)
     # fig5_physics(df_pc, df_general, outdir, formats)
     # fig6_features(df_static, df_dynamic, outdir, formats)
 
