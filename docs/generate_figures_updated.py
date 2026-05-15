@@ -1284,7 +1284,7 @@ def fig6_features1(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     plt.close(fig)
 
 
-def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
+def fig6_features2(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
                   outdir: Path, formats: list):
     """
     Two-panel vertical figure:
@@ -1410,6 +1410,183 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     _save(fig, outdir, "fig6_features", formats)
     plt.close(fig)
 
+
+def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
+                  outdir: Path, formats: list):
+    """
+    Two-panel vertical figure:
+      (a) Static features (frequency > 1), sorted descending
+      (b) Dynamic features: count > 1 shown individually, all count = 1
+          features collapsed into a single Other bar, vision-derived
+          zero-count rows removed entirely.
+    """
+    print("  Generating Figure 6: Feature inventory …")
+
+    # Static features
+    sf_all = (
+        df_static[["Feature", "Studies"]]
+        .dropna(subset=["Feature"])
+        .copy()
+    )
+    sf_all["Feature"] = (sf_all["Feature"].astype(str)
+                         .str.replace("\n", " ", regex=False)
+                         .str.replace(r"\s+", " ", regex=True)
+                         .str.strip())
+    sf_all["Studies"] = pd.to_numeric(sf_all["Studies"], errors="coerce").fillna(0).astype(int)
+    sf_all = sf_all[sf_all["Feature"].str.lower() != "nan"]
+
+    sf_ones = sf_all[sf_all["Studies"] == 1]
+    sf = sf_all[sf_all["Studies"] > 1].sort_values("Studies", ascending=True).copy()
+    n_st_others = len(sf_ones)
+    st_other_row = pd.DataFrame({
+        "Feature": [f"Other ({n_st_others} features, each cited once)"],
+        "Studies": [n_st_others],
+        "is_other": [True],
+    })
+    sf["is_other"] = False
+    sf_plot = pd.concat([st_other_row, sf], ignore_index=True)
+    st_other_names = sf_ones["Feature"].tolist()
+
+    # Dynamic features
+    df = (
+        df_dynamic[["Feature", "Studies"]]
+        .dropna(subset=["Feature"])
+        .copy()
+    )
+    df["Feature"] = df["Feature"].astype(str).str.strip()
+    df["Studies"] = pd.to_numeric(df["Studies"], errors="coerce").fillna(0).astype(int)
+
+    # Split: main (count > 1) vs singletons (count == 1)
+    df_main = df[df["Studies"] > 1].sort_values("Studies", ascending=True).copy()
+    n_others = int((df["Studies"] == 1).sum())
+
+    other_row = pd.DataFrame({
+        "Feature": [f"Other ({n_others} features, each cited once)"],
+        "Studies": [n_others],
+        "is_other": [True],
+    })
+    df_main["is_other"] = False
+    df_plot = pd.concat([other_row, df_main], ignore_index=True)
+
+    bar_colors_b = [GREY if o else BLUE for o in df_plot["is_other"]]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 11))
+    fig.subplots_adjust(hspace=0.35)
+
+    # Panel (a) static
+    bar_colors_a = [GREY if o else BLUE for o in sf_plot["is_other"]]
+    y_pos_a = range(len(sf_plot))
+    axes[0].barh(y_pos_a, sf_plot["Studies"].values,
+                 color=bar_colors_a, edgecolor="white", linewidth=0.6)
+    for i, (cnt, is_other) in enumerate(
+            zip(sf_plot["Studies"].values, sf_plot["is_other"].values)):
+        axes[0].text(cnt + 0.15, i, str(int(cnt)),
+                     va="center", fontsize=8, fontweight="bold",
+                     color=GREY if is_other else "black")
+    axes[0].set_yticks(y_pos_a)
+    axes[0].set_yticklabels(sf_plot["Feature"].values, fontsize=8)
+    axes[0].set_xlabel("Number of Studies")
+    axes[0].set_title(
+        f"(a)  Static Input Features  (n total = {len(sf_all)})",
+        fontweight="bold")
+    axes[0].set_xlim(0, sf_plot["Studies"].max() + 3)
+    axes[0].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+
+    # ── Inset box listing all "Other" static features ─────────────────────
+    n_cols_st = 3
+    n_rows_st = (len(st_other_names) + n_cols_st - 1) // n_cols_st
+    cols_st = [st_other_names[i::n_cols_st] for i in range(n_cols_st)]
+    # Pad columns
+    for col in cols_st:
+        col += [""] * (n_rows_st - len(col))
+
+    st_lines = [r"$\bf{Other\ static\ features\ (each\ cited\ in\ 1\ study):}$"]
+    for row_i in range(n_rows_st):
+        parts = [f"• {cols_st[ci][row_i]}" if cols_st[ci][row_i] else ""
+                 for ci in range(n_cols_st)]
+        st_lines.append(f"{parts[0]:<32}{parts[1]:<32}{parts[2]}")
+
+    st_box_text = "\n".join(st_lines)
+
+    x_max_a = sf_plot["Studies"].max()
+    axes[0].text(
+        x_max_a * 0.35,
+        len(sf_plot) * 0.50,
+        st_box_text,
+        va="center", ha="left",
+        fontsize=6.0,
+        fontfamily="monospace",
+        transform=axes[0].transData,
+        bbox=dict(
+            boxstyle="round,pad=0.5",
+            facecolor="lightyellow",
+            edgecolor=GREY,
+            alpha=0.92,
+            linewidth=0.8,
+        ),
+    )
+
+    # Panel (b) dynamic
+    y_pos_b = range(len(df_plot))
+    axes[1].barh(y_pos_b, df_plot["Studies"].values,
+                 color=bar_colors_b, edgecolor="white", linewidth=0.6)
+    for i, (cnt, is_other) in enumerate(
+            zip(df_plot["Studies"].values, df_plot["is_other"].values)):
+        axes[1].text(cnt + 0.15, i, str(int(cnt)),
+                     va="center", fontsize=8, fontweight="bold",
+                     color=GREY if is_other else "black")
+    axes[1].set_yticks(y_pos_b)
+    axes[1].set_yticklabels(df_plot["Feature"].values, fontsize=8)
+    axes[1].set_xlabel("Number of Studies")
+    axes[1].set_title("(b)  Dynamic Input Features", fontweight="bold")
+    axes[1].set_xlim(0, df_plot["Studies"].max() + 5)
+    axes[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+
+    # ── Inset box listing all "Other" features ───────────────────────────
+    # Collect the singleton feature names in the same order they were in df_ones
+    other_names = df[df["Studies"] == 1]["Feature"].tolist()
+    n_half = (len(other_names) + 1) // 2
+    col1 = other_names[:n_half]
+    col2 = other_names[n_half:]
+
+    # Pad shorter column so zip works cleanly
+    max_rows = max(len(col1), len(col2))
+    col1 += [""] * (max_rows - len(col1))
+    col2 += [""] * (max_rows - len(col2))
+
+    # Build two-column text: bullet  Feature                bullet  Feature
+    lines = [r"$\bf{Other\ features\ (each\ cited\ in\ 1\ study):}$"]
+    for a, b in zip(col1, col2):
+        left = f"• {a}" if a else ""
+        right = f"• {b}" if b else ""
+        # fixed-width columns via padding in the string
+        lines.append(f"{left:<36}{right}")
+
+    box_text = "\n".join(lines)
+
+    # Position in axes-fraction coordinates so it sits in the open
+    # centre-right area (bars are short in the middle y-range)
+    x_max = df_plot["Studies"].max()
+    # Place box starting at ~40% of x-range, vertically centred
+    axes[1].text(
+        x_max * 0.38,  # x in data coords
+        len(df_plot) * 0.50,  # y in data coords (middle)
+        box_text,
+        va="center", ha="left",
+        fontsize=6.5,
+        fontfamily="monospace",
+        transform=axes[1].transData,
+        bbox=dict(
+            boxstyle="round,pad=0.5",
+            facecolor="lightyellow",
+            edgecolor=GREY,
+            alpha=0.92,
+            linewidth=0.8,
+        ),
+    )
+
+    _save(fig, outdir, "fig6_features", formats)
+    plt.close(fig)
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Utility – save helper
 # ─────────────────────────────────────────────────────────────────────────────
