@@ -764,9 +764,13 @@ def fig5_physics(df_pc: pd.DataFrame, df_general: pd.DataFrame,
             return "Topology\n+ Dynamic"
         if has_t2:
             return "Topology\nOnly"
+        if has_t1:
+            return "Loss Penalty"
+        print(f'classify_pattern|Other: {cs}')
         return "Other"
 
     df["pattern"] = df["components"].apply(classify_pattern)
+    df.to_csv("physics.csv")
 
     PATTERN_ORDER = [
         "Topology\nOnly",
@@ -775,7 +779,7 @@ def fig5_physics(df_pc: pd.DataFrame, df_general: pd.DataFrame,
         "Topology\n+ Dynamic",
         "Topology\n+ Loss Penalty",
         "Fully\nData-Learned",
-        "Other",
+        "Loss Penalty",
     ]
     PATTERN_COLORS = {
         "Topology\nOnly":                        BLUE,
@@ -784,7 +788,7 @@ def fig5_physics(df_pc: pd.DataFrame, df_general: pd.DataFrame,
         "Topology\n+ Dynamic":   AMBER,
         "Topology\n+ Loss Penalty":          GREEN,
         "Fully\nData-Learned":                        PURPLE,
-        "Other":                               GREY,
+        "Loss Penalty":                               GREY,
     }
 
     pat_counts_raw = df["pattern"].value_counts()
@@ -1159,17 +1163,17 @@ def main():
     df_general = sheets["General"]
     df_arch    = sheets["Architecture"]
     df_gc      = sheets["Graph Construction"]
-    # df_pc      = sheets["Physical Constraints"]
+    df_pc      = sheets["Physical Constraints"]
     df_static  = sheets["Static Features"]
     df_dynamic = sheets["Dynamic Features"]
 
     # ── Generate figures ──────────────────────────────────────────────────
     print("\nGenerating figures …\n")
-    print(f'df_gc original: {list(df_gc.columns.values)}')
+    print(f'df_pc original: {list(df_pc.columns.values)}')
     # fig2_overview(df_general, outdir, formats)
     # fig3_arch_matrix(df_arch, outdir, formats)
-    fig4_graph_construction(df_gc, outdir, formats)
-    # fig5_physics(df_pc, df_general, outdir, formats)
+    # fig4_graph_construction(df_gc, outdir, formats)
+    fig5_physics(df_pc, df_general, outdir, formats)
     # fig6_features(df_static, df_dynamic, outdir, formats)
 
     print(f"\n{'='*60}")
