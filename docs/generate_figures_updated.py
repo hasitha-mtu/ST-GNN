@@ -550,6 +550,8 @@ def fig4_graph_construction(df_gc: pd.DataFrame, outdir: Path, formats: list):
     node_counts = df["node_cat"].value_counts().sort_values()
     edge_counts = df["edge_cat"].value_counts().sort_values()
 
+    df.to_csv("construction.csv")
+
     fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
 
     # ── Panel (a): node types ─────────────────────────────────────────────
