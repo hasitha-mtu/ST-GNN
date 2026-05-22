@@ -467,8 +467,12 @@ def fig3_arch_matrix(df_arch: pd.DataFrame, outdir: Path, formats: list):
     cross = cross.loc[row_order, col_order]
 
     fig, ax = plt.subplots(
-        figsize=(max(10, len(col_order) * 1.4), max(5, len(row_order) * 0.8))
+        figsize=(max(14, len(col_order) * 1.6), max(6, len(row_order) * 1.0))
     )
+
+    # fig, ax = plt.subplots(
+    #     figsize=(12, 6)
+    # )
 
     for i, row in enumerate(cross.index):
         for j, col in enumerate(cross.columns):
@@ -486,16 +490,16 @@ def fig3_arch_matrix(df_arch: pd.DataFrame, outdir: Path, formats: list):
                 ax.text(
                     j, i, str(int(cnt)),
                     ha="center", va="center",
-                    fontsize=10, fontweight="bold", color="white",
+                    fontsize=12, fontweight="bold", color="white",
                     zorder=4,
                 )
 
     ax.set_xticks(range(len(col_order)))
-    ax.set_xticklabels(col_order, rotation=30, ha="right")
+    ax.set_xticklabels(col_order, rotation=40, ha="right", fontsize=14)
     ax.set_yticks(range(len(row_order)))
-    ax.set_yticklabels(row_order)
-    ax.set_xlabel("Temporal Component")
-    ax.set_ylabel("Spatial Component")
+    ax.set_yticklabels(row_order, fontsize=14)
+    ax.set_xlabel("Temporal Component", fontsize=15)
+    ax.set_ylabel("Spatial Component", fontsize=15)
     # ax.set_title(
     #     "Spatial × Temporal Architecture Matrix\n"
     #     "(bubble area proportional to number of studies)",
@@ -515,10 +519,10 @@ def fig3_arch_matrix(df_arch: pd.DataFrame, outdir: Path, formats: list):
     ax.set_ylim(-0.7, len(row_order) - 0.3)
     ax.grid(True, alpha=0.25, zorder=0)
 
-    # Bubble-size legend
-    for s_val, label in [(1, "1 study"), (3, "3 studies"), (5, "5 studies")]:
-        ax.scatter([], [], s=s_val * 350, c=BLUE, alpha=0.75,
-                   edgecolors="#1a3f6e", linewidth=0.8, label=label)
+    # # Bubble-size legend
+    # for s_val, label in [(1, "1 study"), (3, "3 studies"), (5, "5 studies")]:
+    #     ax.scatter([], [], s=s_val * 350, c=BLUE, alpha=0.75,
+    #                edgecolors="#1a3f6e", linewidth=0.8, label=label)
     # ax.legend(
     #     title="Study count",
     #     loc="upper right",
@@ -1616,7 +1620,7 @@ def parse_args():
     parser.add_argument(
         "--dpi",
         type=int,
-        default=1600,
+        default=1000,
         help="DPI for raster formats (default: 300)",
     )
     return parser.parse_args()
@@ -1669,8 +1673,8 @@ def main():
     print("\nGenerating figures …\n")
     print(f'df_static original: {list(df_static.columns.values)}')
     print(f'df_dynamic original: {list(df_dynamic.columns.values)}')
-    fig2_overview(df_general, outdir, formats)
-    # fig3_arch_matrix(df_arch, outdir, formats)
+    # fig2_overview(df_general, outdir, formats)
+    fig3_arch_matrix(df_arch, outdir, formats)
     # fig4_graph_construction(df_gc, outdir, formats)
     # fig5_physics(df_pc, df_general, outdir, formats)
     # fig6_features(df_static, df_dynamic, outdir, formats)
