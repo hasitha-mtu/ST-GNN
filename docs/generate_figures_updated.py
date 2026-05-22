@@ -1433,7 +1433,7 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     sf = sf_all[sf_all["Studies"] > 1].sort_values("Studies", ascending=True).copy()
     n_st_others = len(sf_ones)
     st_other_row = pd.DataFrame({
-        "Feature": [f"Other ({n_st_others} features, each cited once)"],
+        "Feature": [f"Other"],
         "Studies": [n_st_others],
         "is_other": [True],
     })
@@ -1455,7 +1455,7 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     n_others = int((df["Studies"] == 1).sum())
 
     other_row = pd.DataFrame({
-        "Feature": [f"Other ({n_others} features, each cited once)"],
+        "Feature": [f"Other"],
         "Studies": [n_others],
         "is_other": [True],
     })
@@ -1464,7 +1464,7 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
 
     bar_colors_b = [GREY if o else BLUE for o in df_plot["is_other"]]
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 11))
+    fig, axes = plt.subplots(2, 1, figsize=(14, 11))
     fig.subplots_adjust(hspace=0.35)
 
     # Panel (a) static
@@ -1475,11 +1475,11 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     for i, (cnt, is_other) in enumerate(
             zip(sf_plot["Studies"].values, sf_plot["is_other"].values)):
         axes[0].text(cnt + 0.15, i, str(int(cnt)),
-                     va="center", fontsize=8, fontweight="bold",
+                     va="center", fontsize=12, fontweight="bold",
                      color=GREY if is_other else "black")
     axes[0].set_yticks(y_pos_a)
-    axes[0].set_yticklabels(sf_plot["Feature"].values, fontsize=8)
-    axes[0].set_xlabel("Number of Studies")
+    axes[0].set_yticklabels(sf_plot["Feature"].values, fontsize=12)
+    axes[0].set_xlabel("Number of Studies", fontsize=14)
     axes[0].set_title(
         f"(a)  Static Input Features  (n total = {len(sf_all)})",
         fontweight="bold")
@@ -1508,7 +1508,7 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
         len(sf_plot) * 0.50,
         st_box_text,
         va="center", ha="left",
-        fontsize=6.0,
+        fontsize=8.5,
         fontfamily="monospace",
         transform=axes[0].transData,
         bbox=dict(
@@ -1527,11 +1527,11 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     for i, (cnt, is_other) in enumerate(
             zip(df_plot["Studies"].values, df_plot["is_other"].values)):
         axes[1].text(cnt + 0.15, i, str(int(cnt)),
-                     va="center", fontsize=8, fontweight="bold",
+                     va="center", fontsize=12, fontweight="bold",
                      color=GREY if is_other else "black")
     axes[1].set_yticks(y_pos_b)
-    axes[1].set_yticklabels(df_plot["Feature"].values, fontsize=8)
-    axes[1].set_xlabel("Number of Studies")
+    axes[1].set_yticklabels(df_plot["Feature"].values, fontsize=12)
+    axes[1].set_xlabel("Number of Studies", fontsize=14)
     axes[1].set_title("(b)  Dynamic Input Features", fontweight="bold")
     axes[1].set_xlim(0, df_plot["Studies"].max() + 5)
     axes[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
@@ -1563,11 +1563,11 @@ def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
     x_max = df_plot["Studies"].max()
     # Place box starting at ~40% of x-range, vertically centred
     axes[1].text(
-        x_max * 0.38,  # x in data coords
+        x_max * 0.45,  # x in data coords
         len(df_plot) * 0.50,  # y in data coords (middle)
         box_text,
         va="center", ha="left",
-        fontsize=6.5,
+        fontsize=9,
         fontfamily="monospace",
         transform=axes[1].transData,
         bbox=dict(
@@ -1674,10 +1674,10 @@ def main():
     print(f'df_static original: {list(df_static.columns.values)}')
     print(f'df_dynamic original: {list(df_dynamic.columns.values)}')
     # fig2_overview(df_general, outdir, formats)
-    fig3_arch_matrix(df_arch, outdir, formats)
+    # fig3_arch_matrix(df_arch, outdir, formats)
     # fig4_graph_construction(df_gc, outdir, formats)
     # fig5_physics(df_pc, df_general, outdir, formats)
-    # fig6_features(df_static, df_dynamic, outdir, formats)
+    fig6_features(df_static, df_dynamic, outdir, formats)
 
     print(f"\n{'='*60}")
     print(f"  All figures written to: {outdir.resolve()}")
