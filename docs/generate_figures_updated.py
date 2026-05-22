@@ -346,7 +346,7 @@ def fig2_overview(df_general: pd.DataFrame, outdir: Path, formats: list):
     print("  Generating Figure 2: Overview …")
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    fig.subplots_adjust(wspace=0.05)
+    fig.subplots_adjust(wspace=0.03)
     # fig, axes = plt.subplots(1, 2)
 
     # ── Panel (a): year trend ─────────────────────────────────────────────
@@ -372,16 +372,17 @@ def fig2_overview(df_general: pd.DataFrame, outdir: Path, formats: list):
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + 0.2,
                 str(int(cnt)),
-                ha="center", va="bottom", fontsize=9, fontweight="bold",
+                ha="center", va="bottom", fontsize=14, fontweight="bold",
             )
-    axes[0].set_xlabel("Publication Year")
-    axes[0].set_ylabel("Number of Studies")
+    axes[0].set_xlabel("Publication Year", fontsize=14)
+    axes[0].set_ylabel("Number of Studies", fontsize=14)
     # axes[0].set_title("(a)  Annual Publication Trend", fontweight="bold")
     axes[0].set_title("")
     axes[0].text(
         0.5, -0.18, "(a) Annual Publication Trend",
         transform=axes[0].transAxes,
-        ha="center", va="top", fontweight="bold"
+        ha="center", va="top", fontweight="bold",
+        fontsize=14
     )
     axes[0].set_xticks(list(all_years))
     axes[0].tick_params(axis="x", rotation=0)
@@ -415,6 +416,7 @@ def fig2_overview(df_general: pd.DataFrame, outdir: Path, formats: list):
         wedges, legend_labels,
         loc="center left",
         bbox_to_anchor=(1.02, 0.5),
+        fontsize=12,
         frameon=False,
     )
     # axes[1].set_title(
@@ -427,7 +429,8 @@ def fig2_overview(df_general: pd.DataFrame, outdir: Path, formats: list):
         0.5, -0.18,
         f"(b) Geographic Distribution (n = {len(df_general)})",
         transform=axes[1].transAxes,
-        ha="center", va="top", fontweight="bold"
+        ha="center", va="top", fontweight="bold",
+        fontsize=14
     )
 
     fig.subplots_adjust(wspace=0.05, bottom=0.2)
@@ -552,7 +555,7 @@ def fig4_graph_construction(df_gc: pd.DataFrame, outdir: Path, formats: list):
 
     df.to_csv("construction.csv")
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 7))
 
     # ── Panel (a): node types ─────────────────────────────────────────────
     colours_node = PALETTE[: len(node_counts)]
@@ -634,7 +637,227 @@ def fig4_graph_construction(df_gc: pd.DataFrame, outdir: Path, formats: list):
     _save(fig, outdir, "fig4_graph_construction", formats)
     plt.close(fig)
 
-
+# def fig4_graph_construction(df_gc: pd.DataFrame, outdir: Path, formats: list):
+#     """
+#     Three-panel figure:
+#       (a) Node type horizontal bar chart
+#       (b) Edge type horizontal bar chart
+#       (c) Graph size log-scale scatter plot
+#     """
+#
+#     print("  Generating Figure 4: Graph construction …")
+#
+#     df = df_gc.copy()
+#     df["node_cat"] = df["Node Type (Gauge/Mesh/River reach)"].apply(categorise_node)
+#     df["edge_cat"] = df["Edge Type (Physical/ Mesh/  Etc)"].apply(categorise_edge)
+#     df["graph_size"] = df["Graph Size"].apply(to_numeric_graphsize)
+#
+#     node_counts = df["node_cat"].value_counts().sort_values()
+#     edge_counts = df["edge_cat"].value_counts().sort_values()
+#
+#     df_size = df.dropna(subset=["graph_size"]).copy()
+#     df_size = df_size.sort_values("graph_size").reset_index(drop=True)
+#
+#     df.to_csv("construction.csv", index=False)
+#
+#     # ------------------------------------------------------------
+#     # Global style
+#     # ------------------------------------------------------------
+#     plt.rcParams.update({
+#         "font.size": 10,
+#         "axes.titlesize": 12,
+#         "axes.labelsize": 10,
+#         "xtick.labelsize": 9,
+#         "ytick.labelsize": 9,
+#         "legend.fontsize": 8,
+#         "figure.dpi": 300,
+#     })
+#
+#     fig, axes = plt.subplots(
+#         1, 3,
+#         figsize=(16.5, 6),
+#         gridspec_kw={
+#             "width_ratios": [1.15, 1.35, 1.10],
+#             "wspace": 0.32
+#         }
+#     )
+#
+#     # ============================================================
+#     # Panel (a): Node types
+#     # ============================================================
+#     bars_a = axes[0].barh(
+#         node_counts.index,
+#         node_counts.values,
+#         color=BLUE,
+#         edgecolor="white",
+#         linewidth=0.8
+#     )
+#
+#     for bar, cnt in zip(bars_a, node_counts.values):
+#         axes[0].text(
+#             bar.get_width() + 0.25,
+#             bar.get_y() + bar.get_height() / 2,
+#             f"{int(cnt)}",
+#             va="center",
+#             ha="left",
+#             fontsize=9,
+#             fontweight="bold"
+#         )
+#
+#     axes[0].set_xlabel("Number of studies")
+#     axes[0].set_title("(a) Node type", fontweight="bold", pad=10)
+#     axes[0].set_xlim(0, node_counts.max() + 4)
+#     axes[0].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+#     axes[0].grid(axis="x", alpha=0.25, linestyle="--", linewidth=0.6)
+#
+#     axes[0].spines["top"].set_visible(False)
+#     axes[0].spines["right"].set_visible(False)
+#
+#     # ============================================================
+#     # Panel (b): Edge types
+#     # ============================================================
+#     bars_b = axes[1].barh(
+#         edge_counts.index,
+#         edge_counts.values,
+#         color=ORANGE,
+#         edgecolor="white",
+#         linewidth=0.8
+#     )
+#
+#     for bar, cnt in zip(bars_b, edge_counts.values):
+#         axes[1].text(
+#             bar.get_width() + 0.25,
+#             bar.get_y() + bar.get_height() / 2,
+#             f"{int(cnt)}",
+#             va="center",
+#             ha="left",
+#             fontsize=9,
+#             fontweight="bold"
+#         )
+#
+#     axes[1].set_xlabel("Number of studies")
+#     axes[1].set_title("(b) Edge type", fontweight="bold", pad=10)
+#     axes[1].set_xlim(0, edge_counts.max() + 4)
+#     axes[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+#     axes[1].grid(axis="x", alpha=0.25, linestyle="--", linewidth=0.6)
+#
+#     axes[1].spines["top"].set_visible(False)
+#     axes[1].spines["right"].set_visible(False)
+#
+#     # ============================================================
+#     # Panel (c): Graph size distribution
+#     # ============================================================
+#     threshold = 1_000
+#
+#     point_colors = [
+#         ORANGE if v > threshold else BLUE
+#         for v in df_size["graph_size"]
+#     ]
+#
+#     axes[2].scatter(
+#         range(len(df_size)),
+#         df_size["graph_size"],
+#         c=point_colors,
+#         s=45,
+#         alpha=0.9,
+#         edgecolors="white",
+#         linewidth=0.6,
+#         zorder=3
+#     )
+#
+#     axes[2].set_yscale("log")
+#     axes[2].set_ylabel("Graph size (nodes)", labelpad=4)
+#     axes[2].set_xlabel(f"Studies with known size (n = {len(df_size)})")
+#     axes[2].set_title("(c) Graph size distribution", fontweight="bold", pad=10)
+#     axes[2].set_xticks([])
+#
+#     # Shorter log tick labels to reduce gap between panels B and C
+#     def log_tick_formatter(y, _):
+#         if y >= 1_000_000:
+#             return f"{int(y / 1_000_000)}M"
+#         elif y >= 1_000:
+#             return f"{int(y / 1_000)}K"
+#         elif y >= 1:
+#             return f"{int(y)}"
+#         return ""
+#
+#     axes[2].yaxis.set_major_locator(ticker.LogLocator(base=10))
+#     axes[2].yaxis.set_major_formatter(ticker.FuncFormatter(log_tick_formatter))
+#     axes[2].tick_params(axis="y", pad=2)
+#
+#     axes[2].grid(
+#         axis="y",
+#         which="major",
+#         alpha=0.30,
+#         linestyle="--",
+#         linewidth=0.7,
+#         zorder=0
+#     )
+#
+#     # Threshold line at 1,000 nodes
+#     axes[2].axhline(
+#         threshold,
+#         color="grey",
+#         linewidth=0.9,
+#         linestyle=":",
+#         zorder=1
+#     )
+#
+#     axes[2].text(
+#         0.98,
+#         threshold * 1.08,
+#         "1,000-node threshold",
+#         transform=axes[2].get_yaxis_transform(),
+#         ha="right",
+#         va="bottom",
+#         fontsize=8,
+#         color="dimgray"
+#     )
+#
+#     legend_handles = [
+#         plt.Line2D(
+#             [0], [0],
+#             marker="o",
+#             color="w",
+#             label="≤ 1,000 nodes",
+#             markerfacecolor=BLUE,
+#             markeredgecolor="white",
+#             markersize=7
+#         ),
+#         plt.Line2D(
+#             [0], [0],
+#             marker="o",
+#             color="w",
+#             label="> 1,000 nodes",
+#             markerfacecolor=ORANGE,
+#             markeredgecolor="white",
+#             markersize=7
+#         )
+#     ]
+#
+#     axes[2].legend(
+#         handles=legend_handles,
+#         frameon=True,
+#         framealpha=0.95,
+#         edgecolor="lightgrey",
+#         loc="upper left"
+#     )
+#
+#     axes[2].spines["top"].set_visible(False)
+#     axes[2].spines["right"].set_visible(False)
+#
+#     # ------------------------------------------------------------
+#     # Final layout
+#     # ------------------------------------------------------------
+#     fig.subplots_adjust(
+#         left=0.11,
+#         right=0.985,
+#         top=0.88,
+#         bottom=0.15
+#     )
+#
+#     _save(fig, outdir, "fig4_graph_construction", formats)
+#     plt.close(fig)
 
 def extract_components(type_str: str) -> list:
     """
@@ -959,239 +1182,6 @@ def fig5_physics(df_pc: pd.DataFrame, df_general: pd.DataFrame,
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  Figure 6 – Feature inventory (static + dynamic)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
-#                   outdir: Path, formats: list):
-#     """
-#     Two-panel vertical figure:
-#       (a) Static features (frequency > 1), sorted descending
-#       (b) Dynamic features (all), sorted descending, with vision-derived
-#           zero-count rows highlighted in red
-#     """
-#     print("  Generating Figure 6: Feature inventory …")
-#
-#     # ── Static features ───────────────────────────────────────────────────
-#     sf = (
-#         df_static[["Feature", "Studies"]]
-#         .dropna(subset=["Feature"])
-#         .copy()
-#     )
-#     sf["Feature"] = sf["Feature"].astype(str).str.strip()
-#     sf["Studies"] = pd.to_numeric(sf["Studies"], errors="coerce").fillna(0).astype(int)
-#     sf = sf[sf["Studies"] > 1].sort_values("Studies", ascending=True)
-#
-#     # ── Dynamic features ──────────────────────────────────────────────────
-#     df = (
-#         df_dynamic[["Feature", "Studies"]]
-#         .dropna(subset=["Feature"])
-#         .copy()
-#     )
-#     df["Feature"] = df["Feature"].astype(str).str.strip()
-#     df["Studies"] = pd.to_numeric(df["Studies"], errors="coerce").fillna(0).astype(int)
-#     df = df.sort_values("Studies", ascending=True)
-#
-#     # Append explicit zero-count vision rows
-#     vision_rows = [
-#         "UAV-derived channel width",
-#         "Debris density / blockage index",
-#         "Infrastructure blockage status",
-#         "Satellite-derived flood extent",
-#         "Surface velocity (optical flow)",
-#     ]
-#     vision_df = pd.DataFrame({
-#         "Feature": vision_rows,
-#         "Studies": [0] * len(vision_rows),
-#     })
-#     df = pd.concat([vision_df, df], ignore_index=True)
-#     # Re-sort so vision rows appear at bottom (count = 0 < all others)
-#     df = df.sort_values("Studies", ascending=True).reset_index(drop=True)
-#
-#     # Colours: red for vision, blue otherwise
-#     def dyn_color(feature, count):
-#         if feature in vision_rows:
-#             return RED
-#         return BLUE
-#
-#     fig, axes = plt.subplots(2, 1, figsize=(12, 11))
-#     fig.subplots_adjust(hspace=0.35)
-#
-#     # ── Panel (a) ─────────────────────────────────────────────────────────
-#     bar_colors_a = [BLUE] * len(sf)
-#     axes[0].barh(
-#         sf["Feature"], sf["Studies"],
-#         color=bar_colors_a, edgecolor="white", linewidth=0.6,
-#     )
-#     for feat, cnt in zip(sf["Feature"], sf["Studies"]):
-#         axes[0].text(
-#             cnt + 0.15, sf.index[sf["Feature"] == feat][0]
-#             if feat in sf["Feature"].values else 0,
-#             str(int(cnt)),
-#             va="center", fontsize=8, fontweight="bold",
-#         )
-#     # Re-draw with proper indexing
-#     axes[0].cla()
-#     y_pos = range(len(sf))
-#     axes[0].barh(y_pos, sf["Studies"].values,
-#                  color=BLUE, edgecolor="white", linewidth=0.6)
-#     for i, (cnt, feat) in enumerate(zip(sf["Studies"].values, sf["Feature"].values)):
-#         axes[0].text(cnt + 0.15, i, str(int(cnt)),
-#                      va="center", fontsize=8, fontweight="bold")
-#     axes[0].set_yticks(y_pos)
-#     axes[0].set_yticklabels(sf["Feature"].values, fontsize=8)
-#     axes[0].set_xlabel("Number of Studies")
-#     axes[0].set_title(
-#         f"(a)  Static Input Features  (shown: frequency > 1,  n total = {len(df_static)})",
-#         fontweight="bold",
-#     )
-#     axes[0].set_xlim(0, sf["Studies"].max() + 3)
-#     axes[0].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-#
-#     # ── Panel (b) ─────────────────────────────────────────────────────────
-#     bar_colors_b = [dyn_color(f, c) for f, c in zip(df["Feature"], df["Studies"])]
-#     y_pos_b = range(len(df))
-#     axes[1].barh(y_pos_b, df["Studies"].values,
-#                  color=bar_colors_b, edgecolor="white", linewidth=0.6)
-#     for i, (cnt, feat) in enumerate(zip(df["Studies"].values, df["Feature"].values)):
-#         lbl  = str(int(cnt)) if cnt > 0 else "0  (none identified)"
-#         clr  = RED if feat in vision_rows else "black"
-#         x_pos = max(cnt, 0) + 0.15
-#         axes[1].text(x_pos, i, lbl, va="center", fontsize=8,
-#                      fontweight="bold", color=clr)
-#     axes[1].set_yticks(y_pos_b)
-#     axes[1].set_yticklabels(df["Feature"].values, fontsize=8)
-#     axes[1].set_xlabel("Number of Studies")
-#     axes[1].set_title(
-#         "(b)  Dynamic Input Features  "
-#         "(vision-derived rows shown in red at count = 0)",
-#         fontweight="bold",
-#     )
-#     axes[1].set_xlim(0, df["Studies"].max() + 5)
-#     axes[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-#
-#     # Vision legend patch
-#     p_blue = mpatches.Patch(color=BLUE, label="Sensor / reanalysis features")
-#     p_red  = mpatches.Patch(color=RED,  label="Vision-derived features (not used in any study)")
-#     axes[1].legend(handles=[p_blue, p_red], frameon=True,
-#                    framealpha=0.9, edgecolor="lightgrey", loc="lower right")
-#
-#
-#     _save(fig, outdir, "fig6_features", formats)
-#     plt.close(fig)
-
-# def fig6_features(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
-#                   outdir: Path, formats: list):
-#     """
-#     Two-panel vertical figure:
-#       (a) Static features (frequency > 1), sorted descending
-#       (b) Dynamic features: count > 1 shown individually, all count = 1
-#           features collapsed into a single 'Other' bar, vision-derived
-#           zero-count rows removed entirely.
-#     """
-#     print("  Generating Figure 6: Feature inventory …")
-#
-#     # ── Static features ───────────────────────────────────────────────────
-#     sf = (
-#         df_static[["Feature", "Studies"]]
-#         .dropna(subset=["Feature"])
-#         .copy()
-#     )
-#     sf["Feature"] = sf["Feature"].astype(str).str.strip()
-#     sf["Studies"] = pd.to_numeric(sf["Studies"], errors="coerce").fillna(0).astype(int)
-#     sf = sf[sf["Studies"] > 1].sort_values("Studies", ascending=True)
-#
-#     # ── Dynamic features ──────────────────────────────────────────────────
-#     df = (
-#         df_dynamic[["Feature", "Studies"]]
-#         .dropna(subset=["Feature"])
-#         .copy()
-#     )
-#     df["Feature"] = df["Feature"].astype(str).str.strip()
-#     df["Studies"] = pd.to_numeric(df["Studies"], errors="coerce").fillna(0).astype(int)
-#
-#     # Split into main (count > 1) and singleton (count == 1)
-#     df_main = df[df["Studies"] > 1].sort_values("Studies", ascending=True).copy()
-#     df_ones  = df[df["Studies"] == 1]
-#     n_others = len(df_ones)
-#
-#     # Build the 'Other' summary row
-#     other_row = pd.DataFrame({
-#         "Feature": [f"Other ({n_others} features, each cited once)"],
-#         "Studies": [1],          # bar width = 1 to keep it comparable
-#         "is_other": [True],
-#     })
-#     df_main["is_other"] = False
-#     df_plot = pd.concat([other_row, df_main], ignore_index=True)
-#
-#     # ── Colours ───────────────────────────────────────────────────────────
-#     def dyn_color(is_other):
-#         return GREY if is_other else BLUE
-#
-#     bar_colors_b = [dyn_color(o) for o in df_plot["is_other"]]
-#
-#     # ── Figure ────────────────────────────────────────────────────────────
-#     fig, axes = plt.subplots(2, 1, figsize=(12, 11))
-#     fig.subplots_adjust(hspace=0.35)
-#
-#     # ── Panel (a): Static features ────────────────────────────────────────
-#     y_pos_a = range(len(sf))
-#     axes[0].barh(
-#         y_pos_a, sf["Studies"].values,
-#         color=BLUE, edgecolor="white", linewidth=0.6,
-#     )
-#     for i, cnt in enumerate(sf["Studies"].values):
-#         axes[0].text(
-#             cnt + 0.15, i, str(int(cnt)),
-#             va="center", fontsize=8, fontweight="bold",
-#         )
-#     axes[0].set_yticks(y_pos_a)
-#     axes[0].set_yticklabels(sf["Feature"].values, fontsize=8)
-#     axes[0].set_xlabel("Number of Studies")
-#     axes[0].set_title(
-#         f"(a)  Static Input Features  (shown: frequency > 1,  "
-#         f"n total = {len(df_static)})",
-#         fontweight="bold",
-#     )
-#     axes[0].set_xlim(0, sf["Studies"].max() + 3)
-#     axes[0].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-#
-#     # ── Panel (b): Dynamic features ───────────────────────────────────────
-#     y_pos_b = range(len(df_plot))
-#     axes[1].barh(
-#         y_pos_b, df_plot["Studies"].values,
-#         color=bar_colors_b, edgecolor="white", linewidth=0.6,
-#     )
-#     for i, (cnt, feat, is_other) in enumerate(
-#         zip(df_plot["Studies"].values,
-#             df_plot["Feature"].values,
-#             df_plot["is_other"].values)
-#     ):
-#         axes[1].text(
-#             cnt + 0.15, i, str(int(cnt)),
-#             va="center", fontsize=8, fontweight="bold",
-#             color=GREY if is_other else "black",
-#         )
-#     axes[1].set_yticks(y_pos_b)
-#     axes[1].set_yticklabels(df_plot["Feature"].values, fontsize=8)
-#     axes[1].set_xlabel("Number of Studies")
-#     axes[1].set_title(
-#         "(b)  Dynamic Input Features",
-#         fontweight="bold",
-#     )
-#     axes[1].set_xlim(0, df_plot["Studies"].max() + 5)
-#     axes[1].xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-#
-#     # Legend
-#     p_blue = mpatches.Patch(color=BLUE, label="Individually plotted features (count > 1)")
-#     p_grey = mpatches.Patch(color=GREY, label=f"Other: Inflow, Outflow, Infiltration, Soil temperature, Vapor pressure, Pumping rate, Air pressure, Min. Max. Temperature, etc")
-#     axes[1].legend(
-#         handles=[p_blue, p_grey],
-#         frameon=True, framealpha=0.9,
-#         edgecolor="lightgrey", loc="lower right",
-#         fontsize=8,
-#     )
-#
-#     _save(fig, outdir, "fig6_features", formats)
-#     plt.close(fig)
 
 def fig6_features1(df_static: pd.DataFrame, df_dynamic: pd.DataFrame,
                   outdir: Path, formats: list):
@@ -1626,7 +1616,7 @@ def parse_args():
     parser.add_argument(
         "--dpi",
         type=int,
-        default=1000,
+        default=1600,
         help="DPI for raster formats (default: 300)",
     )
     return parser.parse_args()
@@ -1679,11 +1669,11 @@ def main():
     print("\nGenerating figures …\n")
     print(f'df_static original: {list(df_static.columns.values)}')
     print(f'df_dynamic original: {list(df_dynamic.columns.values)}')
-    # fig2_overview(df_general, outdir, formats)
+    fig2_overview(df_general, outdir, formats)
     # fig3_arch_matrix(df_arch, outdir, formats)
     # fig4_graph_construction(df_gc, outdir, formats)
     # fig5_physics(df_pc, df_general, outdir, formats)
-    fig6_features(df_static, df_dynamic, outdir, formats)
+    # fig6_features(df_static, df_dynamic, outdir, formats)
 
     print(f"\n{'='*60}")
     print(f"  All figures written to: {outdir.resolve()}")
