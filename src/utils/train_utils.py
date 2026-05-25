@@ -6,7 +6,8 @@ import pandas as pd
 
 
 TRAIN_FRAC = 0.70
-VAL_FRAC = 0.15
+VAL_FRAC   = 0.15
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Dataset
 # ═══════════════════════════════════════════════════════════════════════
@@ -24,10 +25,10 @@ class LeeFloodDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray,
                  valid_mask: np.ndarray, t_in: int, t_out: int):
         super().__init__()
-        self.X = torch.from_numpy(X).float()
-        self.y = torch.from_numpy(y).float()
+        self.X    = torch.from_numpy(X).float()
+        self.y    = torch.from_numpy(y).float()
         self.mask = torch.from_numpy(valid_mask).float()
-        self.t_in = t_in
+        self.t_in  = t_in
         self.t_out = t_out
         # Last t_out steps cannot form a complete target window
         self.n_samples = len(X) - t_in - t_out + 1
@@ -44,18 +45,22 @@ class LeeFloodDataset(Dataset):
         # cause massive target leakage because y_seq[0] will equal x_seq[-1].
         start = idx + self.t_in - 1
         y_seq = self.y[start: start + self.t_out]
-        mask = self.mask[start: start + self.t_out]
+        mask  = self.mask[start: start + self.t_out]
         return x_seq, y_seq, mask
 
 
 def make_splits(n_total: int, t_in: int, t_out: int) -> tuple[range, range, range]:
     """
-    Chronological train / val / test index ranges.
-    Includes a 'gap' equal to T_IN + T_OUT between sets to prevent time-series leakage.
+    Chronological train / val / test index ranges with purge gaps.
+
+    Includes a gap equal to T_IN + T_OUT between each split to prevent
+    time-series leakage across boundaries.
+
+    Fractions are controlled by the module-level TRAIN_FRAC / VAL_FRAC constants.
     """
     n_train = int(n_total * TRAIN_FRAC)
-    n_val = int(n_total * VAL_FRAC)
-    gap = t_in + t_out
+    n_val   = int(n_total * VAL_FRAC)
+    gap     = t_in + t_out
 
     return (
         range(0, n_train),
@@ -65,8 +70,8 @@ def make_splits(n_total: int, t_in: int, t_out: int) -> tuple[range, range, rang
 
 
 def make_dataset(X, y, valid_mask, split_range, t_in, t_out):
-    """Slice tensor to the given range before wrapping in Dataset."""
-    end = split_range.stop + t_in + t_out - 1  # include full window
+    """Slice tensors to the given range before wrapping in LeeFloodDataset."""
+    end = split_range.stop + t_in + t_out - 1   # include the full last window
     end = min(end, len(X))
     return LeeFloodDataset(
         X[split_range.start: end],
@@ -103,7 +108,7 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
     ).to(device)
 
     node_mean = node_attr.mean(dim=0)
-    node_std = node_attr.std(dim=0).clamp(min=1e-6)
+    node_std  = node_attr.std(dim=0).clamp(min=1e-6)
     node_attr = (node_attr - node_mean) / node_std
 
     # Edge index (src, dst) — already zero-indexed from graph_builder
@@ -115,18 +120,15 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
     edge_cols = ["river_dist_km", "area_ratio", "elev_drop_m", "same_tributary"]
     edge_attr_np = edges_df[edge_cols].values
 
-    # Check if a node is a reservoir (is_reservoir == 1)
+    # Mask elev_drop_m (index 2) to 0.0 where source or destination is a reservoir,
+    # because impounded reaches have no meaningful hydraulic gradient.
     is_res = nodes_df["is_reservoir"].values
     src_is_res = is_res[edges_df["src_idx"].values]
     dst_is_res = is_res[edges_df["dst_idx"].values]
-
-    # Mask index 2 (elev_drop_m) to 0.0 if either source or destination is a reservoir
     reservoir_edge_mask = (src_is_res == 1) | (dst_is_res == 1)
     edge_attr_np[reservoir_edge_mask, 2] = 0.0
 
-    edge_attr = torch.tensor(
-        edge_attr_np, dtype=torch.float32
-    ).to(device)
+    edge_attr = torch.tensor(edge_attr_np, dtype=torch.float32).to(device)
 
     logger.info(
         "Graph loaded: %d nodes, %d edges, node_attr %s, edge_attr %s",
@@ -135,6 +137,7 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
     )
     return edge_index, edge_attr, node_attr
 
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Loss
 # ═══════════════════════════════════════════════════════════════════════
@@ -142,11 +145,13 @@ def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Ten
 def masked_mse(pred: torch.Tensor, target: torch.Tensor,
                mask: torch.Tensor) -> torch.Tensor:
     """
-    Uniform MSE over valid positions. Kept for persistence baseline
-    evaluation where horizon weighting would distort the comparison.
+    Uniform MSE over valid positions.
+
+    Kept for persistence baseline evaluation where horizon weighting
+    would distort the comparison.
     pred, target, mask: [B, T_out, N]
     """
-    err = (pred - target) ** 2 * mask
+    err   = (pred - target) ** 2 * mask
     denom = mask.sum().clamp(min=1.0)
     return err.sum() / denom
 
@@ -166,11 +171,10 @@ def masked_mse_horizon_weighted(pred: torch.Tensor, target: torch.Tensor,
     pred, target, mask: [B, T_out, N]
     """
     T_out = pred.shape[1]
-    # Linear ramp 1, 2, ..., T_out — normalised to mean = 1
-    ramp = torch.arange(1, T_out + 1, dtype=torch.float32, device=pred.device)
-    ramp = ramp / ramp.mean()                       # [T_out]
-    w = ramp.view(1, T_out, 1) * mask               # [B, T_out, N]
-    err = (pred - target) ** 2 * w
+    ramp  = torch.arange(1, T_out + 1, dtype=torch.float32, device=pred.device)
+    ramp  = ramp / ramp.mean()                       # normalise to mean=1  [T_out]
+    w     = ramp.view(1, T_out, 1) * mask            # [B, T_out, N]
+    err   = (pred - target) ** 2 * w
     return err.sum() / w.sum().clamp(min=1.0)
 
 
@@ -181,7 +185,10 @@ def masked_mse_horizon_weighted(pred: torch.Tensor, target: torch.Tensor,
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
                     mask: torch.Tensor) -> dict[str, float]:
     """
-    Per-node RMSE, MAE, NSE — then averaged across nodes.
+    Aggregate RMSE, MAE, NSE — per node then averaged.
+
+    Uses per-node mean for NSE denominator (ss_tot) rather than global
+    mean, which is the hydrologically correct formulation.
     Tensors: [B, T_out, N]
     """
     N = pred.shape[2]
@@ -199,14 +206,62 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
         mae_list.append((p - t).abs().mean().item())
 
         ss_res = ((p - t) ** 2).sum()
-        ss_tot = ((t - t.mean()) ** 2).sum()  # per-node mean, not global
+        ss_tot = ((t - t.mean()) ** 2).sum()
         nse_list.append((1 - ss_res / ss_tot.clamp(min=1e-8)).item())
 
     return {
         "rmse": float(np.mean(rmse_list)),
-        "mae": float(np.mean(mae_list)),
-        "nse": float(np.mean(nse_list)),
+        "mae":  float(np.mean(mae_list)),
+        "nse":  float(np.mean(nse_list)),
     }
+
+
+def compute_per_node_metrics(
+        pred:   torch.Tensor,   # [B, T_out, N]
+        target: torch.Tensor,   # [B, T_out, N]
+        mask:   torch.Tensor,   # [B, T_out, N]
+) -> list[dict]:
+    """
+    Compute RMSE, MAE, NSE, and MBE individually for every node.
+
+    Returns a list of dicts (one per node) in node-index order:
+        [{"node_idx": 0, "rmse": ..., "mae": ..., "nse": ...,
+          "mbe": ..., "n_valid": ...}, ...]
+
+    Nodes with fewer than 2 valid observations receive NaN metrics.
+    MBE > 0 means the model over-predicts; MBE < 0 means under-prediction.
+    """
+    N    = pred.shape[2]
+    rows = []
+
+    for n in range(N):
+        m = mask[:, :, n].bool()
+        p = pred[:, :, n][m].cpu().float()
+        t = target[:, :, n][m].cpu().float()
+
+        if len(t) < 2:
+            rows.append({"node_idx": n, "rmse": np.nan, "mae": np.nan,
+                         "nse": np.nan, "mbe": np.nan, "n_valid": 0})
+            continue
+
+        rmse   = ((p - t) ** 2).mean().sqrt().item()
+        mae    = (p - t).abs().mean().item()
+        mbe    = (p - t).mean().item()
+        ss_res = ((p - t) ** 2).sum()
+        ss_tot = ((t - t.mean()) ** 2).sum()
+        nse    = (1 - ss_res / ss_tot.clamp(min=1e-8)).item()
+
+        rows.append({
+            "node_idx": n,
+            "rmse":    round(rmse, 6),
+            "mae":     round(mae,  6),
+            "nse":     round(nse,  6),
+            "mbe":     round(mbe,  6),
+            "n_valid": int(m.sum()),
+        })
+
+    return rows
+
 
 def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
                               mask: torch.Tensor) -> list[dict]:
@@ -217,7 +272,7 @@ def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
     Tensors shape: [B, T_out, N]
 
     Returns a list of T_out dicts, one per step:
-        [{"step": 1, "rmse": ..., "mae": ..., "nse": ...}, ...]
+        [{"step": 1, "lead_min": 15, "rmse": ..., "mae": ..., "nse": ...}, ...]
 
     This enables the per-step horizon analysis recommended by
     Gao et al. (2022): graph models should show growing advantage
@@ -230,12 +285,11 @@ def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
     may differ by step (e.g., tidal stations flagged at certain
     steps due to data gaps).
     """
-    T_out = pred.shape[1]
-    N     = pred.shape[2]
+    T_out   = pred.shape[1]
+    N       = pred.shape[2]
     results = []
 
     for h in range(T_out):
-        # Slice to step h: [B, N]
         pred_h = pred[:, h, :]
         tgt_h  = target[:, h, :]
         mask_h = mask[:, h, :]
@@ -254,8 +308,8 @@ def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
             nse_list.append((1 - ss_res / ss_tot.clamp(min=1e-8)).item())
 
         results.append({
-            "step":  h + 1,                               # 1-indexed
-            "lead_min": (h + 1) * 15,                     # minutes ahead
+            "step":     h + 1,                                         # 1-indexed
+            "lead_min": (h + 1) * 15,                                  # minutes ahead
             "rmse": float(np.mean(rmse_list)) if rmse_list else float("nan"),
             "mae":  float(np.mean(mae_list))  if mae_list  else float("nan"),
             "nse":  float(np.mean(nse_list))  if nse_list  else float("nan"),
