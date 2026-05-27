@@ -417,7 +417,7 @@ def build_dataset(
             X[:, i, f] = s.values
 
     # ── 6. Build target y ────────────────────────────────────────────────
-     # y[t] = stage_anomaly[t+1]  — 1-step ahead (15 min horizon)
+    # y[t] = stage_anomaly[t+1]  — 1-step ahead (15 min horizon)
     # Adjust HORIZON here if you want multi-step targets.
     HORIZON = 1
     y = np.roll(X[:, :, 0], shift=-HORIZON, axis=0).astype(np.float32)
@@ -448,7 +448,19 @@ def build_dataset(
         np.save(OUT_DIR / "y.npy",          y)
         np.save(OUT_DIR / "valid_mask.npy", valid_mask)
         np.save(OUT_DIR / "timestamps.npy", np.array(common_index, dtype="datetime64[ns]"))
-        save_dataset_csv(X, y, valid_mask, common_index, node_refs, OUT_DIR)  # ← add this
+
+        # ── timestamps.csv ────────────────────────────────────────
+        # Required by train_st_gnn_flood_model_sar.py to build the
+        # SAR event lookup table. Column name must be "timestamp".
+        pd.DataFrame({"timestamp": common_index.strftime("%Y-%m-%d %H:%M:%S")}).to_csv(
+            OUT_DIR / "timestamps.csv", index=False
+        )
+
+        # ── dataset.csv  (long-format, human-readable) ────────────
+        # Combines X features, y target, and valid_mask into one file
+        # for inspection, plotting, and debugging. Not used by the
+        # training script — use the .npy files for model training.
+        save_dataset_csv(X, y, valid_mask, common_index, node_refs, OUT_DIR)
 
         meta = {"start_date": str(common_index[0]), "end_date": str(common_index[-1]), "timestep": TIMESTEP,
                 "n_timesteps": int(T), "n_nodes": int(N), "n_features": int(F), "horizon_steps": HORIZON,
@@ -463,7 +475,17 @@ def build_dataset(
         with open(OUT_DIR / "dataset_metadata.json", "w") as fp:
             json.dump(meta, fp, indent=2, default=str)
 
-        logger.info("  Saved X.npy, y.npy, timestamps.npy, dataset_metadata.json → %s", OUT_DIR)
+        logger.info(
+            "  Saved to %s:\n"
+            "    X.npy             [T=%d, N=%d, F=%d] float32\n"
+            "    y.npy             [T=%d, N=%d] float32\n"
+            "    valid_mask.npy    [T=%d, N=%d] float32\n"
+            "    timestamps.npy    [T=%d] datetime64\n"
+            "    timestamps.csv    [T=%d rows] — used by training script\n"
+            "    dataset.csv       [T×N=%d rows] — long-format for inspection\n"
+            "    dataset_metadata.json",
+            OUT_DIR, T, N, F, T, N, T, N, T, T, T * N,
+        )
 
     return X, y, common_index, node_refs
 
