@@ -41,6 +41,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pandas as pd
 
+import os
+import sys
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from src.utils.config import load_config
 from src.utils.logger import get_logger
 from src.utils.common_utils import seed_everything
@@ -60,7 +66,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROC_DIR = BASE_DIR / "dataset/processed"
 GRAPH_DIR = BASE_DIR / "dataset/graph"
 SAR_DIR   = BASE_DIR / "dataset/sar"
-
+LIVE_METRICS_PATH = BASE_DIR / "checkpoints"
 # ── Feature dimensions ─────────────────────────────────────────────────
 SAR_EMB_DIM = 16     # FNO encoder output channels per node
 # Fusion input = GRU output (HIDDEN_DIM=64) + SAR embedding (16) = 80
@@ -95,7 +101,6 @@ WEIGHT_DECAY = 1e-4
 PATIENCE     = 30
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  SAR data helpers
@@ -205,6 +210,29 @@ def build_sar_embedding_cache(
         next(iter(cache.values())).shape[0] if cache else 0,
         SAR_EMB_DIM,
     )
+
+    # ── Save SAR diagnostics for dashboard ───────────────────────
+    if cache:
+        diag = {
+            "events": {
+                eid: {
+                    "emb_mean":   emb.mean(dim=0).tolist(),
+                    "emb_std":    emb.std(dim=0).tolist(),
+                    "node_norms": emb.norm(dim=1).tolist(),
+                    "acquisition_date": sar_events[eid].get("acquisition_date"),
+                    "sar_path":         sar_events[eid].get("sar_path"),
+                }
+                for eid, emb in cache.items()
+            },
+            "n_nodes":    next(iter(cache.values())).shape[0],
+            "emb_dim":    SAR_EMB_DIM,
+            "encode_res": [SAR_ENCODE_H, SAR_ENCODE_W],
+        }
+        import ast as _a
+        sar_diag_path = LIVE_METRICS_PATH.parent / "sar_diagnostics.json"
+        sar_diag_path.parent.mkdir(parents=True, exist_ok=True)
+        sar_diag_path.write_text(json.dumps(diag, indent=2))
+
     return cache
 
 
@@ -293,10 +321,7 @@ def train_epoch(
     model.train()
     total_loss = 0.0
 
-    n_batches = len(loader)
     for batch_idx, (x_seq, y_seq, mask) in enumerate(loader):
-        if batch_idx == 0 or (batch_idx + 1) % 500 == 0:
-            print(f"  batch {batch_idx + 1}/{n_batches}", flush=True)
         x_seq = x_seq.to(DEVICE)   # [B, T_in, N, F]
         y_seq = y_seq.to(DEVICE)   # [B, T_out, N]
         mask  = mask.to(DEVICE)    # [B, T_out, N]
@@ -426,14 +451,10 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
             # Node ITM coordinates from nodes.csv
             nodes_df = pd.read_csv(GRAPH_DIR / "nodes.csv")
-            if "easting_itm" not in nodes_df.columns or \
-               "northing_itm" not in nodes_df.columns:
-                logger.info("ITM columns absent — converting lat/lon to ITM …")
-                nodes_df = update_node_coordinates(nodes_df)
-            else:
-                logger.info("ITM columns present in nodes.csv — skipping conversion.")
+            nodes_df = update_node_coordinates(nodes_df)
             node_xy  = torch.tensor(
                 nodes_df[["easting_itm", "northing_itm"]].values,
+                # nodes_df[["lat", "lon"]].values,
                 dtype=torch.float32,
             ).to(DEVICE)
 
@@ -479,26 +500,12 @@ def train(logger, seed, t_in, t_out, max_epochs):
     val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
     test_ds  = make_dataset(X, y, valid_mask, test_rng,  t_in, t_out)
 
-    # ── DataLoader worker count ────────────────────────────────────
-    # Windows uses multiprocessing "spawn" which deadlocks when
-    # num_workers > 0 and CUDA is already initialised in the parent
-    # process. Symptom: training hangs after "epoch: 1" with 0% GPU.
-    # Fix: num_workers=0 on Windows (in-process loading, no spawn).
-    # On Linux/macOS, num_workers=4 is safe and faster.
-    import platform
-    _num_workers = 0 if platform.system() == "Windows" else 4
-    _persistent  = _num_workers > 0
-    logger.info("DataLoader workers: %d  (platform: %s)",
-                _num_workers, platform.system())
-
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True,  num_workers=_num_workers,
-                              pin_memory=True,
-                              persistent_workers=_persistent)
+                              shuffle=True,  num_workers=4,
+                              pin_memory=True, persistent_workers=True)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 2,
-                              shuffle=False, num_workers=_num_workers,
-                              pin_memory=True,
-                              persistent_workers=_persistent)
+                              shuffle=False, num_workers=4,
+                              pin_memory=True, persistent_workers=True)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
                               shuffle=False, num_workers=0)
 
@@ -710,7 +717,7 @@ if __name__ == "__main__":
     seed       = 42
     t_in       = 32
     t_out      = 4
-    max_epochs = 2
+    max_epochs = 10
     seed_everything(seed)
     config = load_config(BASE_DIR / "config" / "config.yaml")
     logger = get_logger(config["logging"]["train"])
