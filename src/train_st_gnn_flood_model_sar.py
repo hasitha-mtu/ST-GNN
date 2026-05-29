@@ -37,8 +37,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pandas as pd
+
+import os
+import sys
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from src.utils.config import load_config
 from src.utils.logger import get_logger
@@ -59,7 +66,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROC_DIR = BASE_DIR / "dataset/processed"
 GRAPH_DIR = BASE_DIR / "dataset/graph"
 SAR_DIR   = BASE_DIR / "dataset/sar"
-
+LIVE_METRICS_PATH = BASE_DIR / "checkpoints"
 # ── Feature dimensions ─────────────────────────────────────────────────
 SAR_EMB_DIM = 16     # FNO encoder output channels per node
 # Fusion input = GRU output (HIDDEN_DIM=64) + SAR embedding (16) = 80
@@ -74,6 +81,15 @@ GAT_HEADS  = 2
 GRU_LAYERS = 2
 DROPOUT    = 0.1
 
+# SAR encode resolution — the FNO runs at this spatial resolution,
+# not at the full preprocessed raster size (1960×3840 at 20m).
+# The FNO is resolution-invariant: it encodes spatial patterns then
+# bilinearly samples at 27 node positions regardless of raster size.
+# Memory at full res: ~44 GB.  At 256×256: ~385 MB (fits 8 GB GPU).
+# Minimum recommended: 128×128.  Diminishing returns above 512×512.
+SAR_ENCODE_H = 256
+SAR_ENCODE_W = 256
+
 # FNO encoder hyperparameters
 FNO_WIDTH      = 32
 FNO_MODES_HIGH = 12    # blocks 1–2: fine boundary detail
@@ -85,7 +101,6 @@ WEIGHT_DECAY = 1e-4
 PATIENCE     = 30
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  SAR data helpers
@@ -100,7 +115,7 @@ def load_sar_events(logger) -> dict | None:
     Expected JSON structure:
     {
       "event_001": {
-        "sar_path":         "event_001.npy",   // filename only, resolved in SAR_DIR
+        "sar_path":         "sar/event_001.npy",   // relative to PROC_DIR
         "acquisition_date": "2019-11-26",
         "event_start":      "2019-11-26T00:00",
         "event_end":        "2019-11-28T23:45",
@@ -150,10 +165,7 @@ def build_sar_embedding_cache(
     encoder.eval()
 
     for event_id, meta in sar_events.items():
-        # SAR .npy files live in SAR_DIR (dataset/sar/), not PROC_DIR.
-        # meta["sar_path"] is the bare filename (e.g. "event_20241110_6496.npy")
-        # as written by preprocess_sar.py.
-        sar_path = SAR_DIR / Path(meta["sar_path"]).name
+        sar_path = SAR_DIR / meta["sar_path"]
         if not sar_path.exists():
             logger.warning("SAR file missing: %s — skipping event %s",
                            sar_path, event_id)
@@ -161,16 +173,36 @@ def build_sar_embedding_cache(
 
         sar = torch.from_numpy(
             np.load(sar_path).astype(np.float32)
-        ).to(DEVICE)                                       # [2, H, W]
+        ).to(DEVICE)                                       # [2, H_orig, W_orig]
 
-        H, W = sar.shape[1], sar.shape[2]
+        # ── Downsample to encode resolution ──────────────────────
+        # The FNO is resolution-invariant: spatial patterns are encoded
+        # then bilinearly sampled at node positions. Running at full
+        # raster size (1960×3840) needs ~44 GB; 256×256 needs ~385 MB.
+        # node_coords_norm is computed from the encode dimensions so
+        # the normalised coordinates [-1,+1] remain correct.
+        H_orig, W_orig = sar.shape[1], sar.shape[2]
+        if H_orig != SAR_ENCODE_H or W_orig != SAR_ENCODE_W:
+            sar = F.interpolate(
+                sar.unsqueeze(0),                          # [1, 2, H, W]
+                size=(SAR_ENCODE_H, SAR_ENCODE_W),
+                mode="bilinear",
+                align_corners=True,
+            ).squeeze(0)                                   # [2, H_enc, W_enc]
+
         node_coords_norm = compute_node_coords_norm(
-            node_xy.cpu(), meta["bbox_itm"], H, W
+            node_xy.cpu(), meta["bbox_itm"],
+            SAR_ENCODE_H, SAR_ENCODE_W,
         ).to(DEVICE)                                       # [N, 2]
 
         emb = encoder.encode_event(sar, node_coords_norm) # [N, 16]
         cache[event_id] = emb.cpu()                        # store on CPU
 
+    logger.info(
+        "SAR encode resolution: %d × %d px  "
+        "(original raster resampled from full preprocessed size)",
+        SAR_ENCODE_H, SAR_ENCODE_W,
+    )
     logger.info(
         "SAR embedding cache built: %d events, "
         "each [%d nodes × %d dims]",
@@ -178,6 +210,29 @@ def build_sar_embedding_cache(
         next(iter(cache.values())).shape[0] if cache else 0,
         SAR_EMB_DIM,
     )
+
+    # ── Save SAR diagnostics for dashboard ───────────────────────
+    if cache:
+        diag = {
+            "events": {
+                eid: {
+                    "emb_mean":   emb.mean(dim=0).tolist(),
+                    "emb_std":    emb.std(dim=0).tolist(),
+                    "node_norms": emb.norm(dim=1).tolist(),
+                    "acquisition_date": sar_events[eid].get("acquisition_date"),
+                    "sar_path":         sar_events[eid].get("sar_path"),
+                }
+                for eid, emb in cache.items()
+            },
+            "n_nodes":    next(iter(cache.values())).shape[0],
+            "emb_dim":    SAR_EMB_DIM,
+            "encode_res": [SAR_ENCODE_H, SAR_ENCODE_W],
+        }
+        import ast as _a
+        sar_diag_path = LIVE_METRICS_PATH.parent / "sar_diagnostics.json"
+        sar_diag_path.parent.mkdir(parents=True, exist_ok=True)
+        sar_diag_path.write_text(json.dumps(diag, indent=2))
+
     return cache
 
 
@@ -396,16 +451,10 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
             # Node ITM coordinates from nodes.csv
             nodes_df = pd.read_csv(GRAPH_DIR / "nodes.csv")
-            # Add ITM coordinate columns if not already present.
-            # update_node_coordinates() converts lat/lon → easting_itm/northing_itm
-            # and saves back to nodes.csv so the conversion only runs once.
-            if "easting_itm" not in nodes_df.columns or                "northing_itm" not in nodes_df.columns:
-                logger.info("ITM columns absent — converting lat/lon to ITM …")
-                nodes_df = update_node_coordinates(nodes_df)
-            else:
-                logger.info("ITM columns present in nodes.csv — skipping conversion.")
+            nodes_df = update_node_coordinates(nodes_df)
             node_xy  = torch.tensor(
                 nodes_df[["easting_itm", "northing_itm"]].values,
+                # nodes_df[["lat", "lon"]].values,
                 dtype=torch.float32,
             ).to(DEVICE)
 
@@ -415,6 +464,7 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
             # Build timestep → event_id lookup
             timestamps_path = PROC_DIR / "timestamps.csv"
+            print(f'timestamps_path: {timestamps_path}')
             if timestamps_path.exists():
                 timestamps   = pd.to_datetime(
                     pd.read_csv(timestamps_path)["timestamp"]
@@ -493,6 +543,7 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
     logger.info("Starting training …")
     for epoch in range(1, max_epochs + 1):
+        print(f'epoch: {epoch}')
 
         train_loss = train_epoch(
             model, train_loader, optimiser,
@@ -540,6 +591,7 @@ def train(logger, seed, t_in, t_out, max_epochs):
                 "use_sar":     use_sar_run,
                 "hparams": {
                     "t_in": t_in, "t_out": t_out,
+                    "f_dyn": F,
                     "hidden": HIDDEN_DIM, "gat_heads": GAT_HEADS,
                     "gru_layers": GRU_LAYERS, "dropout": DROPOUT,
                     "batch_size": BATCH_SIZE, "lr": LR,
@@ -549,6 +601,19 @@ def train(logger, seed, t_in, t_out, max_epochs):
                     "fno_modes_low":  FNO_MODES_LOW,
                 },
             }, ckpt_dir / "best_model.pt")
+            # Log which feature set is active — helps confirm SM integration worked
+            sm_active = F > 5
+            logger.info(
+                "  Features: F=%d (%s)",
+                F,
+                "5 gauge + 6 soil moisture" if sm_active else "5 gauge only — SM not integrated",
+            )
+            if not sm_active:
+                logger.warning(
+                    "  Running with F=5 (gauge only). "
+                    "Set USE_SOIL_MOISTURE=True in build_dataset.py and rebuild X.npy "
+                    "to include ERA5-Land soil moisture features."
+                )
             logger.info("  ✓ Saved best model (val_loss=%.4f)", val_loss)
         else:
             patience_ctr += 1
@@ -651,37 +716,15 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
     return model, test_metrics
 
-def update_node_coordinates(nodes_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert WGS84 lat/lon columns to ITM eastings/northings (EPSG:2157).
-
-    Reads 'lat' and 'lon' columns from nodes_df, converts to ITM metres,
-    adds 'easting_itm' and 'northing_itm' columns, and saves the updated
-    DataFrame back to nodes.csv so this conversion only runs once.
-
-    Requires pyproj: conda install -c conda-forge pyproj
-    """
-    try:
-        from pyproj import Transformer
-    except ImportError:
-        raise ImportError(
-            "pyproj is required to convert lat/lon to ITM. "
-            "Install with: conda install -c conda-forge pyproj"
-        )
-
-    if "lat" not in nodes_df.columns or "lon" not in nodes_df.columns:
-        raise KeyError(
-            "nodes.csv must contain 'lat' and 'lon' columns for ITM conversion. "
-            f"Available columns: {list(nodes_df.columns)}"
-        )
-
+def update_node_coordinates(nodes):
+    from pyproj import Transformer
     t = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
-    nodes_df["easting_itm"], nodes_df["northing_itm"] = t.transform(
-        nodes_df["lon"].values,
-        nodes_df["lat"].values,
+    nodes["easting_itm"], nodes["northing_itm"] = t.transform(
+        nodes["lon"].values,
+        nodes["lat"].values,
     )
-    nodes_df.to_csv(GRAPH_DIR / "nodes.csv", index=False)
-    return nodes_df
+    nodes.to_csv(GRAPH_DIR / "nodes.csv", index=False)
+    return nodes
 
 
 if __name__ == "__main__":
