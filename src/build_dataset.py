@@ -45,6 +45,13 @@ DISCHARGE_DIR = BASE_DIR / "dataset/raw/discharge"   # discharge_{ref}.csv
 RAINFALL_DIR  = BASE_DIR / "dataset/raw/rainfall"    # rainfall_{ref}.csv
 RAIN_META     = BASE_DIR / "dataset/metadata/rainfall_stations.csv"
 OUT_DIR       = BASE_DIR / "dataset/processed"
+ERA5_DIR      = BASE_DIR / "dataset/era5"
+ERA5_SM_FILE  = ERA5_DIR / "era5_land_sm_lee.nc"
+
+# ── Soil moisture flag ────────────────────────────────────────────────────
+# Set True once ERA5-Land data is downloaded. False = F=5 (gauge only).
+USE_SOIL_MOISTURE = True
+SM_LAYERS         = ["swvl1", "swvl2"]
 
 # ── Configuration ──────────────────────────────────────────────────────────
 TIMESTEP       = "15min"    # OPW native resolution
@@ -54,13 +61,32 @@ START_DATE     = "2023-01-01"   # ← was 2010-01-01
 END_DATE       = "2026-03-25"   # ← extend to yesterday
 
 # Dynamic feature names — must match X tensor column order exactly
-DYNAMIC_FEATURES = [
+GAUGE_FEATURES = [
     "stage_anomaly",       # [0]
     "normalized_stage",    # [1]
     "dh_dt",               # [2]
     "discharge_m3s",       # [3]
     "rainfall_mm",         # [4]
 ]
+SM_FEATURES = [
+    "swvl1_raw",           # [5]
+    "swvl1_sat_ratio",     # [6]
+    "swvl1_anomaly",       # [7]
+    "swvl2_raw",           # [8]
+    "swvl2_sat_ratio",     # [9]
+    "swvl2_anomaly",       # [10]
+]
+DYNAMIC_FEATURES = GAUGE_FEATURES + (SM_FEATURES if USE_SOIL_MOISTURE else [])
+
+import os
+import sys
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+from src.data.soil_moisture_features import (compute_sm_features,
+                                             build_node_sm_lookup,
+                                             extract_node_sm_features,
+                                             append_sm_to_node_features,)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -99,7 +125,7 @@ def _load_csv_series(path: Path, value_hints: list[str], resample_how: str, freq
         return None
 
     df[dt_candidates[0]] = pd.to_datetime(df[dt_candidates[0]], utc=True,    # ← utc=True handles +00:00 suffix
-                                           dayfirst=True, errors="coerce")
+                                           dayfirst=False, errors="coerce")
     df[dt_candidates[0]] = df[dt_candidates[0]].dt.tz_localize(None)         # ← strip tz → naive UTC
     df = df.dropna(subset=[dt_candidates[0]])
     df = df.set_index(dt_candidates[0])
@@ -347,8 +373,9 @@ def build_dataset(
     rainfall_cache: dict[str, pd.Series | None] = {}
 
     # ── 4. Build X [T, N, F] ─────────────────────────────────────────────
-    F = len(DYNAMIC_FEATURES)
-    X = np.full((T, N, F), np.nan, dtype=np.float32)
+    F_gauge = len(GAUGE_FEATURES)
+    F       = len(DYNAMIC_FEATURES)
+    X = np.full((T, N, F_gauge), np.nan, dtype=np.float32)
     coverage_stats: list[dict] = []
 
     for i, row in nodes_df.iterrows():
@@ -404,13 +431,47 @@ def build_dataset(
             "rain_gauge_ref":   rain_ref,
         })
 
-    # ── 5. Gap imputation ────────────────────────────────────────────────
-    # Short gaps (≤ GAP_FILL_STEPS = 90 min): forward-fill (physically sensible
-    # for slowly-varying water levels).  Longer gaps: zero-fill and rely on
-    # the coverage flag to mask them during loss computation.
-    logger.info("Imputing missing values (ffill ≤ %d steps, then zero-fill) …", GAP_FILL_STEPS)
+# ── 5a. Soil moisture features ─────────────────────────────────────────
+    if USE_SOIL_MOISTURE:
+        logger.info("Computing ERA5-Land soil moisture features ...")
+        ds_sm = compute_sm_features(str(ERA5_SM_FILE), layers=SM_LAYERS)
+        try:
+            if not ERA5_SM_FILE.exists():
+                msg = "ERA5-Land file not found: " + str(ERA5_SM_FILE)
+                msg += " -- Run download_era5_land_sm() or set USE_SOIL_MOISTURE=False."
+                raise FileNotFoundError(msg)
+            ds_sm = compute_sm_features(str(ERA5_SM_FILE), layers=SM_LAYERS)
+            logger.info("  ERA5-Land features: %s", list(ds_sm.data_vars))
+            if "lat" not in nodes_df.columns or "lon" not in nodes_df.columns:
+                raise KeyError("nodes.csv needs lat/lon for ERA5 spatial matching.")
+            node_lookup = build_node_sm_lookup(
+                ds_sm,
+                node_lons=nodes_df["lon"].values,
+                node_lats=nodes_df["lat"].values,
+            )
+            sm_matrix, _ = extract_node_sm_features(
+                ds_sm, node_lookup,
+                target_timestamps=common_index,
+                layers=SM_LAYERS,
+            )
+            logger.info("  SM matrix: %s  NaN: %.4f",
+                        sm_matrix.shape, float(np.isnan(sm_matrix).mean()))
+            X = append_sm_to_node_features(X, sm_matrix)
+            logger.info("  Features: %d gauge + %d SM = %d total",
+                        F_gauge, sm_matrix.shape[2], X.shape[2])
+        except Exception as exc:
+            logger.error(
+                "Soil moisture integration FAILED: %s. "
+                "Falling back to gauge-only (F=5). "
+                "Set USE_SOIL_MOISTURE=False to suppress.",
+                exc,
+            )
+
+    # ── 5b. Gap imputation (all features) ──────────────────────────────────
+    logger.info("Imputing missing values (ffill <= %d steps, then zero-fill) ...", GAP_FILL_STEPS)
+    F_actual = X.shape[2]
     for i in range(N):
-        for f in range(F):
+        for f in range(F_actual):
             s = pd.Series(X[:, i, f])
             s = s.ffill(limit=GAP_FILL_STEPS)
             s = s.fillna(0.0)
@@ -424,12 +485,13 @@ def build_dataset(
     y[-HORIZON:, :] = np.nan  # last HORIZON steps have no future
 
     # ── 7. Summary stats ─────────────────────────────────────────────────
+    F_final = X.shape[2]
     nan_pct = np.isnan(y).mean() * 100
     logger.info("\n✓ Dataset built:")
-    logger.info("  X shape:       %s  (T=%d, N=%d, F=%d)", X.shape, T, N, F)
+    logger.info("  X shape:       %s  (T=%d, N=%d, F=%d)", X.shape, T, N, F_final)
     logger.info("  y shape:       %s", y.shape)
     logger.info("  y NaN (last step masked): %.1f%%", nan_pct)
-    logger.info("  Features:      %s", DYNAMIC_FEATURES)
+    logger.info("  Features [%d]: %s", F_final, DYNAMIC_FEATURES)
 
     # ── 8. Save ───────────────────────────────────────────────────────────
     node_refs = nodes_df["ref"].astype(str).tolist()
@@ -463,7 +525,9 @@ def build_dataset(
         save_dataset_csv(X, y, valid_mask, common_index, node_refs, OUT_DIR)
 
         meta = {"start_date": str(common_index[0]), "end_date": str(common_index[-1]), "timestep": TIMESTEP,
-                "n_timesteps": int(T), "n_nodes": int(N), "n_features": int(F), "horizon_steps": HORIZON,
+                "n_timesteps": int(T), "n_nodes": int(N), "n_features": int(X.shape[2]), "horizon_steps": HORIZON,
+                "soil_moisture_active": USE_SOIL_MOISTURE and X.shape[2] > len(GAUGE_FEATURES),
+                "sm_layers": SM_LAYERS if USE_SOIL_MOISTURE else [],
                 "rolling_window": ROLLING_WINDOW, "gap_fill_steps": GAP_FILL_STEPS,
                 "dynamic_features": DYNAMIC_FEATURES, "node_refs": node_refs, "coverage": coverage_stats,
                 "rainfall_assignment_method": "nearest_neighbour", "rainfall_note": (
@@ -569,87 +633,9 @@ if __name__ == "__main__":
     inspect_dataset()
 
 # if __name__ == "__main__":
-#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
-#
-#     for ref in ["19163", "19160", "19161", "19164", "19058", "19045"]:
-#         df = pd.read_csv(WL_DIR / f"wl_{ref}.csv")
-#         df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-#         df = df.dropna(subset=["datetime"])
-#
-#         # Check coverage specifically in 2023-2026
-#         mask = (df["datetime"] >= "2023-01-01") & (df["datetime"] < "2026-03-26")
-#         window = df[mask]
-#         total_5min = len(pd.date_range("2023-01-01", "2026-03-25", freq="5min"))
-#         total_15min = len(pd.date_range("2023-01-01", "2026-03-25", freq="15min"))
-#         notna = window["value"].notna().sum()
-#         print(f"{ref}:  valid_rows={notna:,}  "
-#               f"pct_of_5min={notna / total_5min * 100:.1f}%  "
-#               f"pct_of_15min={notna / total_15min * 100:.1f}%")
+#     import xarray as xr  # reads and handles netcdf files with metadata
+#     data = xr.open_dataset(ERA5_SM_FILE)
+#     # print(data.variables)
+#     print(data.variables.keys())
 
-# if __name__ == "__main__":
-#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
-#
-#     for ref in ["19056", "19058", "19045", "19105"]:
-#         df = pd.read_csv(WL_DIR / f"wl_{ref}.csv", usecols=["datetime"])
-#         df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-#         df = df.dropna().sort_values("datetime")
-#         diffs = df["datetime"].diff().dt.total_seconds() / 60  # minutes
-#         print(f"\n{ref}:")
-#         print(diffs.value_counts().head(5).to_string())
-#
-#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19163.csv")
-#     print(df[df["value"].isna()]["quality_code"].value_counts())
-#     print(df[df["value"].isna()].head(3))
 
-# if __name__ == "__main__":
-#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
-#     BAD_QUALITY_CODES = {-1, 32, 101}
-#     # One known-good, one known-bad
-#     diagnose("19054")  # ✓ 99.7%
-#     diagnose("19045")  # ✗ 37.4%
-#     diagnose("19160")  # ✗ 18.0%  tidal
-
-# if __name__ == "__main__":
-#     WL_DIR = Path(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level")
-#
-#     rows = []
-#     for f in sorted(WL_DIR.glob("wl_*.csv")):
-#         df = pd.read_csv(f, usecols=["datetime", "quality_code"])
-#         df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-#         df = df.dropna(subset=["datetime"])
-#         good = df[pd.to_numeric(df["quality_code"], errors="coerce").isin([31, 41, 254])]
-#         rows.append({
-#             "ref": f.stem.replace("wl_", ""),
-#             "first_good": good["datetime"].min().strftime("%Y-%m-%d") if len(good) else "–",
-#             "last_good": good["datetime"].max().strftime("%Y-%m-%d") if len(good) else "–",
-#             "good_count": len(good),
-#         })
-#
-#     df_out = pd.DataFrame(rows)
-#     print(df_out.to_string(index=False))
-
-# if __name__ == "__main__":
-#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19045.csv")
-#     print(f'For station 19045')
-#     print(df['quality_ok'].value_counts())
-#     print(df['quality_code'].value_counts().head(10))
-#
-#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19094.csv")
-#     print(f'For station 19094')
-#     print(df['quality_ok'].value_counts())
-#     print(df['quality_code'].value_counts().head(10))
-#
-#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19103.csv")
-#     print(f'For station 19103')
-#     print(df['quality_ok'].value_counts())
-#     print(df['quality_code'].value_counts().head(10))
-#
-#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19111.csv")
-#     print(f'For station 19111')
-#     print(df['quality_ok'].value_counts())
-#     print(df['quality_code'].value_counts().head(10))
-#
-#     df = pd.read_csv(r"C:\Users\AdikariAdikari\PycharmProjects\ST-GNN\dataset\raw\water_level\wl_19163.csv")
-#     print(f'For station 19163')
-#     print(df['quality_ok'].value_counts())
-#     print(df['quality_code'].value_counts().head(10))
