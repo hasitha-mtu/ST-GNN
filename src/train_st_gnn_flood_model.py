@@ -1,37 +1,28 @@
 """
-train_st_gnn_flood_model.py  –  ST-GNN flood forecasting for the Lee catchment
-===============================================================================
-Architecture:
-  1. Node embedding   Linear([F_dyn + F_static]) → hidden_dim
-  2. Spatial          GATConv (GAT_HEADS heads, with edge_attr) at every
-                      timestep in the input window
-  3. Temporal         GRU (GRU_LAYERS layers) over the T_in-step sequence
-                      of spatially-enriched node embeddings
-  4. Output           Linear head → T_out step forecast per node
+train_st_gnn_flood_model.py  –  PI-ST-GNN static graph baseline, River Lee catchment
+========================================================================================
+Architecture
+------------
+  1. Node feature projection   Linear(F_dyn + F_static) → hidden_dim
+  2. Temporal encoder          Per-node GRU → hidden state [B, N, hidden]
+  3. Graph message passing     GATConv ×3 layers (batched)
+  4. Output head               Linear → delta stage_anomaly [B, T_out, N]
 
-  This is the primary spatial model. Compared against PerNodeGRU and
-  PerNodeLSTM baselines to isolate the contribution of graph message passing.
+This is the clean static-graph, no-SAR baseline for the PI-ST-GNN comparison.
+It isolates the contribution of graph message passing over PerNodeGRU/LSTM.
+
+Comparison matrix:
+  PerNodeGRU           — no graph, no SAR  (temporal lower bound)
+  PerNodeLSTM          — no graph, no SAR  (temporal lower bound)
+  STGNNFlood (this)    — static graph, no SAR
+  STGNNFlood+SAR       — static graph + SAR-FNO  (train_st_gnn_sar.py)
+  STGNNFloodDynEdge    — dynamic edge weights     (Phase 1)
+  STGNNFloodHAND       — dynamic topology         (Phase 2)
 
 Input window:   T_in  = 32 steps  (8 hours at 15-min resolution)
 Output horizon: T_out =  4 steps  (1 hour, multi-step)
-
-Target:         DELTA stage_anomaly — the model predicts the CHANGE from
-                the last observed value rather than the absolute level.
-                  delta[h] = stage_anomaly[t+h] - stage_anomaly[t]
-                Absolute predictions are recovered at evaluation time:
-                  abs_pred[h] = last_obs + delta_pred[h]
-                An output of 0.0 is equivalent to persistence, so the model
-                is explicitly penalised for lazy forecasting.
-
-Loss:           Horizon-weighted masked MSE — later steps in the forecast
-                window receive proportionally more weight.
-                  h+1: 0.4x  h+2: 0.8x  h+3: 1.2x  h+4: 1.6x  (T_out=4)
-                This forces the model to focus on harder long-horizon steps
-                where persistence degrades most.
-
-Train / val / test split: chronological 70 / 15 / 15 with T_in+T_out purge gaps.
-Split fractions are governed by TRAIN_FRAC / VAL_FRAC in train_utils.py.
 """
+
 
 import json
 import math
@@ -40,8 +31,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pandas as pd
+
+import os
+import sys
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from src.utils.config import load_config
 from src.utils.logger import get_logger
@@ -54,12 +52,13 @@ from src.utils.train_utils import compute_per_node_metrics
 from src.utils.train_utils import compute_per_step_metrics
 from src.utils.train_utils import masked_mse_horizon_weighted
 
-from src.models.st_gnn_flood import STGNNFloodModel
+from src.models.st_gnn_flood   import STGNNFloodModel
 
 # ── Paths ──────────────────────────────────────────────────────────────
-BASE_DIR  = Path(__file__).resolve().parent.parent
-PROC_DIR  = BASE_DIR / "dataset/processed"
+BASE_DIR   = Path(__file__).resolve().parent.parent.parent
+PROC_DIR = BASE_DIR / "dataset/processed"
 GRAPH_DIR = BASE_DIR / "dataset/graph"
+LIVE_METRICS_PATH = BASE_DIR / "checkpoints" / "live_metrics.json"
 
 # ── Hyperparameters ────────────────────────────────────────────────────
 HIDDEN_DIM = 64    # node embedding + GRU hidden size
@@ -74,33 +73,33 @@ PATIENCE     = 30   # early stopping patience (epochs)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ═══════════════════════════════════════════════════════════════════════
+#  SAR data helpers
+# ═══════════════════════════════════════════════════════════════════════
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Training loop
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_epoch(model, loader, optimiser,
-                edge_index, edge_attr, node_attr) -> float:
-    """
-    One training epoch using delta (residual) prediction.
-
-    Predicts delta_stage_anomaly[h] = stage_anomaly[t+h] - stage_anomaly[t].
-    Horizon-weighted loss penalises later steps more heavily, preventing
-    collapse to a near-zero-delta (persistence) solution.
-    """
+def train_epoch(
+    model, loader, optimiser,
+    edge_index, edge_attr, node_attr,
+) -> float:
+    """One training epoch over the Lee gauge dataset."""
     model.train()
     total_loss = 0.0
 
-    for x_seq, y_seq, mask in loader:
-        x_seq = x_seq.to(DEVICE)
-        y_seq = y_seq.to(DEVICE)
-        mask  = mask.to(DEVICE)
+    for batch_idx, (x_seq, y_seq, mask) in enumerate(loader):
+        x_seq = x_seq.to(DEVICE)   # [B, T_in, N, F]
+        y_seq = y_seq.to(DEVICE)   # [B, T_out, N]
+        mask  = mask.to(DEVICE)    # [B, T_out, N]
 
-        last_obs     = x_seq[:, -1, :, 0]               # [B, N]
-        delta_target = y_seq - last_obs.unsqueeze(1)     # [B, T_out, N]
+        last_obs     = x_seq[:, -1, :, 0]              # [B, N]
+        delta_target = y_seq - last_obs.unsqueeze(1)   # [B, T_out, N]
 
         optimiser.zero_grad()
-        delta_pred = model(x_seq, node_attr, edge_index, edge_attr)  # [B, T_out, N]
+        delta_pred = model(x_seq, node_attr, edge_index, edge_attr)
         loss = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -111,27 +110,24 @@ def train_epoch(model, loader, optimiser,
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
-    """
-    Evaluation epoch.
-
-    Delta predictions are reconstructed to absolute stage_anomaly space
-    before computing metrics, so RMSE/MAE/NSE are directly comparable
-    across all model types.
-    """
+def eval_epoch(
+    model, loader,
+    edge_index, edge_attr, node_attr,
+):
     model.eval()
     total_loss = 0.0
     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
 
-    for x_seq, y_seq, mask in loader:
+    for batch_idx, (x_seq, y_seq, mask) in enumerate(loader):
         x_seq = x_seq.to(DEVICE)
         y_seq = y_seq.to(DEVICE)
         mask  = mask.to(DEVICE)
 
         last_obs     = x_seq[:, -1, :, 0]
         delta_target = y_seq - last_obs.unsqueeze(1)
-        delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
-        abs_pred     = last_obs.unsqueeze(1) + delta_pred
+
+        delta_pred = model(x_seq, node_attr, edge_index, edge_attr)
+        abs_pred   = last_obs.unsqueeze(1) + delta_pred
 
         total_loss += masked_mse_horizon_weighted(
             delta_pred, delta_target, mask
@@ -158,24 +154,26 @@ def eval_epoch(model, loader, edge_index, edge_attr, node_attr):
 # ═══════════════════════════════════════════════════════════════════════
 
 def train(logger, seed, t_in, t_out, max_epochs):
-    ckpt_dir = BASE_DIR / "checkpoints" / "st_gnn" / str(seed) / str(t_out)
+
+    run_tag  = "st_gnn_static"
+    ckpt_dir = BASE_DIR / "checkpoints" / run_tag / str(seed) / str(t_out)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("=== Training ST-GNN ===")
+
+    logger.info("=== Training ST-GNN (static graph, no SAR) ===")
     logger.info("Device: %s", DEVICE)
 
-    # ── Load data ──────────────────────────────────────────────────────
+    # ── Load gauge data ────────────────────────────────────────────────
     logger.info("Loading dataset …")
     X          = np.load(PROC_DIR / "X.npy")
     y          = np.load(PROC_DIR / "y.npy")
     valid_mask = np.load(PROC_DIR / "valid_mask.npy")
-
-    T, N, F = X.shape
+    T, N, F    = X.shape
     logger.info("  X: %s  y: %s  valid_mask: %s", X.shape, y.shape, valid_mask.shape)
 
     # ── Load graph ─────────────────────────────────────────────────────
     edge_index, edge_attr, node_attr = load_graph(logger, GRAPH_DIR, DEVICE)
 
-    # ── Splits ─────────────────────────────────────────────────────────
+    # ── Splits & dataloaders ───────────────────────────────────────────
     n_windows = T - t_in - t_out + 1
     train_rng, val_rng, test_rng = make_splits(n_windows, t_in, t_out)
     logger.info(
@@ -199,18 +197,26 @@ def train(logger, seed, t_in, t_out, max_epochs):
     # ── Model ──────────────────────────────────────────────────────────
     f_static = node_attr.shape[1]
     f_edge   = edge_attr.shape[1]
-
+    # When SAR is active the fusion layer input is F_dyn + f_static + SAR_EMB_DIM;
+    # the model handles this via the sar_emb_dim constructor argument.
     model = STGNNFloodModel(
-        f_dyn=F, f_static=f_static, f_edge=f_edge,
-        hidden=HIDDEN_DIM, gat_heads=GAT_HEADS,
-        gru_layers=GRU_LAYERS, t_out=t_out, dropout=DROPOUT,
+        f_dyn=F,
+        f_static=f_static,
+        f_edge=f_edge,
+        hidden=HIDDEN_DIM,
+        gat_heads=GAT_HEADS,
+        gru_layers=GRU_LAYERS,
+        t_out=t_out,
+        dropout=DROPOUT,
+        sar_emb_dim=0,        # no SAR — static-graph baseline
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters: %s", f"{n_params:,}")
 
     # ── Optimiser & scheduler ──────────────────────────────────────────
-    optimiser = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimiser = torch.optim.AdamW(model.parameters(), lr=LR,
+                                  weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimiser, mode="min", factor=0.5, patience=20
     )
@@ -222,16 +228,19 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
     logger.info("Starting training …")
     for epoch in range(1, max_epochs + 1):
+        print(f'epoch: {epoch}')
+
         train_loss = train_epoch(
-            model, train_loader, optimiser, edge_index, edge_attr, node_attr
+            model, train_loader, optimiser,
+            edge_index, edge_attr, node_attr,
         )
         val_loss, val_metrics, persist_metrics = eval_epoch(
-            model, val_loader, edge_index, edge_attr, node_attr
+            model, val_loader,
+            edge_index, edge_attr, node_attr,
         )
         scheduler.step(val_loss)
 
         current_lr = optimiser.param_groups[0]["lr"]
-        logger.info("  LR: %.2e", current_lr)
         if current_lr <= 1e-5:
             logger.info("  LR floor reached — stopping")
             break
@@ -245,11 +254,12 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
         logger.info(
             "Epoch %3d  train=%.4f  val=%.4f  "
-            "Model  RMSE=%.4f NSE=%.4f  |  "
-            "Persist RMSE=%.4f NSE=%.4f",
+            "Model RMSE=%.4f NSE=%.4f  |  "
+            "Persist RMSE=%.4f NSE=%.4f  LR=%.1e",
             epoch, train_loss, val_loss,
             val_metrics["rmse"],     val_metrics["nse"],
             persist_metrics["rmse"], persist_metrics["nse"],
+            current_lr,
         )
 
         if val_loss < best_val_loss:
@@ -261,13 +271,30 @@ def train(logger, seed, t_in, t_out, max_epochs):
                 "optimiser":   optimiser.state_dict(),
                 "val_loss":    val_loss,
                 "val_metrics": val_metrics,
+                "use_sar":     False,
                 "hparams": {
                     "t_in": t_in, "t_out": t_out,
+                    "f_dyn": F,
                     "hidden": HIDDEN_DIM, "gat_heads": GAT_HEADS,
                     "gru_layers": GRU_LAYERS, "dropout": DROPOUT,
                     "batch_size": BATCH_SIZE, "lr": LR,
+                    "sar_emb_dim": 0,
+                    
                 },
             }, ckpt_dir / "best_model.pt")
+            # Log which feature set is active — helps confirm SM integration worked
+            sm_active = F > 5
+            logger.info(
+                "  Features: F=%d (%s)",
+                F,
+                "5 gauge + 6 soil moisture" if sm_active else "5 gauge only — SM not integrated",
+            )
+            if not sm_active:
+                logger.warning(
+                    "  Running with F=5 (gauge only). "
+                    "Set USE_SOIL_MOISTURE=True in build_dataset.py and rebuild X.npy "
+                    "to include ERA5-Land soil moisture features."
+                )
             logger.info("  ✓ Saved best model (val_loss=%.4f)", val_loss)
         else:
             patience_ctr += 1
@@ -285,11 +312,13 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
     with torch.no_grad():
-        for x_seq, y_seq, mask in test_loader:
+        for batch_idx, (x_seq, y_seq, mask) in enumerate(test_loader):
             x_seq    = x_seq.to(DEVICE)
             last_obs = x_seq[:, -1, :, 0]
+
             delta_pred = model(x_seq, node_attr, edge_index, edge_attr)
             abs_pred   = last_obs.unsqueeze(1) + delta_pred
+
             all_abs_pred.append(abs_pred.cpu())
             all_tgt.append(y_seq)
             all_mask.append(mask)
@@ -302,76 +331,54 @@ def train(logger, seed, t_in, t_out, max_epochs):
     cat_mask    = torch.cat(all_mask)
     cat_persist = torch.cat(all_persist)
 
-    # Test loss (horizon-weighted delta space — consistent with training)
-    with torch.no_grad():
-        delta_losses = []
-        for x_seq, y_seq, mask in test_loader:
-            x_seq        = x_seq.to(DEVICE)
-            last_obs     = x_seq[:, -1, :, 0]
-            delta_target = y_seq.to(DEVICE) - last_obs.unsqueeze(1)
-            delta_pred   = model(x_seq, node_attr, edge_index, edge_attr)
-            delta_losses.append(
-                masked_mse_horizon_weighted(
-                    delta_pred, delta_target, mask.to(DEVICE)
-                ).item()
-            )
-    test_loss    = float(np.mean(delta_losses))
     test_metrics = compute_metrics(cat_pred, cat_tgt, cat_mask)
-
-    m_all      = cat_mask.bool()
-    mbe_global = (cat_pred[m_all] - cat_tgt[m_all]).mean().item()
+    m_all        = cat_mask.bool()
+    mbe_global   = (cat_pred[m_all] - cat_tgt[m_all]).mean().item()
 
     logger.info(
         "\n✓ Test results:\n"
-        "  Loss: %.4f\n  RMSE: %.4f\n  MAE:  %.4f\n  NSE:  %.4f\n  MBE:  %.4f m",
-        test_loss,
+        "  RMSE: %.4f\n  MAE:  %.4f\n  NSE:  %.4f\n  MBE:  %.4f m",
         test_metrics["rmse"], test_metrics["mae"],
         test_metrics["nse"],  mbe_global,
     )
 
     # ── Per-node metrics ───────────────────────────────────────────────
-    nodes_df  = pd.read_csv(GRAPH_DIR / "nodes.csv")
-    node_rows = compute_per_node_metrics(cat_pred, cat_tgt, cat_mask)
-    pn_df = pd.DataFrame(node_rows)
-    pn_df["ref"]  = nodes_df["ref"].astype(str).values
-    pn_df["name"] = nodes_df["name"].values
-
+    nodes_df     = pd.read_csv(GRAPH_DIR / "nodes.csv")
+    node_rows    = compute_per_node_metrics(cat_pred,    cat_tgt, cat_mask)
     persist_rows = compute_per_node_metrics(cat_persist, cat_tgt, cat_mask)
-    pn_df["persist_nse"] = [r["nse"] for r in persist_rows]
-    pn_df["skill"] = (
+
+    pn_df = pd.DataFrame(node_rows)
+    pn_df["ref"]          = nodes_df["ref"].astype(str).values
+    pn_df["name"]         = nodes_df["name"].values
+    pn_df["persist_nse"]  = [r["nse"] for r in persist_rows]
+    pn_df["skill"]        = (
         (pn_df["nse"] - pn_df["persist_nse"])
         / (1 - pn_df["persist_nse"]).clip(lower=1e-8)
     ).round(4)
 
-    pn_df = pn_df[["ref", "name", "n_valid", "rmse", "mae", "mbe",
-                   "nse", "persist_nse", "skill"]]
+    pn_df = pn_df[["ref", "name", "n_valid", "rmse", "mae",
+                   "mbe", "nse", "persist_nse", "skill"]]
     pn_df.to_csv(ckpt_dir / "per_node_metrics.csv", index=False)
     logger.info("  Saved per_node_metrics.csv")
 
-    sorted_pn = pn_df.dropna(subset=["nse"]).sort_values("nse")
-    logger.info("\n  Lowest NSE nodes:\n%s",
-                sorted_pn.head(5)[["name", "nse", "skill"]].to_string(index=False))
-    logger.info("\n  Highest NSE nodes:\n%s",
-                sorted_pn.tail(5)[["name", "nse", "skill"]].to_string(index=False))
-
-    # ── Aggregate test metrics ─────────────────────────────────────────
+    # ── Aggregate + per-step metrics ───────────────────────────────────
     with open(ckpt_dir / "test_metrics.json", "w") as f:
         json.dump({
-            "test_loss": test_loss,
             **test_metrics,
-            "mbe": round(mbe_global, 6),
+            "mbe":     round(mbe_global, 6),
+            "use_sar": False,
+            "model":   "stgnn_static",
         }, f, indent=2)
 
-    # ── Per-step metrics ───────────────────────────────────────────────
     per_step         = compute_per_step_metrics(cat_pred,    cat_tgt, cat_mask)
     per_step_persist = compute_per_step_metrics(cat_persist, cat_tgt, cat_mask)
 
     for h_dict, p_dict in zip(per_step, per_step_persist):
-        persist_nse = p_dict["nse"]
-        model_nse   = h_dict["nse"]
-        if not (np.isnan(persist_nse) or np.isnan(model_nse)) and persist_nse < 1.0:
-            h_dict["persist_nse"] = round(persist_nse, 6)
-            h_dict["skill"]       = round((model_nse - persist_nse) / (1 - persist_nse), 4)
+        pn = p_dict["nse"]
+        mn = h_dict["nse"]
+        if not (np.isnan(pn) or np.isnan(mn)) and pn < 1.0:
+            h_dict["persist_nse"] = round(pn, 6)
+            h_dict["skill"]       = round((mn - pn) / (1 - pn), 4)
         else:
             h_dict["persist_nse"] = float("nan")
             h_dict["skill"]       = float("nan")
@@ -382,12 +389,22 @@ def train(logger, seed, t_in, t_out, max_epochs):
 
     return model, test_metrics
 
+def update_node_coordinates(nodes):
+    from pyproj import Transformer
+    t = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+    nodes["easting_itm"], nodes["northing_itm"] = t.transform(
+        nodes["lon"].values,
+        nodes["lat"].values,
+    )
+    nodes.to_csv(GRAPH_DIR / "nodes.csv", index=False)
+    return nodes
+
 
 if __name__ == "__main__":
     seed       = 42
     t_in       = 32
     t_out      = 4
-    max_epochs = 100
+    max_epochs = 2
     seed_everything(seed)
     config = load_config(BASE_DIR / "config" / "config.yaml")
     logger = get_logger(config["logging"]["train"])
