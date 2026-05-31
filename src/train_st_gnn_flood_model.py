@@ -55,7 +55,7 @@ from src.utils.train_utils import masked_mse_horizon_weighted
 from src.models.st_gnn_flood   import STGNNFloodModel
 
 # ── Paths ──────────────────────────────────────────────────────────────
-BASE_DIR   = Path(__file__).resolve().parent.parent.parent
+BASE_DIR   = Path(__file__).resolve().parent.parent
 PROC_DIR = BASE_DIR / "dataset/processed"
 GRAPH_DIR = BASE_DIR / "dataset/graph"
 LIVE_METRICS_PATH = BASE_DIR / "checkpoints" / "live_metrics.json"
