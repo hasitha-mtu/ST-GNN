@@ -98,10 +98,16 @@ def reproject_dem_to_itm(dem_path, out_path):
     return out_path
 
 
-def compute_hand(dem_path: Path) -> tuple:
+def compute_hand(dem_path: Path, fdir_path: Path | None = None) -> tuple:
     """
     HAND using correct pad-based D8 + ITM reprojection.
     Fixes: CRS mismatch, np.roll sign error, endpoint sampling, perp offsets.
+
+    If fdir_path is provided, saves dr/dc/nan_mask to that file so flood map
+    scripts can do D8 catchment delineation rather than Voronoi partitioning.
+    The arrays are saved here because they are already in memory from the ITM
+    DEM — saving elsewhere risks loading a different DEM and getting a shape
+    mismatch between fdir.npz and the raster used for visualisation.
     """
     import rasterio
     dem_path = Path(dem_path)
@@ -162,6 +168,20 @@ def compute_hand(dem_path: Path) -> tuple:
     print(f"  HAND shape={hand.shape}  NaN={np.isnan(hand).mean():.2%}")
     if valid.size > 0:
         print(f"  HAND range: [{valid.min():.2f}, {valid.max():.2f}] m")
+    # Save D8 flow direction arrays if requested
+    if fdir_path is not None:
+        fdir_path = Path(fdir_path)
+        fdir_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            fdir_path,
+            dr       = dr,
+            dc       = dc,
+            nan_mask = nan_mask.astype(np.bool_),
+        )
+        size_mb = fdir_path.stat().st_size / 1024 ** 2
+        print(f"  fdir.npz saved → {fdir_path.name}  "
+              f"shape={dr.shape}  {size_mb:.1f} MB")
+
     return hand, affine, crs
 
 def _compute_hand_from_mask(
@@ -354,7 +374,8 @@ def run(
     print("=" * 60)
 
     # ── 1. Compute HAND ───────────────────────────────────────────────
-    hand, affine, crs = compute_hand(dem_path)
+    fdir_out = out_path.parent / "fdir.npz"
+    hand, affine, crs = compute_hand(dem_path, fdir_path=fdir_out)
 
     # ── 2. Load node ITM coordinates ──────────────────────────────────
     eastings, northings, refs = nodes_to_itm(nodes_path)
