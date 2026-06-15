@@ -23,8 +23,7 @@ from pathlib import Path
 MAX_EPOCHS = 1
 
 if __name__ == "__main__":
-    # seeds = [42, 123, 456]
-    seeds = [42]
+    seeds = [42, 123, 456]
     t_outs = [4, 12, 16]
     t_in = 32
     max_epochs = MAX_EPOCHS
