@@ -115,6 +115,7 @@ MODEL_REGISTRY = {
     "st_gnn_sar":       "models.st_gnn_flood.STGNNFloodModel",
     "st_gnn_dyn_edge":  "models.st_gnn_dyn_edge.STGNNDynEdge",
     "st_gnn_hand_edge": "models.st_gnn_hand_edge.STGNNHANDEdge",
+    "dfc_gnn": "models.dfc_gnn.DFCGNNFlood",
 }
 
 def resolve_model_tag(ckpt_dir: Path) -> str:
@@ -226,8 +227,30 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     hand_dst           = torch.from_numpy(hand["dst"].astype(np.int64)),
                     hand_threshold     = torch.from_numpy(hand["hand_threshold"]),
                     hand_overland_dist = torch.from_numpy(hand["overland_dist_km"]))
+    elif tag == "dfc_gnn":
+        # DFC-GNN: edge features are buffers inside the model;
+        # use build_dfc_gnn() factory so they are loaded correctly.
+        from models.dfc_gnn import build_dfc_gnn
+        ef_path = GRAPH_DIR / "edge_features.npz"
+        if not ef_path.exists():
+            raise FileNotFoundError(
+                f"edge_features.npz not found at {ef_path}. "
+                f"Run compute_edge_features.py + extract_sar_wetness.py first.")
+        n_nodes = np.load(PROC_DIR / "X.npy", mmap_mode="r").shape[1]
+        model   = build_dfc_gnn(
+            n_nodes      = n_nodes,
+            f_in         = f_dyn,
+            T_out        = t_out,
+            ef_path      = str(ef_path),
+            d_model      = hp.get("hidden", 64),
+            n_heads      = hp.get("gat_heads", 4),
+            n_layers     = hp.get("gru_layers", 2),
+            dropout      = hp.get("dropout", 0.1),
+            lambda_flood = hp.get("lambda_flood", 0.1),
+            device       = "cpu",
+        )
     else:
-        raise ValueError(f"Unhandled tag: {tag}")
+        raise ValueError(f"Unhandled tag: {tag}. Known: {list(MODEL_REGISTRY)}")
 
     # Load weights — training scripts save under "state_dict"
     state_key = "state_dict" if "state_dict" in ckpt else "model_state_dict"
@@ -258,13 +281,19 @@ def test_dataloader(hp: dict, batch_size: int = 256):
     test_start = int(T * 0.85)
     test_end   = T - T_out
 
+    # INDEXING: must match training DataLoader (make_dataset in train_utils.py).
+    # Training uses xs = X[t : t+T_in], yt = y[t+T_in : t+T_in+T_out]
+    # The PREVIOUS version used X[t-T_in:t] which shifted every prediction
+    # T_in = 32 steps (8 hours) early relative to its ground-truth target,
+    # causing NSE ≈ -0.24 instead of the training-verified 0.993.
+    n_windows = test_end - test_start - T_in + 1
     class WDS(torch.utils.data.Dataset):
-        def __len__(self): return test_end - test_start
+        def __len__(self): return n_windows
         def __getitem__(self, i):
-            t  = test_start + i
-            xs = torch.from_numpy(X[t-T_in:t].astype(np.float32))
-            yt = torch.from_numpy(y[t:t+T_out].astype(np.float32))
-            mk = torch.from_numpy(mask[t:t+T_out].astype(np.float32))
+            t  = test_start + i          # window start (absolute timestep)
+            xs = torch.from_numpy(X[t   : t+T_in       ].astype(np.float32))
+            yt = torch.from_numpy(y[t+T_in : t+T_in+T_out].astype(np.float32))
+            mk = torch.from_numpy(mask[t+T_in : t+T_in+T_out].astype(np.float32))
             return xs, yt, mk
 
     import platform
@@ -306,28 +335,76 @@ def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
     model, hp       = load_model(ckpt_dir, device)
     dl, T_in, T_out, ts, te = test_dataloader(hp)
     tag             = resolve_model_tag(ckpt_dir)
-    needs_graph     = tag not in ("gru", "lstm")
-    # Always load node_attr — baselines also use static node features
-    # (PerNodeGRU/LSTM concatenate node_attr with x_seq before the GRU).
-    # Only skip edge_index and edge_attr for non-graph models.
-    ei, ea, na      = load_graph(device)
+    # needs_graph: models that take (x_seq, na, ei, ea) as forward args
+    # DFC-GNN stores edge_index/edge_attr as registered buffers internally;
+    # it only takes x_seq and returns (stage_pred, flood_logits).
+    needs_graph = tag not in ("gru", "lstm", "dfc_gnn")
+    ei, ea, na  = load_graph(device)
     if not needs_graph:
         ei, ea = None, None
+    if tag == "dfc_gnn":
+        na = None   # DFC-GNN does not use static node_attr
 
     preds = []
     for x_seq, y_seq, mask in dl:
         x_seq = x_seq.to(device)
-        if needs_graph:
+        if tag == "dfc_gnn":
+            # DFC-GNN: forward(x) → (stage_pred [B,T_out,N], flood_logits [B,N])
+            # Stage head outputs delta predictions; take step 0.
+            output = model(x_seq)
+            delta  = output[0] if isinstance(output, (tuple, list)) else output
+        elif needs_graph:
             delta = model(x_seq, na, ei, ea)
         else:
             delta = model(x_seq, na)
-        # Absolute stage = delta + last observed stage anomaly
+        # Absolute stage = predicted delta + last observed stage anomaly.
+        # x_seq[:, -1, :, 0] = stage anomaly at the last input timestep
+        # (feature 0 is stage_anomaly in X.npy, same variable as y.npy).
+        # This reconstruction matches the training eval in all train_*.py scripts:
+        #   abs_pred = last_obs.unsqueeze(1) + delta_pred
         last_obs  = x_seq[:, -1, :, 0]                   # [B, N]
         abs_pred  = delta[:, 0, :] + last_obs             # [B, N] — 1-step ahead
         preds.append(abs_pred.cpu().numpy())
 
     pred = np.concatenate(preds, axis=0)   # [T_test, N]
     np.save(ckpt_dir / "test_predictions.npy", pred)
+
+    # ── NSE sanity check ──────────────────────────────────────────────
+    # Compare saved predictions against y.npy to verify scale alignment.
+    # TARGET_START = TEST_START + T_IN so that pred[i] ↔ y[TARGET_START+i]
+    # (both indexed from the first forecast step of the first test window).
+    # If this NSE diverges > 0.05 from test_metrics.json, there is a
+    # unit mismatch between predictions and targets.
+    _sanity_nse = float("nan")
+    try:
+        y_full   = np.load(PROC_DIR / "y.npy",          mmap_mode="r")
+        m_full   = np.load(PROC_DIR / "valid_mask.npy", mmap_mode="r")
+        _tgt_start = ts + T_in           # first target timestep
+        n_s      = min(len(pred), len(y_full) - _tgt_start)
+        y_s      = y_full[_tgt_start : _tgt_start + n_s].astype(np.float32)
+        m_s      = m_full[_tgt_start : _tgt_start + n_s].astype(bool)
+        p_s      = pred[:n_s]
+        valid    = m_s & np.isfinite(p_s) & np.isfinite(y_s)
+        if valid.sum() > 0:
+            p_v, t_v  = p_s[valid], y_s[valid]
+            ss_res = float(np.sum((t_v - p_v) ** 2))
+            ss_tot = float(np.sum((t_v - t_v.mean()) ** 2))
+            _sanity_nse = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        # Load expected NSE from training evaluation (ground truth)
+        _expected_nse = None
+        _tm_path = ckpt_dir / "test_metrics.json"
+        if _tm_path.exists():
+            with open(_tm_path) as _f:
+                _expected_nse = json.load(_f).get("nse")
+        print(f"  NSE sanity check: {_sanity_nse:.4f}", end="")
+        if _expected_nse is not None:
+            gap = abs(_sanity_nse - _expected_nse)
+            status = "OK" if gap < 0.05 else "WARNING: scale mismatch"
+            print(f"  (training reported {_expected_nse:.4f},  gap={gap:.4f}  {status})")
+        else:
+            print()
+    except Exception as _e:
+        print(f"  NSE sanity check skipped: {_e}")
 
     all_ts = pd.to_datetime(pd.read_csv(PROC_DIR/"timestamps.csv")["timestamp"])
     meta   = {"ckpt": str(ckpt_dir), "model": tag,
@@ -374,8 +451,8 @@ def run_model(model_dir: Path, device: torch.device,
         seed_preds = []
         for cd in ckpt_dirs:
             pred_path = cd / "test_predictions.npy"
-            if pred_path.exists():
-                print(f"    {cd.relative_to(CKPT_ROOT)}: cached")
+            if pred_path.exists() and not getattr(args, "force", False):
+                print(f"    {cd.relative_to(CKPT_ROOT)}: cached (use --force to rerun)")
                 seed_preds.append(np.load(pred_path))
             else:
                 print(f"    {cd.relative_to(CKPT_ROOT)}:")
