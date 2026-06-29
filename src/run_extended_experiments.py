@@ -328,15 +328,15 @@ def main():
         print("  [DRY RUN — no training will occur]\n")
 
     if args.track in ("A", "all"):
-        base_dir = BASE_DIR / "track_a"
+        base_dir = BASE_DIR / "checkpoints" /"track_a"
         run_track_a(base_dir, logger, args.dry_run)
 
     if args.track in ("B", "all"):
-        base_dir = BASE_DIR / "track_b"
+        base_dir = BASE_DIR / "checkpoints" / "track_b"
         run_track_b(base_dir, logger, args.dry_run)
 
     if args.track in ("C", "all"):
-        base_dir = BASE_DIR / "track_c"
+        base_dir = BASE_DIR / "checkpoints" / "track_c"
         run_track_c(base_dir, logger, args.dry_run)
 
     print("\nAll requested tracks complete.")
