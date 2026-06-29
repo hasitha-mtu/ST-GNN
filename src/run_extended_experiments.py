@@ -106,7 +106,7 @@ TRACK_C_T_OUT = 96                        # 24 hr
 
 # ── Track A ─────────────────────────────────────────────────────────────
 
-def run_track_a(logger, dry_run: bool = False):
+def run_track_a(base_dir, logger, dry_run: bool = False):
     """Extended horizons for all 7 models."""
     print("\n" + "═"*60)
     print("  TRACK A — Extended horizons: T_out = 24 (6hr) and 48 (12hr)")
@@ -134,7 +134,7 @@ def run_track_a(logger, dry_run: bool = False):
                 print(f"\n[Track A  {done}/{total}]  {tag}  seed={seed}  "
                       f"t_in={TRACK_A_T_IN}  t_out={t_out}  ({t_out*15//60}hr)")
                 if not dry_run:
-                    fn(logger, seed, TRACK_A_T_IN, t_out, MAX_EPOCHS)
+                    fn(logger, seed, TRACK_A_T_IN, t_out, MAX_EPOCHS, base_dir)
 
 
 # ── Track B ─────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ class _GRUTrainAdaptor:
     pass
 
 
-def _run_tin_ablation_model(fn_train, tag: str, logger,
+def _run_tin_ablation_model(base_dir, fn_train, tag: str, logger,
                              seed: int, t_in: int, dry_run: bool):
     """
     Run one T_in ablation training run.
@@ -162,7 +162,7 @@ def _run_tin_ablation_model(fn_train, tag: str, logger,
     """
     import importlib, types
 
-    ckpt_root_ablation = BASE_DIR / "checkpoints" / "ablation_tin"
+    ckpt_root_ablation = base_dir / "checkpoints" / "ablation_tin"
     ckpt_root_ablation.mkdir(parents=True, exist_ok=True)
 
     # Each training script constructs its ckpt_dir from BASE_DIR / "checkpoints"
@@ -193,14 +193,14 @@ def _run_tin_ablation_model(fn_train, tag: str, logger,
               f"t_in={t_in}  t_out={TRACK_B_T_OUT}")
     else:
         try:
-            fn_train(logger, seed, t_in, TRACK_B_T_OUT, MAX_EPOCHS)
+            fn_train(logger, seed, t_in, TRACK_B_T_OUT, MAX_EPOCHS, base_dir)
         finally:
             # Restore original tag
             if hasattr(module, "RUN_TAG") and orig_tag is not None:
                 module.RUN_TAG = orig_tag
 
 
-def run_track_b(logger, dry_run: bool = False):
+def run_track_b(base_dir, logger, dry_run: bool = False):
     """T_in sensitivity ablation for DFC-GNN and GRU."""
     print("\n" + "═"*60)
     print("  TRACK B — T_in ablation: DFC-GNN vs GRU")
@@ -225,12 +225,12 @@ def run_track_b(logger, dry_run: bool = False):
                 print(f"\n[Track B  {done}/{total}]  {tag}  seed={seed}  "
                       f"t_in={t_in}  t_out={TRACK_B_T_OUT}  "
                       f"({t_in*15//60}hr context)")
-                _run_tin_ablation_model(fn, tag, logger, seed, t_in, dry_run)
+                _run_tin_ablation_model(base_dir, fn, tag, logger, seed, t_in, dry_run)
 
 
 # ── Track C ─────────────────────────────────────────────────────────────
 
-def run_track_c(logger, dry_run: bool = False):
+def run_track_c(base_dir, logger, dry_run: bool = False):
     """24-hour operational benchmark for DFC-GNN and GRU."""
     print("\n" + "═"*60)
     print("  TRACK C — 24-hour benchmark: DFC-GNN vs GRU")
@@ -253,7 +253,7 @@ def run_track_c(logger, dry_run: bool = False):
             print(f"\n[Track C  {done}/{total}]  {tag}  seed={seed}  "
                   f"t_in={TRACK_C_T_IN}  t_out={TRACK_C_T_OUT}  (24 hr)")
             if not dry_run:
-                fn(logger, seed, TRACK_C_T_IN, TRACK_C_T_OUT, MAX_EPOCHS)
+                fn(logger, seed, TRACK_C_T_IN, TRACK_C_T_OUT, MAX_EPOCHS, base_dir)
 
 
 # ── Summary printer ─────────────────────────────────────────────────────
@@ -328,13 +328,16 @@ def main():
         print("  [DRY RUN — no training will occur]\n")
 
     if args.track in ("A", "all"):
-        run_track_a(logger, args.dry_run)
+        base_dir = BASE_DIR / "track_a"
+        run_track_a(base_dir, logger, args.dry_run)
 
     if args.track in ("B", "all"):
-        run_track_b(logger, args.dry_run)
+        base_dir = BASE_DIR / "track_b"
+        run_track_b(base_dir, logger, args.dry_run)
 
     if args.track in ("C", "all"):
-        run_track_c(logger, args.dry_run)
+        base_dir = BASE_DIR / "track_c"
+        run_track_c(base_dir, logger, args.dry_run)
 
     print("\nAll requested tracks complete.")
 
