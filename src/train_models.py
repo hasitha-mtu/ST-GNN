@@ -33,12 +33,12 @@ if __name__ == "__main__":
     for seed in seeds:
         seed_everything(seed)
         for t_out in t_outs:
-            train_gru(logger, seed, t_in, t_out, max_epochs)
-            train_lstm(logger, seed, t_in, t_out, max_epochs)
+            train_gru(logger, seed, t_in, t_out, max_epochs, None)
+            train_lstm(logger, seed, t_in, t_out, max_epochs, None)
 
-            train_st_gnn(logger, seed, t_in, t_out, max_epochs)
-            train_st_gnn_sar(logger, seed, t_in, t_out, max_epochs)
-            train_st_gnn_dyn_edge(logger, seed, t_in, t_out, max_epochs)
-            train_st_gnn_hand_edge(logger, seed, t_in, t_out, max_epochs)
+            train_st_gnn(logger, seed, t_in, t_out, max_epochs, None)
+            train_st_gnn_sar(logger, seed, t_in, t_out, max_epochs, None)
+            train_st_gnn_dyn_edge(logger, seed, t_in, t_out, max_epochs, None)
+            train_st_gnn_hand_edge(logger, seed, t_in, t_out, max_epochs, None)
 
-            train_dfc_gnn(logger, seed, t_in, t_out, max_epochs)
+            train_dfc_gnn(logger, seed, t_in, t_out, max_epochs, None)

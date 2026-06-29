@@ -151,8 +151,10 @@ def eval_epoch(model, loader, node_attr):
 #  Main
 # ═══════════════════════════════════════════════════════════════════════
 
-def train(logger, seed, t_in, t_out, max_epochs):
-    ckpt_dir = BASE_DIR / "checkpoints" / "lstm" / str(seed) / str(t_out)
+def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
+    if base_dir is None:
+        base_dir = BASE_DIR
+    ckpt_dir = base_dir / "checkpoints" / "lstm" / str(seed) / str(t_out)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     logger.info("=== Training Baseline LSTM ===")
     logger.info("Device: %s", DEVICE)

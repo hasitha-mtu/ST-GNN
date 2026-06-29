@@ -254,10 +254,11 @@ def eval_epoch(
 #  Main training function
 # ═══════════════════════════════════════════════════════════════════════
 
-def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int):
+def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, ckpt_dir = None):
 
     run_tag  = "dfc_gnn"
-    ckpt_dir = BASE_DIR / "checkpoints" / run_tag / str(seed) / str(t_out)
+    if ckpt_dir is None:
+        ckpt_dir = BASE_DIR / "checkpoints" / run_tag / str(seed) / str(t_out)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=== Training DFC-GNN (physically-biased dynamic attention) ===")
