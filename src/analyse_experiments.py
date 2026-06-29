@@ -44,15 +44,53 @@ OUT_DIR    = BASE_DIR / "results/figures/model_comparison"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Experiment config ──────────────────────────────────────────────────
-MODELS   = ["gru", "lstm", "st_gnn"]
+# ── Model registry ────────────────────────────────────────────────────
+# Ordered: no-graph baselines → graph baselines → DFC-GNN (contribution)
+MODELS   = [
+    "gru",             # PerNodeGRU — temporal lower bound
+    "lstm",            # PerNodeLSTM — temporal lower bound
+    "st_gnn_static",   # STGNNFlood (static graph)
+    "st_gnn_sar",      # STGNNFlood + SAR embedding
+    "st_gnn_dyn_edge", # STGNNDynEdge — dynamic edge weights
+    "st_gnn_hand_edge",# STGNNHANDEdge — HAND-threshold topology
+    "dfc_gnn",         # DFC-GNN — physically-biased dynamic attention
+]
 SEEDS    = [42, 123, 456]
 HORIZONS = [4, 12, 16]          # T_out steps at 15-min → 1hr, 3hr, 4hr
 HZ_LABEL = {4: "1 hr", 12: "3 hr", 16: "4 hr"}
 
-MODEL_COLORS  = {"gru": "#1D9E75", "lstm": "#D85A30", "st_gnn": "#185FA5"}
-MODEL_LABELS  = {"gru": "GRU (no graph)", "lstm": "LSTM (no graph)",
-                 "st_gnn": "ST-GNN"}
-MODEL_MARKERS = {"gru": "o", "lstm": "s", "st_gnn": "^"}
+# No-graph baselines: warm colours
+# Graph baselines: blue family
+# DFC-GNN (primary contribution): gold — stands out visually
+MODEL_COLORS = {
+    "gru":             "#1D9E75",   # teal
+    "lstm":            "#D85A30",   # orange-red
+    "st_gnn_static":   "#185FA5",   # dark blue
+    "st_gnn_sar":      "#4A90D9",   # medium blue
+    "st_gnn_dyn_edge": "#7B68EE",   # slate blue
+    "st_gnn_hand_edge":"#9B59B6",   # purple
+    "dfc_gnn":         "#D4A017",   # gold — primary contribution
+}
+MODEL_LABELS = {
+    "gru":             "GRU (no graph)",
+    "lstm":            "LSTM (no graph)",
+    "st_gnn_static":   "ST-GNN (static)",
+    "st_gnn_sar":      "ST-GNN+SAR",
+    "st_gnn_dyn_edge": "ST-GNN DynEdge",
+    "st_gnn_hand_edge":"ST-GNN HAND",
+    "dfc_gnn":         "DFC-GNN (proposed)",
+}
+MODEL_MARKERS = {
+    "gru":             "o",
+    "lstm":            "s",
+    "st_gnn_static":   "^",
+    "st_gnn_sar":      "D",
+    "st_gnn_dyn_edge": "P",
+    "st_gnn_hand_edge":"X",
+    "dfc_gnn":         "*",
+}
+# Subset for legacy three-model comparisons (backward-compatible)
+MODELS_CORE = ["gru", "lstm", "st_gnn_static"]
 
 # Persistence baseline (constant across runs — same dataset, same mask)
 PERSIST_NSE  = 0.9160
@@ -108,11 +146,14 @@ def load_all() -> tuple[pd.DataFrame, pd.DataFrame]:
                     tm = json.load(f)
                 global_rows.append({
                     "model": model, "seed": seed, "horizon": hz,
-                    "rmse": tm.get("rmse", np.nan),
-                    "mae":  tm.get("mae",  np.nan),
-                    "nse":  tm.get("nse",  np.nan),
-                    "mbe":  tm.get("mbe",  np.nan),
+                    "rmse":      tm.get("rmse",      np.nan),
+                    "mae":       tm.get("mae",       np.nan),
+                    "nse":       tm.get("nse",       np.nan),
+                    "mbe":       tm.get("mbe",       np.nan),
                     "test_loss": tm.get("test_loss", np.nan),
+                    # DFC-GNN extras (NaN for other models)
+                    "flood_acc": tm.get("flood_acc", np.nan),
+                    "n_edges":   tm.get("n_edges",   np.nan),
                 })
 
                 pn = pd.read_csv(pn_path)
@@ -159,7 +200,9 @@ def summary_table(global_df: pd.DataFrame) -> pd.DataFrame:
     Also computes skill score vs persistence.
     """
     rows = []
-    for model in MODELS:
+    available_models = [m for m in MODELS
+                        if m in global_df["model"].unique()]
+    for model in available_models:
         for hz in HORIZONS:
             sub = global_df[(global_df.model == model) &
                             (global_df.horizon == hz)]
@@ -170,59 +213,69 @@ def summary_table(global_df: pd.DataFrame) -> pd.DataFrame:
             rmse_mean = sub.rmse.mean()
             rmse_std  = sub.rmse.std(ddof=1)
             skill     = (nse_mean - PERSIST_NSE) / (1 - PERSIST_NSE)
-            rows.append({
-                "model":     MODEL_LABELS[model],
-                "horizon":   HZ_LABEL[hz],
-                "NSE mean":  round(nse_mean, 4),
-                "NSE std":   round(nse_std, 4),
-                "RMSE mean": round(rmse_mean, 4),
-                "RMSE std":  round(rmse_std, 4),
-                "Skill":     round(skill, 4),
-                "MBE mean":  round(sub.mbe.mean(), 4),
-            })
+            row = {
+                "model":      MODEL_LABELS.get(model, model),
+                "horizon":    HZ_LABEL[hz],
+                "NSE mean":   round(nse_mean, 4),
+                "NSE std":    round(nse_std, 4),
+                "RMSE mean":  round(rmse_mean, 4),
+                "RMSE std":   round(rmse_std, 4),
+                "Skill":      round(skill, 4),
+                "MBE mean":   round(sub.mbe.mean(), 4),
+            }
+            if "flood_acc" in sub.columns and not sub.flood_acc.isna().all():
+                row["flood_acc"] = round(sub.flood_acc.mean(), 4)
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
 def wilcoxon_gru_vs_stgnn(node_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Wilcoxon signed-rank test comparing per-node NSE between GRU and
-    ST-GNN across all seeds and nodes, per horizon.
+    Wilcoxon signed-rank tests across all model pairs, per horizon.
+
+    Compares each model against GRU (no-graph baseline) and includes
+    the key DFC-GNN vs ST-GNN (static) comparison.
 
     The Wilcoxon signed-rank test (Wilcoxon 1945, Biometrics 1(6)) is
-    used here because:
-    - We are comparing paired observations (same node, same seed)
-    - The distribution of NSE differences is unlikely to be normal
-      (asymmetric, bounded above at 1.0)
-    - It is the non-parametric equivalent of the paired t-test and is
-      appropriate for n=27 nodes × 3 seeds = 81 paired observations
+    appropriate here because:
+    - Paired observations (same node, same seed, aligned by index)
+    - NSE differences are asymmetric and bounded above at 1.0
+    - n=27 nodes × 3 seeds = 81 paired observations per comparison
     """
-    rows = []
+    # Comparison pairs: all baselines vs GRU + DFC-GNN vs each baseline
+    COMPARE_PAIRS = [
+        ("gru",   "st_gnn_static",   "GRU vs ST-GNN(static)"),
+        ("gru",   "st_gnn_sar",      "GRU vs ST-GNN+SAR"),
+        ("gru",   "st_gnn_dyn_edge", "GRU vs DynEdge"),
+        ("gru",   "st_gnn_hand_edge","GRU vs HAND"),
+        ("gru",   "dfc_gnn",         "GRU vs DFC-GNN"),
+        ("st_gnn","dfc_gnn",         "ST-GNN(static) vs DFC-GNN"),
+    ]
+    avail = node_df["model"].unique()
+    rows  = []
     for hz in HORIZONS:
-        gru_nse  = node_df[(node_df.model == "gru")    & (node_df.horizon == hz)]["nse"].values
-        gnn_nse  = node_df[(node_df.model == "st_gnn") & (node_df.horizon == hz)]["nse"].values
-        lstm_nse = node_df[(node_df.model == "lstm")   & (node_df.horizon == hz)]["nse"].values
-
-        n = min(len(gru_nse), len(gnn_nse), len(lstm_nse))
-        if n < 8:
-            continue
-
-        gru_nse  = gru_nse[:n]
-        gnn_nse  = gnn_nse[:n]
-        lstm_nse = lstm_nse[:n]
-
-        stat_gru_gnn,  p_gru_gnn  = stats.wilcoxon(gru_nse,  gnn_nse,  alternative="two-sided")
-        stat_gru_lstm, p_gru_lstm = stats.wilcoxon(gru_nse,  lstm_nse, alternative="two-sided")
-        stat_gnn_lstm, p_gnn_lstm = stats.wilcoxon(gnn_nse,  lstm_nse, alternative="two-sided")
-
-        rows.append({
-            "Horizon":            HZ_LABEL[hz],
-            "GRU mean NSE":       round(gru_nse.mean(), 4),
-            "ST-GNN mean NSE":    round(gnn_nse.mean(), 4),
-            "LSTM mean NSE":      round(lstm_nse.mean(), 4),
-            "p(GRU vs ST-GNN)":   f"{p_gru_gnn:.4f}{'*' if p_gru_gnn < 0.05 else ''}",
-            "p(GRU vs LSTM)":     f"{p_gru_lstm:.4f}{'*' if p_gru_lstm < 0.05 else ''}",
-            "p(ST-GNN vs LSTM)":  f"{p_gnn_lstm:.4f}{'*' if p_gnn_lstm < 0.05 else ''}",
-        })
+        row = {"Horizon": HZ_LABEL[hz]}
+        for m_a, m_b, label in COMPARE_PAIRS:
+            if m_a not in avail or m_b not in avail:
+                row[label] = "n/a"
+                continue
+            nse_a = node_df[(node_df.model==m_a) & (node_df.horizon==hz)]["nse"].values
+            nse_b = node_df[(node_df.model==m_b) & (node_df.horizon==hz)]["nse"].values
+            n = min(len(nse_a), len(nse_b))
+            if n < 8:
+                row[label] = "n/a (too few)"
+                continue
+            nse_a, nse_b = nse_a[:n], nse_b[:n]
+            try:
+                _, p = stats.wilcoxon(nse_a, nse_b, alternative="two-sided")
+                winner = MODEL_LABELS.get(m_b, m_b) \
+                         if nse_b.mean() > nse_a.mean() \
+                         else MODEL_LABELS.get(m_a, m_a)
+                row[label] = (f"p={p:.4f}{"*" if p<0.05 else ""}"
+                              f" [{winner} wins ΔNSE={abs(nse_b.mean()-nse_a.mean()):.4f}]")
+            except Exception:
+                row[label] = "error"
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -243,7 +296,8 @@ def plot_horizon_curves(global_df: pd.DataFrame) -> None:
     hz_vals = sorted(HORIZONS)
     hz_ticks = [HZ_LABEL[h] for h in hz_vals]
 
-    for model in MODELS:
+    avail = global_df["model"].unique()
+    for model in [m for m in MODELS if m in avail]:
         nse_means, nse_stds = [], []
         rmse_means, rmse_stds = [], []
         for hz in hz_vals:
@@ -297,6 +351,12 @@ def plot_node_advantage(node_df: pd.DataFrame, horizon: int = 4) -> None:
 
     Nodes sorted by Δ NSE so the spatial pattern is visible.
     """
+    # avail_m = node_df["model"].unique()
+    # if "gru" not in avail_m or "st_gnn" not in avail_m:
+    #     print(f"  [skip] node_advantage_hz{horizon}: "
+    #           f"needs gru + st_gnn, missing: "
+    #           f"{[m for m in ['gru','st_gnn'] if m not in avail_m]}")
+    #     return
     gru = (node_df[(node_df.model == "gru") & (node_df.horizon == horizon)]
            .groupby("name")["nse"].mean().rename("gru"))
     gnn = (node_df[(node_df.model == "st_gnn") & (node_df.horizon == horizon)]
@@ -328,7 +388,14 @@ def plot_node_advantage(node_df: pd.DataFrame, horizon: int = 4) -> None:
                 fontsize=7)
 
     # Zone annotations
+    if df.empty or df["delta"].isna().all():
+        plt.close(fig)
+        print(f"  [skip] node_advantage_hz{horizon}: "
+              f"both models needed but one is missing")
+        return
     xmax = df["delta"].abs().max() * 1.4
+    if not np.isfinite(xmax) or xmax == 0:
+        xmax = 0.01
     ax.set_xlim(-xmax, xmax)
     fig.tight_layout()
     fig.savefig(OUT_DIR / f"node_advantage_hz{horizon}.png",
@@ -353,11 +420,12 @@ def plot_skill_violin(node_df: pd.DataFrame) -> None:
     for ax, (title, node_set) in zip(axes, groups):
         data_by_model = []
         labels = []
-        for model in MODELS:
+        avail_m = [m for m in MODELS if m in node_df["model"].unique()]
+        for model in avail_m:
             sub = node_df[(node_df.model == model) &
                           (node_df["name"].isin(node_set))]["skill"].dropna()
             data_by_model.append(sub.values)
-            labels.append(MODEL_LABELS[model])
+            labels.append(MODEL_LABELS.get(model, model))
 
         parts = ax.violinplot(data_by_model, positions=range(len(MODELS)),
                               showmedians=True, showextrema=True)
@@ -371,7 +439,7 @@ def plot_skill_violin(node_df: pd.DataFrame) -> None:
 
         ax.axhline(0, color="#D85A30", lw=1.0, ls="--", alpha=0.8)
         ax.set_xticks(range(len(MODELS)))
-        ax.set_xticklabels(["GRU", "ST-GNN", "LSTM"], fontsize=9)
+        ax.set_xticklabels(labels, fontsize=9)
         ax.set_title(title, fontsize=9.5)
         ax.tick_params(labelsize=8.5)
 
@@ -384,7 +452,6 @@ def plot_skill_violin(node_df: pd.DataFrame) -> None:
     plt.close(fig)
     print("  Saved: skill_violin.png")
 
-
 def plot_seed_stability(global_df: pd.DataFrame) -> None:
     """
     NSE across seeds for each model at T_out=4 (1hr horizon).
@@ -395,7 +462,8 @@ def plot_seed_stability(global_df: pd.DataFrame) -> None:
     fig.patch.set_facecolor("white")
 
     hz = 4
-    for model in MODELS:
+    avail_s = global_df["model"].unique()
+    for model in [m for m in MODELS if m in avail_s]:
         sub = global_df[(global_df.model == model) &
                         (global_df.horizon == hz)]
         nse_vals = [sub[sub.seed == s]["nse"].values[0]
@@ -465,7 +533,7 @@ def _find_nse_col(h: pd.DataFrame, path: Path) -> tuple:
     return None, None, False
 
 
-def plot_training_curves_overlay(horizon: int = 4) -> None:
+def plot_training_curves_overlay(global_df, horizon: int = 4) -> None:
     """
     Validation NSE curves for all models and seeds at a given horizon.
     Thin lines = individual seeds, thick line = mean across seeds.
@@ -479,7 +547,8 @@ def plot_training_curves_overlay(horizon: int = 4) -> None:
     y_label   = "Validation NSE"
     any_drawn = False
 
-    for model in MODELS:
+    avail_tc = global_df["model"].unique() if not global_df.empty else []
+    for model in [m for m in MODELS if m in avail_tc]:
         all_vals = []
         max_ep   = 0
         for seed in SEEDS:
@@ -640,14 +709,21 @@ def print_conclusion(global_df: pd.DataFrame,
     print("CONCLUSION")
     print(sep)
 
+    avail_m = global_df["model"].unique()
     for hz in HORIZONS:
         gru_nse  = global_df[(global_df.model == "gru")    & (global_df.horizon == hz)]["nse"]
         gnn_nse  = global_df[(global_df.model == "st_gnn") & (global_df.horizon == hz)]["nse"]
         lstm_nse = global_df[(global_df.model == "lstm")   & (global_df.horizon == hz)]["nse"]
+        dfc_nse  = global_df[(global_df.model == "dfc_gnn") & (global_df.horizon == hz)]["nse"]
         print(f"\nHorizon {HZ_LABEL[hz]} (T_out={hz}):")
-        print(f"  GRU    NSE {gru_nse.mean():.4f} ± {gru_nse.std(ddof=1):.4f}")
-        print(f"  ST-GNN NSE {gnn_nse.mean():.4f} ± {gnn_nse.std(ddof=1):.4f}")
-        print(f"  LSTM   NSE {lstm_nse.mean():.4f} ± {lstm_nse.std(ddof=1):.4f}")
+        for m_tag, m_series in [
+            ("gru",    gru_nse), ("lstm", lstm_nse), ("st_gnn", gnn_nse),
+            ("dfc_gnn", dfc_nse),
+        ]:
+            if m_tag not in avail_m or m_series.empty: continue
+            lbl = MODEL_LABELS.get(m_tag, m_tag)
+            std = m_series.std(ddof=1) if len(m_series) > 1 else 0
+            print(f"  {lbl:<26} NSE {m_series.mean():.4f} ± {std:.4f}")
 
         # Check if GRU-GNN difference is within variance
         gru_std  = gru_nse.std(ddof=1)
@@ -681,6 +757,143 @@ def print_conclusion(global_df: pd.DataFrame,
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
+
+def plot_dfc_vs_best_baseline(node_df: pd.DataFrame, horizon: int = 4) -> None:
+    """
+    For each node, show ΔNSE between DFC-GNN and the best-performing
+    graph baseline (whichever of ST-GNN, SAR, DynEdge, HAND has highest
+    mean NSE for that node).  This isolates the contribution of the
+    physically-biased dynamic attention over the previous best method.
+    """
+    if "dfc_gnn" not in node_df["model"].unique():
+        print("  [skip] dfc_gnn not in results yet")
+        return
+
+    dfc_nse = (node_df[(node_df.model == "dfc_gnn") & (node_df.horizon == horizon)]
+               .groupby("name")["nse"].mean().rename("dfc"))
+
+    # Best among static graph baselines
+    best_nse = None
+    for m in ["st_gnn_hand_edge", "st_gnn_dyn_edge", "st_gnn_sar", "st_gnn"]:
+        if m not in node_df["model"].unique():
+            continue
+        mn = (node_df[(node_df.model == m) & (node_df.horizon == horizon)]
+              .groupby("name")["nse"].mean())
+        best_nse = mn if best_nse is None else best_nse.combine(mn, max)
+
+    if best_nse is None:
+        print("  [skip] no graph baseline results found")
+        return
+
+    df = pd.concat([dfc_nse, best_nse.rename("best_baseline")], axis=1).dropna()
+    df["delta"] = df["dfc"] - df["best_baseline"]
+    df = df.sort_values("delta")
+
+    colors = ["#D4A017" if d >= 0 else "#888780" for d in df["delta"]]
+    fig, ax = plt.subplots(figsize=(10, max(6, len(df) * 0.37)))
+    fig.patch.set_facecolor("white")
+    ax.barh(df.index, df["delta"], color=colors, height=0.7,
+            edgecolor="white", linewidth=0.4)
+    ax.axvline(0, color="#444441", lw=0.8)
+    ax.set_xlabel("ΔNSE (DFC-GNN − best graph baseline)  |  gold = DFC-GNN wins",
+                  fontsize=9)
+    ax.set_title(f"DFC-GNN advantage over best graph baseline\n"
+                 f"Horizon T_out={horizon} ({HZ_LABEL[horizon]})  |  "
+                 f"mean over 3 seeds", fontsize=10)
+    ax.tick_params(labelsize=8.5)
+    for i, (_, row) in enumerate(df.iterrows()):
+        ax.text(row["delta"] + (0.0002 if row["delta"] >= 0 else -0.0002),
+                i, f"{row['delta']:+.4f}",
+                va="center", ha="left" if row["delta"] >= 0 else "right",
+                fontsize=7)
+    xmax = df["delta"].abs().max() * 1.4
+    if not np.isfinite(xmax) or xmax == 0:
+        xmax = 0.01
+    ax.set_xlim(-xmax, xmax)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / f"dfc_advantage_hz{horizon}.png",
+                dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: dfc_advantage_hz{horizon}.png")
+
+
+def plot_flood_acc_comparison(global_df: pd.DataFrame) -> None:
+    """
+    Bar chart comparing flood_acc (node-level flood classification accuracy)
+    across all models that report it, at each horizon.
+    Only DFC-GNN reports flood_acc; other models show NaN → grey bar at 0.
+    This plot documents the contribution of the auxiliary flood head.
+    """
+    if "flood_acc" not in global_df.columns:
+        return
+    dfc = global_df[global_df.model == "dfc_gnn"]
+    if dfc.empty or dfc.flood_acc.isna().all():
+        print("  [skip] flood_acc not yet available")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    fig.patch.set_facecolor("white")
+    x   = np.arange(len(HORIZONS))
+    w   = 0.5
+    means = [dfc[dfc.horizon == hz]["flood_acc"].mean() for hz in HORIZONS]
+    stds  = [dfc[dfc.horizon == hz]["flood_acc"].std(ddof=1)
+             if len(dfc[dfc.horizon == hz]) > 1 else 0 for hz in HORIZONS]
+    ax.bar(x, means, width=w, color=MODEL_COLORS["dfc_gnn"],
+           yerr=stds, capsize=5, alpha=0.85,
+           label="DFC-GNN flood_acc", edgecolor="white")
+    ax.set_xticks(x)
+    ax.set_xticklabels([HZ_LABEL[h] for h in HORIZONS])
+    ax.set_ylim(0.95, 1.0)
+    ax.set_ylabel("Node-level flood classification accuracy", fontsize=9)
+    ax.set_title("DFC-GNN auxiliary flood head accuracy\n"
+                 "Mean ± std across 3 seeds  |  "
+                 "1.0 = perfect node-level flood/no-flood classification",
+                 fontsize=10)
+    ax.legend(fontsize=9)
+    ax.tick_params(labelsize=9)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "flood_acc_dfc_gnn.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: flood_acc_dfc_gnn.png")
+
+
+def plot_all_models_nse_table(global_df: pd.DataFrame) -> None:
+    """
+    Heatmap table of NSE mean across all 7 models × 3 horizons.
+    Darker colour = higher NSE.  Provides a quick full-comparison view
+    for the thesis figures section.
+    """
+    avail = [m for m in MODELS if m in global_df["model"].unique()]
+    data  = np.full((len(avail), len(HORIZONS)), np.nan)
+    for i, m in enumerate(avail):
+        for j, hz in enumerate(HORIZONS):
+            sub = global_df[(global_df.model == m) & (global_df.horizon == hz)]["nse"]
+            if not sub.empty:
+                data[i, j] = sub.mean()
+
+    fig, ax = plt.subplots(figsize=(7, max(4, len(avail) * 0.6)))
+    fig.patch.set_facecolor("white")
+    im = ax.imshow(data, cmap="YlGn", aspect="auto", vmin=0.88, vmax=1.0)
+    ax.set_xticks(range(len(HORIZONS)))
+    ax.set_xticklabels([HZ_LABEL[h] for h in HORIZONS], fontsize=9)
+    ax.set_yticks(range(len(avail)))
+    ax.set_yticklabels([MODEL_LABELS.get(m, m) for m in avail], fontsize=9)
+    for i in range(len(avail)):
+        for j in range(len(HORIZONS)):
+            if not np.isnan(data[i, j]):
+                ax.text(j, i, f"{data[i,j]:.4f}", ha="center", va="center",
+                        fontsize=8.5,
+                        color="white" if data[i, j] > 0.97 else "black")
+    plt.colorbar(im, ax=ax, label="NSE", shrink=0.8)
+    ax.set_title("Test NSE — all models × horizons  (mean over 3 seeds)",
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "nse_heatmap_all_models.png",
+                dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: nse_heatmap_all_models.png")
+
+
 def main():
     print("Loading experiment results …")
     global_df, node_df, step_df = load_all()
@@ -698,14 +911,17 @@ def main():
     print_summary(summ, wilcox)
 
     print("\nGenerating figures …")
+    plot_all_models_nse_table(global_df)
     plot_horizon_curves(global_df)
     plot_seed_stability(global_df)
     plot_per_step_advantage(step_df)
     for hz in HORIZONS:
         plot_node_advantage(node_df, hz)
+        plot_dfc_vs_best_baseline(node_df, hz)
     plot_skill_violin(node_df)
+    plot_flood_acc_comparison(global_df)
     for hz in HORIZONS:
-        plot_training_curves_overlay(hz)
+        plot_training_curves_overlay(global_df, hz)
 
     print_conclusion(global_df, node_df)
 
