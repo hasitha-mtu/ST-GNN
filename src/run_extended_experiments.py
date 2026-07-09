@@ -240,8 +240,9 @@ def run_track_c(base_dir, logger, dry_run: bool = False):
     print("═"*60)
 
     benchmark_fns = {
-        "gru":     train_gru,
-        "dfc_gnn": train_dfc_gnn,
+        "gru": train_gru,  # no-graph baseline
+        "st_gnn_hand_edge": train_st_gnn_hand_edge,  # best static-graph baseline
+        "dfc_gnn": train_dfc_gnn,  # proposed model
     }
 
     total = len(SEEDS) * len(benchmark_fns)
