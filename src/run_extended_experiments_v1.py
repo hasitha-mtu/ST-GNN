@@ -100,7 +100,7 @@ TRACK_B_T_IN_NEW = [16, 64, 96]          # new T_in values (32 = existing)
 TRACK_B_T_IN_ALL = [16, 32, 64, 96]      # full set for analysis
 TRACK_B_T_OUT    = 4                      # 1-hr horizon (most sensitive to antecedent)
 
-# Track C: 24-hour operational benchmark — DFC-GNN and GRU × T_out=96 × 3 seeds
+# Track C: 24-hour operational benchmark — GRU, ST-GNN HAND, DFC-GNN × T_out=96 × 3 seeds
 TRACK_C_T_IN  = 32
 TRACK_C_T_OUT = 96                        # 24 hr
 
@@ -240,15 +240,17 @@ def run_track_b(logger, dry_run: bool = False):
 def run_track_c(logger, dry_run: bool = False):
     """24-hour operational benchmark for DFC-GNN and GRU."""
     print("\n" + "═"*60)
-    print("  TRACK C — 24-hour benchmark: DFC-GNN vs GRU")
-    print("  T_out = 96 steps = 24 hr")
+    print("  TRACK C — 24-hour benchmark: GRU vs ST-GNN HAND vs DFC-GNN")
+    print("  T_out = 96 steps = 24 hr  |  3 models × 3 seeds = 9 runs")
+    print("  Three-way: no-graph / best static-graph / proposed model")
+    print("  Allows claim: DFC-GNN > best competing graph model at 24hr")
     print("  Benchmark: OPW HEC-HMS operational forecast (24hr lead)")
-    print("  If DFC-GNN NSE > OPW benchmark at 24hr → operational case made")
     print("═"*60)
 
     benchmark_fns = {
-        "gru":     train_gru,
-        "dfc_gnn": train_dfc_gnn,
+        "gru":              train_gru,                # no-graph baseline
+        "st_gnn_hand_edge": train_st_gnn_hand_edge,  # best static-graph baseline
+        "dfc_gnn":          train_dfc_gnn,           # proposed model
     }
 
     total = len(SEEDS) * len(benchmark_fns)
@@ -280,7 +282,7 @@ def print_plan():
 
     a_runs = len(SEEDS) * len(TRACK_A_T_OUT) * 7
     b_runs = len(SEEDS) * len(TRACK_B_T_IN_NEW) * 2
-    c_runs = len(SEEDS) * 2
+    c_runs = len(SEEDS) * 3  # gru + st_gnn_hand_edge + dfc_gnn
     total  = a_runs + b_runs + c_runs
 
     print(f"""
@@ -301,7 +303,7 @@ def print_plan():
     T_in  = {TRACK_C_T_IN} steps ({TRACK_C_T_IN*15//60}hr input)
     T_out = {TRACK_C_T_OUT} steps ({TRACK_C_T_OUT*15//60} hr)
     Seeds = {SEEDS}
-    New runs = {len(SEEDS)} × 2 = {c_runs}
+    New runs = {len(SEEDS)} × 3 = {c_runs}
 
   ─────────────────────────────────────
   Total new training runs: {total}
