@@ -231,13 +231,14 @@ def run_track_b(base_dir, logger, dry_run: bool = False):
 # ── Track C ─────────────────────────────────────────────────────────────
 
 def run_track_c(base_dir, logger, dry_run: bool = False):
-    """24-hour operational benchmark for DFC-GNN and GRU."""
-    print("\n" + "═"*60)
-    print("  TRACK C — 24-hour benchmark: DFC-GNN vs GRU")
-    print("  T_out = 96 steps = 24 hr")
+    """24-hour operational benchmark for GRU vs ST-GNN HAND vs DFC-GNN."""
+    print("\n" + "═" * 60)
+    print("  TRACK C — 24-hour benchmark: GRU vs ST-GNN HAND vs DFC-GNN")
+    print("  T_out = 96 steps = 24 hr  |  3 models × 3 seeds = 9 runs")
+    print("  Three-way: no-graph / best static-graph / proposed model")
+    print("  Allows claim: DFC-GNN > best competing graph model at 24hr")
     print("  Benchmark: OPW HEC-HMS operational forecast (24hr lead)")
-    print("  If DFC-GNN NSE > OPW benchmark at 24hr → operational case made")
-    print("═"*60)
+    print("═" * 60)
 
     benchmark_fns = {
         "gru": train_gru,  # no-graph baseline
