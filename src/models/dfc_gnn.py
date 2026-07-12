@@ -673,22 +673,18 @@ class HANDDecoder(nn.Module):
 # ═════════════════════════════════════════════════════════════════════
 
 def load_edge_features(
-    path: str = "dataset/graph/edge_features.npz",
-    device: str = "cpu",
+    path:         str  = "dataset/graph/edge_features.npz",
+    device:       str  = "cpu",
+    use_sar_edge: bool = True,
 ) -> dict:
     """
-    Load pre-computed edge features and return tensors ready for DFCGNNFlood.
+    Load pre-computed edge features from edge_features.npz.
 
-    Example
-    -------
-        ef = load_edge_features("dataset/graph/edge_features.npz")
-        model = DFCGNNFlood(
-            n_nodes    = 27,
-            f_in       = 11,
-            edge_index = ef["edge_index"],
-            edge_attr  = ef["edge_attr"],
-            node_elev  = ef["node_elev"],
-        )
+    use_sar_edge : bool
+        True  (default, Experiment 2/RSE) — include sar_wetness_norm when present.
+        False (Experiment 1/JoH)          — load only the 4 terrain features
+        regardless of what the .npz contains.  Keeps Experiment 1 entirely
+        independent of any remote sensing input.
     """
     data = np.load(path, allow_pickle=True)
 
@@ -702,7 +698,9 @@ def load_edge_features(
              data["elev_diff_norm"],
              data["travel_time_norm"],
              data["hand_diff_norm"]]
-            + ([data["sar_wetness_norm"]] if "sar_wetness_norm" in data else []),
+            + ([data["sar_wetness_norm"]]                          # 5th feature: SAR
+               if (use_sar_edge and "sar_wetness_norm" in data)
+               else []),                  # omitted for Experiment 1 (JoH paper)
             axis=1),
         dtype=torch.float32,
     ).to(device)
@@ -728,13 +726,14 @@ def build_dfc_gnn(
     n_nodes:    int,
     f_in:       int,
     T_out:      int,
-    ef_path:    str  = "dataset/graph/edge_features.npz",
-    d_model:    int  = 64,
-    n_heads:    int  = 4,
-    n_layers:   int  = 2,
-    dropout:    float = 0.1,
-    lambda_flood:float = 0.1,
-    device:     str  = "cpu",
+    ef_path:      str  = "dataset/graph/edge_features.npz",
+    d_model:      int  = 64,
+    n_heads:      int  = 4,
+    n_layers:     int  = 2,
+    dropout:      float = 0.1,
+    lambda_flood: float = 0.1,
+    device:       str  = "cpu",
+    use_sar_edge: bool = True,   # set False for Experiment 1 (JoH)
 ) -> DFCGNNFlood:
     """
     Factory function called by train_model.py for the dfc_gnn variant.
@@ -743,7 +742,7 @@ def build_dfc_gnn(
     the training script can build DFCGNNFlood with a single config change:
         --model dfc_gnn
     """
-    ef = load_edge_features(ef_path, device=device)
+    ef = load_edge_features(ef_path, device=device, use_sar_edge=use_sar_edge)
     model = DFCGNNFlood(
         n_nodes      = n_nodes,
         f_in         = f_in,
