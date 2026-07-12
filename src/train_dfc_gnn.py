@@ -68,6 +68,14 @@ PROC_DIR   = BASE_DIR / "dataset/processed"
 GRAPH_DIR  = BASE_DIR / "dataset/graph"
 LIVE_METRICS_PATH = BASE_DIR / "checkpoints" / "live_metrics.json"
 
+# ── Experiment selector ───────────────────────────────────────────────
+# USE_SAR_EDGE = False → Experiment 1 (JoH): 4 terrain edge features only.
+#                        Checkpoint saved under "dfc_gnn".
+#                        DFC-GNN is cleanly independent of remote sensing.
+# USE_SAR_EDGE = True  → Experiment 2 (RSE): 4 terrain + 1 SAR wetness.
+#                        Checkpoint saved under "dfc_gnn_sar".
+USE_SAR_EDGE: bool = False   # set True when running Experiment 2
+
 # ── Hyperparameters ────────────────────────────────────────────────────
 HIDDEN_DIM   = 64
 GAT_HEADS    = 4     # DFC-GNN uses 4 heads (vs 2 in static baseline)
@@ -256,13 +264,16 @@ def eval_epoch(
 
 def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = None):
 
-    run_tag  = "dfc_gnn"
+    # Checkpoint dir: "dfc_gnn" for Exp1 (no SAR), "dfc_gnn_sar" for Exp2
+    run_tag  = "dfc_gnn" if not USE_SAR_EDGE else "dfc_gnn_sar"
     if base_dir is None:
         base_dir = BASE_DIR
     ckpt_dir = base_dir / "checkpoints" / run_tag / str(seed) / str(t_out)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("=== Training DFC-GNN (physically-biased dynamic attention) ===")
+    exp_label = "Experiment 1 / JoH (no SAR edge)" if not USE_SAR_EDGE \
+                else "Experiment 2 / RSE (SAR wetness edge)"
+    logger.info("=== Training DFC-GNN [%s] ===", exp_label)
     logger.info("Device: %s", DEVICE)
 
     # ── Load gauge data ────────────────────────────────────────────────
@@ -340,6 +351,7 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
         dropout      = DROPOUT,
         lambda_flood = LAMBDA_FLOOD,
         device       = str(DEVICE),
+        use_sar_edge = USE_SAR_EDGE,   # controlled by module-level flag
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
