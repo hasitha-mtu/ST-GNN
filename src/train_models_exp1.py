@@ -97,6 +97,10 @@ SEEDS     = [42, 123, 456]
 T_IN      = 32                          # 8-hour input window
 T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
 MAX_EPOCHS = 300
+
+# SEEDS     = [42]
+# T_IN      = 32                          # 8-hour input window
+# T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
 # MAX_EPOCHS = 1
 
 # Model registry in narrative order (baselines first, then graph models)
@@ -153,7 +157,13 @@ def compute_persistence_baseline(t_outs: list[int]) -> None:
     for t_out in t_outs:
         rows = []
         for node in range(N):
-            nse_vals, rmse_vals = [], []
+            # Fix 2.7b: aggregate ALL (pred, target) pairs first, then
+            # compute a single NSE over the pooled predictions.
+            # The original code averaged per-window NSE values, which
+            # is not the same as the NSE the trained models report (the
+            # trained models compute NSE over all test predictions pooled).
+            all_preds, all_targets = [], []
+            sq_errors = []
             for i in range(test_start, T - t_out):
                 last_obs = y_full[i, node]
                 targets  = y_full[i+1:i+1+t_out, node]
@@ -162,18 +172,25 @@ def compute_persistence_baseline(t_outs: list[int]) -> None:
                     continue
                 t_valid = targets[masks]
                 p_valid = np.full_like(t_valid, last_obs)
-                ss_res  = float(np.sum((t_valid - p_valid) ** 2))
-                ss_tot  = float(np.sum((t_valid - t_valid.mean()) ** 2))
-                nse = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-                rmse = float(np.sqrt(np.mean((t_valid - p_valid) ** 2)))
-                nse_vals.append(nse)
-                rmse_vals.append(rmse)
+                all_preds.extend(p_valid.tolist())
+                all_targets.extend(t_valid.tolist())
+                sq_errors.extend(((t_valid - p_valid) ** 2).tolist())
+
+            if all_targets:
+                p_all = np.array(all_preds)
+                t_all = np.array(all_targets)
+                ss_res = float(np.sum((t_all - p_all) ** 2))
+                ss_tot = float(np.sum((t_all - t_all.mean()) ** 2))
+                nse  = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                rmse = float(np.sqrt(np.mean(sq_errors)))
+            else:
+                nse, rmse = float("nan"), float("nan")
 
             rows.append({
                 "ref":  nodes_df.iloc[node]["ref"] if "ref" in nodes_df.columns else node,
                 "name": nodes_df.iloc[node].get("name", f"node_{node}"),
-                "nse":  round(float(np.nanmean(nse_vals)), 6) if nse_vals else float("nan"),
-                "rmse": round(float(np.nanmean(rmse_vals)), 6) if rmse_vals else float("nan"),
+                "nse":  round(nse, 6),
+                "rmse": round(rmse, 6),
             })
 
         df = pd.DataFrame(rows)
