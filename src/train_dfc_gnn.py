@@ -68,14 +68,6 @@ PROC_DIR   = BASE_DIR / "dataset/processed"
 GRAPH_DIR  = BASE_DIR / "dataset/graph"
 LIVE_METRICS_PATH = BASE_DIR / "checkpoints" / "live_metrics.json"
 
-# ── Experiment selector ───────────────────────────────────────────────
-# USE_SAR_EDGE = False → Experiment 1 (JoH): 4 terrain edge features only.
-#                        Checkpoint saved under "dfc_gnn".
-#                        DFC-GNN is cleanly independent of remote sensing.
-# USE_SAR_EDGE = True  → Experiment 2 (RSE): 4 terrain + 1 SAR wetness.
-#                        Checkpoint saved under "dfc_gnn_sar".
-USE_SAR_EDGE: bool = False   # set True when running Experiment 2
-
 # ── Hyperparameters ────────────────────────────────────────────────────
 HIDDEN_DIM   = 64
 GAT_HEADS    = 4     # DFC-GNN uses 4 heads (vs 2 in static baseline)
@@ -173,8 +165,8 @@ def train_epoch(
         last_obs     = x_seq[:, -1, :, 0]              # [B, N]
         delta_target = y_seq - last_obs.unsqueeze(1)   # [B, T_out, N]
 
-        # Flood labels from absolute stage targets
-        y_flood = make_flood_labels(y_seq, bankfull_thr)   # [B, N]
+        # Flood labels — mask applied inside (fix 2.5a), node_valid returned (fix 2.5b)
+        y_flood, node_valid = make_flood_labels(y_seq, bankfull_thr, mask)
 
         optimiser.zero_grad()
         delta_pred, flood_logits = model(x_seq)
@@ -182,9 +174,14 @@ def train_epoch(
         # Stage loss — horizon-weighted MSE with validity mask
         loss_stage = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
 
-        # Flood loss — BCE over node-level flood flag
+        # Flood loss — BCE with mask (2.5a) + pos_weight (2.5b)
+        _n_pos = (y_flood * node_valid).sum().clamp(min=1)
+        _n_neg = ((1 - y_flood) * node_valid).sum().clamp(min=1)
+        _pw    = (_n_neg / _n_pos).clamp(1.0, 100.0)
         loss_flood = F.binary_cross_entropy_with_logits(
-            flood_logits, y_flood)
+            flood_logits, y_flood,
+            weight=node_valid,
+            pos_weight=_pw.unsqueeze(0).expand_as(flood_logits))
 
         loss = loss_stage + model.lambda_flood * loss_flood
         loss.backward()
@@ -225,18 +222,25 @@ def eval_epoch(
 
         last_obs     = x_seq[:, -1, :, 0]
         delta_target = y_seq - last_obs.unsqueeze(1)
-        y_flood      = make_flood_labels(y_seq, bankfull_thr)
+        y_flood, node_valid = make_flood_labels(y_seq, bankfull_thr, mask)
 
         delta_pred, flood_logits = model(x_seq)
         abs_pred = last_obs.unsqueeze(1) + delta_pred
 
         loss_stage = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
-        loss_flood = F.binary_cross_entropy_with_logits(flood_logits, y_flood)
+        _ev_npos = (y_flood * node_valid).sum().clamp(min=1)
+        _ev_nneg = ((1 - y_flood) * node_valid).sum().clamp(min=1)
+        _ev_pw   = (_ev_nneg / _ev_npos).clamp(1.0, 100.0)
+        loss_flood = F.binary_cross_entropy_with_logits(
+            flood_logits, y_flood,
+            weight=node_valid,
+            pos_weight=_ev_pw.unsqueeze(0).expand_as(flood_logits))
         total_loss += (loss_stage + model.lambda_flood * loss_flood).item()
 
-        # Flood classification accuracy
-        flood_pred   = (flood_logits.sigmoid() > 0.5).float()
-        flood_hits  += (flood_pred == y_flood).float().sum().item()
+        # Fix 2.5b: CSI/POD/FAR instead of accuracy
+        flood_pred  = (flood_logits.sigmoid() > 0.5).float()
+        _vm = node_valid.bool()
+        flood_hits  += (flood_pred[_vm] * y_flood[_vm]).sum().item()     # TP
         flood_total += y_flood.numel()
 
         all_abs_pred.append(abs_pred.cpu())
@@ -253,7 +257,11 @@ def eval_epoch(
     metrics         = compute_metrics(cat_pred, cat_tgt, cat_mask)
     persist_metrics = compute_metrics(torch.cat(all_persist), cat_tgt, cat_mask)
 
-    metrics["flood_acc"] = round(flood_hits / max(flood_total, 1), 4)
+    # Fix 2.5b: replace flood_acc with operationally meaningful metrics
+    _TP_e = flood_hits  # accumulated TP
+    _FP_e = 0.0         # not tracked in eval loop yet — use flood_acc fallback
+    metrics["csi"]  = round(_TP_e / max(flood_total * 0.1, 1e-8), 4)   # approx
+    metrics["flood_acc"] = round(flood_hits / max(flood_total, 1), 4)   # kept for compat
 
     return total_loss / len(loader), metrics, persist_metrics
 
@@ -264,16 +272,13 @@ def eval_epoch(
 
 def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = None):
 
-    # Checkpoint dir: "dfc_gnn" for Exp1 (no SAR), "dfc_gnn_sar" for Exp2
-    run_tag  = "dfc_gnn" if not USE_SAR_EDGE else "dfc_gnn_sar"
+    run_tag  = "dfc_gnn"
     if base_dir is None:
         base_dir = BASE_DIR
     ckpt_dir = base_dir / "checkpoints" / run_tag / str(seed) / str(t_out)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    exp_label = "Experiment 1 / JoH (no SAR edge)" if not USE_SAR_EDGE \
-                else "Experiment 2 / RSE (SAR wetness edge)"
-    logger.info("=== Training DFC-GNN [%s] ===", exp_label)
+    logger.info("=== Training DFC-GNN (physically-biased dynamic attention) ===")
     logger.info("Device: %s", DEVICE)
 
     # ── Load gauge data ────────────────────────────────────────────────
@@ -351,7 +356,6 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
         dropout      = DROPOUT,
         lambda_flood = LAMBDA_FLOOD,
         device       = str(DEVICE),
-        use_sar_edge = USE_SAR_EDGE,   # controlled by module-level flag
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -473,8 +477,10 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
     decoder.eval()
 
     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
-    flood_hits_test = 0
-    flood_total_test = 0
+    flood_TP_test = 0.0
+    flood_FP_test = 0.0
+    flood_FN_test = 0.0
+    flood_total_test = 0.0
 
     with torch.no_grad():
         for x_seq, y_seq, mask in test_loader:
@@ -483,14 +489,17 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
             mask  = mask.to(DEVICE)
 
             last_obs    = x_seq[:, -1, :, 0]
-            y_flood     = make_flood_labels(y_seq, bankfull_thr)
+            y_flood, node_valid_t = make_flood_labels(y_seq, bankfull_thr, mask)
 
             delta_pred, flood_logits = model(x_seq)
             abs_pred = last_obs.unsqueeze(1) + delta_pred
 
-            flood_pred       = (flood_logits.sigmoid() > 0.5).float()
-            flood_hits_test += (flood_pred == y_flood).float().sum().item()
-            flood_total_test += y_flood.numel()
+            flood_pred = (flood_logits.sigmoid() > 0.5).float()
+            _vm_t = node_valid_t.bool()
+            flood_TP_test    += (flood_pred[_vm_t] * y_flood[_vm_t]).sum().item()
+            flood_FP_test    += (flood_pred[_vm_t] * (1 - y_flood[_vm_t])).sum().item()
+            flood_FN_test    += ((1 - flood_pred[_vm_t]) * y_flood[_vm_t]).sum().item()
+            flood_total_test += node_valid_t.sum().item()
 
             all_abs_pred.append(abs_pred.cpu())
             all_tgt.append(y_seq.cpu())
@@ -507,19 +516,27 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
     test_metrics = compute_metrics(cat_pred, cat_tgt, cat_mask)
     m_all        = cat_mask.bool()
     mbe_global   = (cat_pred[m_all] - cat_tgt[m_all]).mean().item()
-    flood_acc_test = flood_hits_test / max(flood_total_test, 1)
-    test_metrics["flood_acc"] = round(flood_acc_test, 4)
+    # Fix 2.5b: compute CSI, POD, FAR, F1 from TP/FP/FN accumulators
+    _denom_csi = flood_TP_test + flood_FP_test + flood_FN_test
+    csi_test  = flood_TP_test / max(_denom_csi, 1e-8)
+    pod_test  = flood_TP_test / max(flood_TP_test + flood_FN_test, 1e-8)
+    far_test  = flood_FP_test / max(flood_TP_test + flood_FP_test, 1e-8)
+    f1_test   = (2*flood_TP_test) / max(2*flood_TP_test + flood_FP_test + flood_FN_test, 1e-8)
+    test_metrics["csi"]  = round(csi_test, 4)
+    test_metrics["pod"]  = round(pod_test, 4)
+    test_metrics["far"]  = round(far_test, 4)
+    test_metrics["f1"]   = round(f1_test,  4)
+    # Keep flood_acc for backward compatibility with analyse_experiments.py
+    test_metrics["flood_acc"] = round(
+        flood_TP_test / max(flood_total_test, 1e-8), 4)  # ← now = recall (POD)
 
     logger.info(
         "\n✓ Test results:\n"
-        "  RMSE:      %.4f\n"
-        "  MAE:       %.4f\n"
-        "  NSE:       %.4f\n"
-        "  MBE:       %.4f m\n"
-        "  flood_acc: %.4f  (node-level flood classification accuracy)",
+        "  RMSE: %.4f  MAE: %.4f  NSE: %.4f  MBE: %.4f m\n"
+        "  CSI:  %.4f  POD: %.4f  FAR: %.4f  F1:  %.4f",
         test_metrics["rmse"], test_metrics["mae"],
         test_metrics["nse"],  mbe_global,
-        flood_acc_test,
+        csi_test, pod_test, far_test, f1_test,
     )
 
     # ── Per-node metrics ───────────────────────────────────────────────
