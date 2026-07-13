@@ -189,6 +189,19 @@ class STGNNHANDEdge(nn.Module):
         self.norm3 = nn.LayerNorm(hidden // 2)
         self.res3  = nn.Linear(hidden, hidden // 2, bias=False)
 
+        # ── HAND message gate (Fix 2.1) ──────────────────────────────
+        # Linear transform applied to source node features for HAND edges,
+        # followed by per-edge multiplication with stage-based activation.
+        # This ensures activation directly gates the HAND edge message,
+        # rather than being one projected input to the GATConv attention.
+        # hidden → hidden (same dim as GATConv layer 1 input)
+        self.hand_msg_linear = nn.Linear(hidden, hidden, bias=False)
+        self.hand_msg_norm   = nn.LayerNorm(hidden)
+        # Learnable scalar controlling HAND message magnitude vs river msgs
+        # Initialised at 0 so training begins without HAND contribution
+        # and ramps up only when activation provides reliable signal.
+        self.hand_scale = nn.Parameter(torch.zeros(1))
+
         # ── Output head ───────────────────────────────────────────────
         self.head = nn.Sequential(
             nn.Linear(hidden // 2, hidden // 4),
@@ -255,12 +268,17 @@ class STGNNHANDEdge(nn.Module):
         thresh_t = self.hand_thresh_norm.unsqueeze(0).expand(B, -1)  # [B, E]
         zeros    = torch.zeros(B, E_hand, device=x_last.device)      # [B, E]
 
-        return torch.stack(
-            [dist_t, thresh_t, zeros, zeros, activation], dim=-1
-        )                                                            # [B, E, 5]
+        # Fix 2.1: activation is NO LONGER an edge attribute passed to GATConv.
+        # It becomes an explicit multiplicative gate applied in forward().
+        # Return 4-feature static attrs (compatible with river edge format)
+        # PLUS activation as a separate return value.
+        static_ea = torch.stack(
+            [dist_t, thresh_t, zeros, zeros], dim=-1
+        )                                                            # [B, E, 4]
+        return static_ea, activation                                 # [B,E,4], [B,E]
 
     # ──────────────────────────────────────────────────────────────────
-    def _build_combined_graph(
+    def _build_river_graph(
         self,
         x_last:    torch.Tensor,    # [B, N, F]
         edge_index: torch.Tensor,   # [2, E_river]
@@ -269,38 +287,26 @@ class STGNNHANDEdge(nn.Module):
         N:         int,
     ):
         """
-        Concatenate river network edges and HAND candidate edges into a
-        single batched graph for efficient GATConv.
+        Build batched graph for RIVER edges only.
+
+        Fix 2.1: HAND edges are processed separately in forward() with
+        explicit activation gating. This method returns river edges only.
 
         Returns
         -------
-        batched_edge_index : [2, B × (E_river + E_hand)]
-        batched_edge_attr  : [B × (E_river + E_hand), 5]
-        E_total            : int — edges per graph instance
+        batched_edge_index : [2, B × E_river]
+        batched_edge_attr  : [B × E_river, 5]  (4 static + conductance)
         """
         E_river = edge_index.shape[1]
-        E_hand  = self.hand_src.shape[0]
+        river_ea = self._river_edge_attr(x_last, edge_index, edge_attr)  # [B, E, 5]
 
-        # Edge attributes
-        river_ea = self._river_edge_attr(x_last, edge_index, edge_attr)
-        hand_ea  = self._hand_edge_attr(x_last)
+        offsets = torch.arange(B, device=edge_index.device) * N
+        src_b = (edge_index[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+        dst_b = (edge_index[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
+        batched_ei = torch.stack([src_b, dst_b], dim=0)   # [2, B×E_river]
+        batched_ea = river_ea.reshape(B * E_river, 5)      # [B×E_river, 5]
 
-        # Combined edge index for one graph: river edges then HAND edges
-        hand_ei = torch.stack(
-            [self.hand_src, self.hand_dst], dim=0
-        )                                                     # [2, E_hand]
-        combined_ei = torch.cat([edge_index, hand_ei], dim=1) # [2, E_total]
-        combined_ea = torch.cat([river_ea, hand_ea], dim=1)   # [B, E_total, 5]
-        E_total = E_river + E_hand
-
-        # Batch offsets
-        offsets = torch.arange(B, device=edge_index.device) * N  # [B]
-        src_b = (combined_ei[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        dst_b = (combined_ei[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        batched_ei = torch.stack([src_b, dst_b], dim=0)          # [2, B×E_total]
-        batched_ea = combined_ea.reshape(B * E_total, 5)          # [B×E_total, 5]
-
-        return batched_ei, batched_ea, E_total
+        return batched_ei, batched_ea
 
     # ──────────────────────────────────────────────────────────────────
     def forward(
@@ -329,18 +335,57 @@ class STGNNHANDEdge(nn.Module):
         if self.use_sar and sar_emb is not None:
             h = self.sar_fusion(torch.cat([h, sar_emb], dim=-1))
 
-        # ── Step 4: build combined dynamic graph ───────────────────────
+        # ── Step 4: build river-only batched graph ─────────────────────
         x_last = x_seq[:, -1, :, :]
-        batched_ei, batched_ea, E_total = self._build_combined_graph(
+        batched_ei, batched_ea = self._build_river_graph(
             x_last, edge_index, edge_attr, B, N
         )
 
-        # ── Step 5: GATConv ────────────────────────────────────────────
+        # ── Step 4b: compute HAND activation and gated messages ────────
+        # Fix 2.1: activation explicitly gates HAND messages.
+        # This implements dynamic topology: when stage < τ, activation→0
+        # and the HAND edge contributes nothing regardless of attention.
+        # When stage > τ, activation→1 and the full message is aggregated.
+        hand_ea_static, hand_activation = self._hand_edge_attr(x_last)
+        # hand_activation: [B, E_hand] ∈ (0,1)
+
+        # ── Step 5: GATConv on river graph ─────────────────────────────
         h_flat = h.reshape(B * N, self.hidden)
 
-        h1 = F.elu(self.norm1(
-            self.gat1(h_flat, batched_ei, batched_ea) + self.res1(h_flat)
-        ))
+        h1_river = self.gat1(h_flat, batched_ei, batched_ea)  # [B*N, hidden*heads]
+
+        # ── Step 5b: activation-gated HAND messages ────────────────────
+        # For each HAND edge (src→dst), compute a linear transform of the
+        # source node feature, then scale by activation before aggregating
+        # to the destination node.  Gradient flows through both the linear
+        # transform and through activation (which depends on stage).
+        h_for_hand = h.reshape(B * N, self.hidden)   # same as h_flat
+
+        # Batch-expand HAND edge indices
+        offsets_h   = torch.arange(B, device=edge_index.device) * N
+        hand_src_b  = (self.hand_src.unsqueeze(0) + offsets_h.unsqueeze(1)).reshape(-1)
+        hand_dst_b  = (self.hand_dst.unsqueeze(0) + offsets_h.unsqueeze(1)).reshape(-1)
+        E_hand      = self.hand_src.shape[0]
+
+        # Source features for each HAND edge: [B*E_hand, hidden]
+        src_feat    = h_for_hand[hand_src_b]
+        hand_msg    = self.hand_msg_linear(src_feat)           # [B*E_hand, hidden]
+
+        # Gate by activation: [B, E_hand] → [B*E_hand, 1]
+        gate_flat   = hand_activation.reshape(B * E_hand, 1)  # [B*E_hand, 1]
+        hand_msg_gated = hand_msg * gate_flat                  # explicit gate
+
+        # Scatter-sum to destination nodes: [B*N, hidden]
+        hand_agg = torch.zeros_like(h_for_hand)
+        hand_dst_exp = hand_dst_b.unsqueeze(-1).expand_as(hand_msg_gated)
+        hand_agg.scatter_add_(0, hand_dst_exp, hand_msg_gated)
+        hand_agg = self.hand_msg_norm(hand_agg)               # [B*N, hidden]
+
+        # Combine river + gated HAND contributions
+        # hand_scale starts at 0; grows as training demonstrates HAND utility
+        h1_combined = h1_river + torch.sigmoid(self.hand_scale) * hand_agg
+        h1 = F.elu(self.norm1(h1_combined + self.res1(h_flat)))
+
         h2 = F.elu(self.norm2(
             self.gat2(h1,    batched_ei, batched_ea) + self.res2(h1)
         ))

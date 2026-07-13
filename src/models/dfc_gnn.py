@@ -238,7 +238,19 @@ class PhysicallyBiasedGATConv(nn.Module):
         gate = torch.sigmoid(elev_diff / self.tau_gate)          # [E]
         # Broadcast: [B, E, H]
         gate = gate.unsqueeze(0).unsqueeze(-1).expand(B, E, H)
-        score = score * gate
+
+        # ── Log-additive gate (reviewer fix 2.3) ──────────────────
+        # WRONG (original):  score = score * gate
+        #   When gate→0, score→0 not -∞. If original score was negative,
+        #   multiplying by a small gate makes it less negative, potentially
+        #   *increasing* the uphill edge's relative attention after softmax.
+        #
+        # CORRECT:  score = score + log(gate + ε)
+        #   When gate→0, log(gate+ε)→-∞, so edge score→-∞ → attention=0.
+        #   When gate→1, log(gate+ε)→0, no distortion of original score.
+        #   Satisfies α_ij = g_ij · softmax_j(e_ij) in the log-exp sense.
+        #   Reference: Tucker et al. (2017) REBAR; Jang et al. (2017) Gumbel.
+        score = score + torch.log(gate + 1e-6)
 
         # ── Softmax over incoming edges per destination node ───────────
         # Convert to sparse-style: for each dst, normalise over all src

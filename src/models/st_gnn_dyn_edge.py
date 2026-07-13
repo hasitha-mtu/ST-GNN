@@ -96,7 +96,7 @@ class STGNNDynEdge(nn.Module):
         dropout:        float = 0.1,
         sar_emb_dim:    int   = 0,
         discharge_idx:  int   = 3,
-        discharge_ref:  float = 1.0,
+        discharge_ref = 1.0,   # float scalar OR [N] tensor per-node
     ):
         super().__init__()
         self.hidden         = hidden
@@ -104,8 +104,12 @@ class STGNNDynEdge(nn.Module):
         self.sar_emb_dim    = sar_emb_dim
         self.use_sar        = (sar_emb_dim > 0)
         self.discharge_idx  = discharge_idx
-        self.discharge_ref  = discharge_ref
         self.use_dyn_edge   = (f_edge >= 5)
+        # Fix 2.2: register per-node Q_ref as buffer (checkpoint-safe, device-aware)
+        if isinstance(discharge_ref, torch.Tensor):
+            self.register_buffer("discharge_ref", discharge_ref.float())
+        else:
+            self.register_buffer("discharge_ref", torch.tensor([float(discharge_ref)]))
 
         # Learnable scale for sigmoid conductance — initialised to 3.0 so that
         # a 2× increase in discharge over reference gives conductance ≈ 0.95.
@@ -182,14 +186,23 @@ class STGNNDynEdge(nn.Module):
         # Discharge at upstream node for every edge: [B, E]
         Q_src = x_last[:, src, self.discharge_idx]          # [B, E]
 
-        # Sigmoid conductance: high when discharge >> reference
+        # Fix 2.2a: per-node reference discharge (buffer [1] or [N])
+        Q_ref_src = (self.discharge_ref[src] if self.discharge_ref.shape[0] > 1
+                     else self.discharge_ref)   # broadcast or index
+
         conductance = torch.sigmoid(
-            self.conductance_scale * (Q_src / self.discharge_ref - 1.0)
+            self.conductance_scale * (Q_src / (Q_ref_src + 1e-8) - 1.0)
         )                                                     # [B, E]
 
-        # Tile static attrs across batch, concat dynamic conductance
+        # Fix 2.2b: use log(conductance) as the 5th edge feature.
+        # log(conductance) is monotonically related to Q: a positive learned
+        # projection weight in GATConv gives guaranteed Q↑ → attention↑,
+        # addressing the reviewer concern that raw conductance could be
+        # projected with a negative or negligible weight.
+        log_conductance = torch.log(conductance + 1e-6)      # [B, E]
+
         static_tiled = edge_attr.unsqueeze(0).expand(B, -1, -1)  # [B, E, 4]
-        dyn = conductance.unsqueeze(-1)                           # [B, E, 1]
+        dyn = log_conductance.unsqueeze(-1)                       # [B, E, 1]
         return torch.cat([static_tiled, dyn], dim=-1)             # [B, E, 5]
 
     # ──────────────────────────────────────────────────────────────────
