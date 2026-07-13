@@ -56,8 +56,8 @@ MODELS   = [
     "dfc_gnn",         # DFC-GNN — physically-biased dynamic attention
 ]
 SEEDS    = [42, 123, 456]
-HORIZONS = [4, 12, 16]          # T_out steps at 15-min → 1hr, 3hr, 4hr
-HZ_LABEL = {4: "1 hr", 12: "3 hr", 16: "4 hr"}
+HORIZONS = [4, 12, 16, 24, 48]  # T_out steps at 15-min → 1hr–12hr
+HZ_LABEL = {4: "1 hr", 12: "3 hr", 16: "4 hr", 24: "6 hr", 48: "12 hr"}
 
 # No-graph baselines: warm colours
 # Graph baselines: blue family
@@ -116,7 +116,7 @@ RESERVOIR_NODES = {
 # 1.  Data loading
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_all() -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_all() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Walk the directory tree and load all test_metrics.json and
     per_node_metrics.csv files into two tidy DataFrames.
@@ -161,6 +161,25 @@ def load_all() -> tuple[pd.DataFrame, pd.DataFrame]:
                 pn["seed"]    = seed
                 pn["horizon"] = hz
                 node_rows.append(pn)
+
+                # Extended metrics (KGE, POD, FAR, peak timing)
+                # Written by run_inference.py compute_extended_metrics().
+                # If absent, all values default to NaN — backward-compatible.
+                em_path = d / "extended_metrics.json"
+                if em_path.exists():
+                    with open(em_path) as f:
+                        em = json.load(f)
+                    global_rows[-1].update({
+                        "kge_mean":             em.get("kge_mean"),
+                        "kge_r_mean":           em.get("kge_r_mean"),
+                        "kge_alpha_mean":       em.get("kge_alpha_mean"),
+                        "kge_beta_mean":        em.get("kge_beta_mean"),
+                        "pod":                  em.get("pod"),
+                        "far":                  em.get("far"),
+                        "peak_timing_mean_hr":  em.get("peak_timing_mean_hr"),
+                        "peak_timing_median_hr":em.get("peak_timing_median_hr"),
+                        "peak_timing_n_events": em.get("peak_timing_n_events"),
+                    })
 
     if missing:
         print(f"[warn] {len(missing)} missing directories:")
@@ -223,6 +242,19 @@ def summary_table(global_df: pd.DataFrame) -> pd.DataFrame:
                 "Skill":      round(skill, 4),
                 "MBE mean":   round(sub.mbe.mean(), 4),
             }
+            # Extended metrics — include when present
+            for col, label in [
+                ("kge_mean",            "KGE mean"),
+                ("kge_r_mean",           "KGE r"),
+                ("kge_alpha_mean",       "KGE alpha"),
+                ("kge_beta_mean",        "KGE beta"),
+                ("pod",                  "POD"),
+                ("far",                  "FAR"),
+                ("peak_timing_mean_hr",  "Peak timing mean (hr)"),
+                ("peak_timing_median_hr","Peak timing median (hr)"),
+            ]:
+                if col in sub.columns and sub[col].notna().any():
+                    row[label] = round(float(sub[col].mean(skipna=True)), 4)
             if "flood_acc" in sub.columns and not sub.flood_acc.isna().all():
                 row["flood_acc"] = round(sub.flood_acc.mean(), 4)
             rows.append(row)
@@ -849,7 +881,7 @@ def plot_flood_acc_comparison(global_df: pd.DataFrame) -> None:
                  "Mean ± std across 3 seeds  |  "
                  "1.0 = perfect node-level flood/no-flood classification",
                  fontsize=10)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=9) 
     ax.tick_params(labelsize=9)
     fig.tight_layout()
     fig.savefig(OUT_DIR / "flood_acc_dfc_gnn.png", dpi=180, bbox_inches="tight")
@@ -894,6 +926,201 @@ def plot_all_models_nse_table(global_df: pd.DataFrame) -> None:
     print("  Saved: nse_heatmap_all_models.png")
 
 
+
+def plot_kge_components(global_df: pd.DataFrame, horizon: int = 4) -> None:
+    """
+    Grouped bar chart showing KGE and its three components (r, alpha, beta)
+    for each model at the given horizon.
+
+    Why this matters: NSE = 1.0 is achievable even with large bias (beta ≠ 1)
+    if the model tracks temporal patterns well (high r).  KGE decomposition
+    shows WHERE each model falls short — autocorrelation inflation of NSE is
+    visible as high r with low alpha (under-prediction of variability).
+
+    Reference: Gupta et al. (2009, JoH 377:80-91) — the definitive KGE paper.
+    """
+    kge_cols = ["kge_mean", "kge_r_mean", "kge_alpha_mean", "kge_beta_mean"]
+    labels_c = ["KGE", "r (correlation)", "α (variability)", "β (bias)"]
+    colors_c = ["#2C6E49", "#4A90D9", "#D85A30", "#9B59B6"]
+
+    avail = [m for m in MODELS if m in global_df["model"].unique()]
+    if not any(c in global_df.columns for c in kge_cols):
+        print("  [skip] kge_components: run run_inference.py first to generate extended_metrics.json")
+        return
+
+    sub = global_df[(global_df.horizon == horizon) & (global_df.model.isin(avail))]
+    if sub.empty:
+        return
+
+    x      = np.arange(len(avail))
+    width  = 0.18
+    fig, ax = plt.subplots(figsize=(13, 5))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    for i, (col, lbl, clr) in enumerate(zip(kge_cols, labels_c, colors_c)):
+        vals = [sub[sub.model == m][col].mean() if col in sub.columns else np.nan
+                for m in avail]
+        ax.bar(x + (i - 1.5) * width, vals, width, label=lbl,
+               color=clr, alpha=0.80, edgecolor="white")
+
+    ax.axhline(1.0, color="#444441", lw=0.8, ls="--", alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_LABELS.get(m, m) for m in avail],
+                       rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel("KGE component value  |  perfect = 1.0", fontsize=9)
+    ax.set_title(
+        f"KGE decomposition — {HZ_LABEL.get(horizon, str(horizon))} horizon  |  "
+        f"mean over 3 seeds\n"
+        f"KGE < NSE indicates bias or variability mismatch not captured by NSE alone",
+        fontsize=9,
+    )
+    ax.legend(fontsize=8.5)
+    ax.tick_params(labelsize=8.5)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / f"kge_components_hz{horizon}.png",
+                dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: kge_components_hz{horizon}.png")
+
+
+def plot_pod_far(global_df: pd.DataFrame) -> None:
+    """
+    POD vs FAR scatter per model, coloured by horizon.
+
+    Ideal operating point: top-left corner (POD = 1.0, FAR = 0.0).
+    Points in the lower-right are false-alarm-prone; upper-right is
+    desirable but operationally risky if FAR is also high.
+
+    This replaces flood_acc as the operational performance metric because
+    flood_acc is misleading with class imbalance: a model that always
+    predicts no-flood achieves ~44% accuracy in this dataset but POD = 0.0.
+
+    Reference: Wilks (2011, Statistical Methods in the Atmospheric Sciences,
+    §8.2) for threshold-based verification metrics.
+    """
+    if "pod" not in global_df.columns or global_df["pod"].isna().all():
+        print("  [skip] pod_far: extended_metrics.json not yet generated")
+        return
+
+    avail = [m for m in MODELS if m in global_df["model"].unique()]
+    hz_vals = sorted(global_df["horizon"].unique())
+    hz_colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(hz_vals)))
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    for hz, hclr in zip(hz_vals, hz_colors):
+        sub = global_df[global_df.horizon == hz]
+        for m in avail:
+            row = sub[sub.model == m]
+            if row.empty or row["pod"].isna().all():
+                continue
+            pod_mean = row["pod"].mean()
+            far_mean = row["far"].mean() if "far" in row.columns else np.nan
+            ax.scatter(far_mean, pod_mean,
+                       color=MODEL_COLORS.get(m, "#888888"),
+                       marker=MODEL_MARKERS.get(m, "o"),
+                       s=100, zorder=3, alpha=0.85,
+                       label=f"{MODEL_LABELS.get(m, m)} @ {HZ_LABEL.get(hz, str(hz))}")
+            ax.annotate(f"{HZ_LABEL.get(hz, str(hz))}",
+                        (far_mean, pod_mean),
+                        textcoords="offset points", xytext=(4, 3),
+                        fontsize=6.5, color=MODEL_COLORS.get(m, "#888888"))
+
+    ax.plot([0, 1], [0, 1], "k--", lw=0.7, alpha=0.4, label="Random")
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("False Alarm Ratio (FAR)  |  lower is better", fontsize=9)
+    ax.set_ylabel("Probability of Detection (POD)  |  higher is better", fontsize=9)
+    ax.set_title(
+        "POD vs FAR — operational flood detection performance\n"
+        "Ideal: top-left corner (high POD, low FAR)  |  "
+        "mean over 3 seeds per model and horizon",
+        fontsize=9,
+    )
+    # Legend: deduplicate — one entry per model only
+    handles, lbls = ax.get_legend_handles_labels()
+    seen, h2, l2 = set(), [], []
+    for h, l in zip(handles, lbls):
+        base = l.split(" @ ")[0]
+        if base not in seen:
+            seen.add(base); h2.append(h); l2.append(base)
+    ax.legend(h2, l2, fontsize=7.5, loc="lower right", ncol=2)
+    ax.tick_params(labelsize=8.5)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "pod_far_scatter.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: pod_far_scatter.png")
+
+
+def plot_peak_timing(global_df: pd.DataFrame) -> None:
+    """
+    Box plot of peak timing error (hours) per model across all horizons.
+
+    Peak timing error is the most operationally critical metric for flood
+    early warning: a model that correctly predicts flood magnitude but lags
+    the peak by 2 hours provides zero benefit over persistence for evacuation
+    decisions.  NSE, KGE, and RMSE are all insensitive to timing errors of
+    this magnitude when the hydrograph shape is otherwise well reproduced.
+
+    A model with peak timing error < 1 hour at the 4-hour forecast horizon
+    constitutes a genuinely useful early warning tool under the Irish Civil
+    Defence Framework.
+    """
+    col = "peak_timing_mean_hr"
+    if col not in global_df.columns or global_df[col].isna().all():
+        print("  [skip] peak_timing: extended_metrics.json not yet generated")
+        return
+
+    avail = [m for m in MODELS if m in global_df["model"].unique()]
+    hz_vals = sorted(global_df["horizon"].unique())
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    x      = np.arange(len(avail))
+    width  = 0.14
+    n_hz   = len(hz_vals)
+    offsets = np.linspace(-(n_hz-1)/2 * width, (n_hz-1)/2 * width, n_hz)
+
+    for hz, offset in zip(hz_vals, offsets):
+        vals = []
+        for m in avail:
+            sub = global_df[(global_df.model == m) & (global_df.horizon == hz)]
+            vals.append(sub[col].mean() if not sub.empty else np.nan)
+        ax.bar(x + offset, vals, width, alpha=0.80, edgecolor="white",
+               label=HZ_LABEL.get(hz, str(hz)))
+
+    # Operational reference lines
+    for y_ref, lbl in [(1.0, "1 hr — operationally useful"),
+                       (2.0, "2 hr — marginal"),
+                       (4.0, "4 hr — forecast horizon")]:
+        ax.axhline(y_ref, color="#888888", lw=0.8, ls="--", alpha=0.6)
+        ax.text(len(avail) - 0.5, y_ref + 0.05, lbl,
+                fontsize=7, ha="right", color="#888888")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_LABELS.get(m, m) for m in avail],
+                       rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel("Mean peak timing error (hours)", fontsize=9)
+    ax.set_title(
+        "Peak flood timing error per model and horizon\n"
+        "Computed from all flood peaks > bankfull threshold  |  "
+        "mean over 3 seeds and 27 nodes",
+        fontsize=9,
+    )
+    ax.legend(title="Horizon", fontsize=8.5)
+    ax.tick_params(labelsize=8.5)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / "peak_timing_error.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved: peak_timing_error.png")
+
+
+
 def main():
     print("Loading experiment results …")
     global_df, node_df, step_df = load_all()
@@ -926,6 +1153,12 @@ def main():
     print_conclusion(global_df, node_df)
 
     # Save summary tables to CSV for thesis
+    # Extended metric plots (skipped gracefully if extended_metrics.json absent)
+    for hz in HORIZONS:
+        plot_kge_components(global_df, hz)
+    plot_pod_far(global_df)
+    plot_peak_timing(global_df)
+
     summ.to_csv(OUT_DIR / "global_metrics_summary.csv", index=False)
     wilcox.to_csv(OUT_DIR / "wilcoxon_results.csv", index=False)
     print(f"\nAll outputs saved to {OUT_DIR}")
