@@ -96,8 +96,8 @@ _mod_dfc.USE_SAR_EDGE = False   # DFCGNNFlood: 4 terrain edge features only
 SEEDS     = [42, 123, 456]
 T_IN      = 32                          # 8-hour input window
 T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
-# MAX_EPOCHS = 300
-MAX_EPOCHS = 1
+MAX_EPOCHS = 300
+# MAX_EPOCHS = 1
 
 # Model registry in narrative order (baselines first, then graph models)
 MODEL_REGISTRY = [
