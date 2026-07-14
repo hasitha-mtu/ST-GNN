@@ -343,7 +343,7 @@ def train_epoch(
         else:
             sar_emb = None
 
-        optimiser.zero_grad()
+        optimiser.zero_grad(set_to_none=True)
         delta_pred = model(x_seq, node_attr, edge_index, edge_attr, sar_emb)
         loss = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
         loss.backward()

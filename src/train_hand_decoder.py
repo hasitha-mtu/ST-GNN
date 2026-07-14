@@ -391,7 +391,7 @@ def train_hand_decoder(
     for epoch in range(1, n_epochs + 1):
         total_loss = 0.0
         n_pairs    = 0
-        optimiser.zero_grad()
+        optimiser.zero_grad(set_to_none=True)
 
         for ev_name, sar_mask in train_events.items():
             # Use synthetic stage predictions if model not loaded

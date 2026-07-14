@@ -471,7 +471,7 @@ def train_epoch(model, loader, optimiser, edge_index, edge_attr,
         last_obs     = x_seq[:, -1, :, 0]                        # [B, N]
         delta_target = y_seq - last_obs.unsqueeze(1)              # [B, T_out, N]
 
-        optimiser.zero_grad()
+        optimiser.zero_grad(set_to_none=True)
         delta_pred = model(x_seq, node_attr, edge_index, edge_attr)  # [B, T_out, N]
         loss = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
         loss.backward()

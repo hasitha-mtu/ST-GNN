@@ -185,7 +185,7 @@ def train_epoch(
         # Flood labels and per-node validity from absolute stage targets
         y_flood, node_valid = make_flood_labels(y_seq, bankfull_thr, mask)
 
-        optimiser.zero_grad()
+        optimiser.zero_grad(set_to_none=True)
         delta_pred, flood_logits = model(x_seq)
 
         # Stage loss — horizon-weighted MSE with validity mask
