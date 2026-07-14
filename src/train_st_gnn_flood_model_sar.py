@@ -57,6 +57,7 @@ from src.utils.train_utils import compute_metrics
 from src.utils.train_utils import compute_per_node_metrics
 from src.utils.train_utils import compute_per_step_metrics
 from src.utils.train_utils import masked_mse_horizon_weighted
+from src.utils.compile_utils import compile_model
 
 from src.models.st_gnn_flood   import STGNNFloodModel
 from src.models.sar_fno_encoder import SARFNOEncoder, compute_node_coords_norm
@@ -526,6 +527,8 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
         dropout=DROPOUT,
         sar_emb_dim=SAR_EMB_DIM if use_sar_run else 0,
     ).to(DEVICE)
+
+    model = compile_model(model, tag=run_tag, logger=logger)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters: %s", f"{n_params:,}")
