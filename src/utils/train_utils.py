@@ -39,10 +39,24 @@ class LeeFloodDataset(Dataset):
     def __getitem__(self, idx):
         x_seq = self.X[idx: idx + self.t_in]
 
-        # y[t] = stage_anomaly at t+1, so start from t_in-1 to get 1-step-ahead first.
-        # NOTE: This explicitly assumes `y.npy` was forward-shifted by 1 index during
-        # preprocessing. If `y` is just an unshifted slice (e.g., X[:,:,0]), this will
-        # cause massive target leakage because y_seq[0] will equal x_seq[-1].
+        # ── TARGET ALIGNMENT — READ BEFORE CHANGING ─────────────────────
+        # Two possible conventions for y.npy:
+#
+        #   SHIFTED   y[t] = stage_anomaly at t+1  (y.npy is shifted forward)
+        #             → start = idx + t_in - 1  ← CURRENT CODE
+        #             y_seq[0] = stage at (idx + t_in)  ✓ correct 1-step target
+#
+        #   UNSHIFTED y[t] = stage_anomaly at t    (y.npy stores t directly)
+        #             → start = idx + t_in          ← ALTERNATIVE
+        #             If using t_in-1 with unshifted y:
+        #             y_seq[0] = stage at (idx + t_in - 1) = x[-1,:,0]
+        #             delta_target[0] = 0 exactly → target leakage!
+#
+        # VERIFY: open build_dataset.py and check whether y is saved as
+        #   y = df["stage_anomaly"].values[1:]   (shifted — use t_in-1)
+        #   y = df["stage_anomaly"].values        (unshifted — use t_in)
+        # The NSE=0.9475 at epoch 1 suggests the current convention is
+        # internally consistent, but it must match build_dataset.py exactly.
         start = idx + self.t_in - 1
         y_seq = self.y[start: start + self.t_out]
         mask  = self.mask[start: start + self.t_out]
@@ -191,6 +205,14 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
     mean, which is the hydrologically correct formulation.
     Tensors: [B, T_out, N]
     """
+    # Normalise device: all three tensors must be on the same device
+    # before boolean indexing.  mask.bool() inherits the mask's device;
+    # if pred/target were moved to CPU but mask was not (or vice versa),
+    # `pred[:, :, n][m]` raises RuntimeError on the device mismatch.
+    # Moving everything to CPU here makes the function device-agnostic.
+    pred   = pred.detach().cpu().float()
+    target = target.detach().cpu().float()
+    mask   = mask.detach().cpu()
     N = pred.shape[2]
     rmse_list, mae_list, nse_list = [], [], []
 
@@ -231,6 +253,9 @@ def compute_per_node_metrics(
     Nodes with fewer than 2 valid observations receive NaN metrics.
     MBE > 0 means the model over-predicts; MBE < 0 means under-prediction.
     """
+    pred   = pred.detach().cpu().float()
+    target = target.detach().cpu().float()
+    mask   = mask.detach().cpu()
     N    = pred.shape[2]
     rows = []
 
@@ -285,6 +310,9 @@ def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
     may differ by step (e.g., tidal stations flagged at certain
     steps due to data gaps).
     """
+    pred   = pred.detach().cpu().float()
+    target = target.detach().cpu().float()
+    mask   = mask.detach().cpu()
     T_out   = pred.shape[1]
     N       = pred.shape[2]
     results = []
