@@ -118,24 +118,41 @@ def load_bankfull_thresholds(graph_dir: Path, n_nodes: int,
 
 
 def make_flood_labels(
-    y_seq:        torch.Tensor,   # [B, T_out, N]  absolute stage targets
-    bankfull_thr: torch.Tensor,   # [N]  per-node bankfull threshold
-) -> torch.Tensor:
+    y_seq:        torch.Tensor,              # [B, T_out, N]  absolute stage
+    bankfull_thr: torch.Tensor,              # [N]  per-node bankfull threshold
+    mask:         torch.Tensor | None = None,  # [B, T_out, N]  validity mask
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Derive binary flood labels for the auxiliary BCE loss.
+    Derive binary flood labels and per-node validity mask.
 
     A node is labelled "flooded" (1) if its target stage exceeds the
     bankfull threshold at ANY point in the forecast horizon.
-    Using max over horizon rather than just the first step gives a more
-    informative signal — a node that floods at step 3 should be flagged
-    even if it is below bankfull at step 1.
 
-    Returns [B, N] float32 binary tensor (0 or 1).
+    Parameters
+    ----------
+    y_seq        : [B, T_out, N] absolute stage anomaly targets
+    bankfull_thr : [N] per-node bankfull stage anomaly threshold
+    mask         : [B, T_out, N] bool — True where targets are valid
+
+    Returns
+    -------
+    y_flood    : [B, N] float32 — 1 if stage > bankfull at any horizon step
+    node_valid : [B, N] float32 — 1 if ≥1 valid timestep exists per (batch, node)
+                 Used as the BCE loss weight: masked nodes do not contribute.
     """
     # [B, T_out, N] → max over T_out → [B, N]
-    stage_max = y_seq.max(dim=1).values          # [B, N]
+    stage_max  = y_seq.max(dim=1).values                            # [B, N]
     flood_flag = (stage_max > bankfull_thr.unsqueeze(0)).float()   # [B, N]
-    return flood_flag
+
+    # node_valid: True for (batch, node) pairs that have at least one
+    # valid measurement in the forecast horizon — these are the only pairs
+    # the BCE flood loss should be evaluated on.
+    if mask is not None:
+        node_valid = mask.any(dim=1).float()   # [B, T_out, N].any(dim=1) → [B, N]
+    else:
+        node_valid = torch.ones_like(flood_flag)   # all valid when mask absent
+
+    return flood_flag, node_valid
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -165,7 +182,7 @@ def train_epoch(
         last_obs     = x_seq[:, -1, :, 0]              # [B, N]
         delta_target = y_seq - last_obs.unsqueeze(1)   # [B, T_out, N]
 
-        # Flood labels — mask applied inside (fix 2.5a), node_valid returned (fix 2.5b)
+        # Flood labels and per-node validity from absolute stage targets
         y_flood, node_valid = make_flood_labels(y_seq, bankfull_thr, mask)
 
         optimiser.zero_grad()

@@ -53,6 +53,7 @@ from src.utils.train_utils import compute_metrics
 from src.utils.train_utils import compute_per_node_metrics
 from src.utils.train_utils import compute_per_step_metrics
 from src.utils.train_utils import masked_mse_horizon_weighted
+from src.utils.compile_utils import compile_model
 
 from src.models.st_gnn_dyn_edge import STGNNDynEdge as STGNNFloodModel
 from src.models.sar_fno_encoder import SARFNOEncoder, compute_node_coords_norm
@@ -532,6 +533,8 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
         discharge_idx=discharge_col,
         discharge_ref=q_ref,
     ).to(DEVICE)
+
+    model = compile_model(model, tag=run_tag, logger=logger)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters: %s", f"{n_params:,}")
