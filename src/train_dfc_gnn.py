@@ -61,6 +61,7 @@ from src.utils.train_utils  import (
     compute_per_step_metrics, masked_mse_horizon_weighted,
 )
 from src.models.dfc_gnn import build_dfc_gnn, load_edge_features, HANDDecoder
+from src.utils.gpu_sampler import make_gpu_loaders
 
 # ── Paths ──────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).resolve().parent.parent
@@ -174,9 +175,9 @@ def train_epoch(
     totals = {"loss": 0.0, "loss_stage": 0.0, "loss_flood": 0.0}
 
     for x_seq, y_seq, mask in loader:
-        x_seq = x_seq.to(DEVICE)    # [B, T_in, N, F]
-        y_seq = y_seq.to(DEVICE)    # [B, T_out, N]
-        mask  = mask.to(DEVICE)     # [B, T_out, N]
+        # x_seq = x_seq.to(DEVICE)    # [B, T_in, N, F]
+        # y_seq = y_seq.to(DEVICE)    # [B, T_out, N]
+        # mask  = mask.to(DEVICE)     # [B, T_out, N]
 
         # Delta targets (same convention as static baseline)
         last_obs     = x_seq[:, -1, :, 0]              # [B, N]
@@ -233,9 +234,9 @@ def eval_epoch(
     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
 
     for x_seq, y_seq, mask in loader:
-        x_seq = x_seq.to(DEVICE)
-        y_seq = y_seq.to(DEVICE)
-        mask  = mask.to(DEVICE)
+        # x_seq = x_seq.to(DEVICE)
+        # y_seq = y_seq.to(DEVICE)
+        # mask  = mask.to(DEVICE)
 
         last_obs     = x_seq[:, -1, :, 0]
         delta_target = y_seq - last_obs.unsqueeze(1)
@@ -345,20 +346,26 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
         len(train_rng), len(val_rng), len(test_rng),
     )
 
-    train_ds = make_dataset(X, y, valid_mask, train_rng, t_in, t_out)
-    val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
-    test_ds  = make_dataset(X, y, valid_mask, test_rng,  t_in, t_out)
+    # train_ds = make_dataset(X, y, valid_mask, train_rng, t_in, t_out)
+    # val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
+    # test_ds  = make_dataset(X, y, valid_mask, test_rng,  t_in, t_out)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=4, pin_memory=True, persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
-        num_workers=4, pin_memory=True, persistent_workers=True,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+    # train_loader = DataLoader(
+    #     train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    #     num_workers=4, pin_memory=True, persistent_workers=True,
+    # )
+    # val_loader = DataLoader(
+    #     val_ds, batch_size=BATCH_SIZE * 2, shuffle=False,
+    #     num_workers=4, pin_memory=True, persistent_workers=True,
+    # )
+    # test_loader = DataLoader(
+    #     test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+    # )
+
+    train_loader, val_loader, test_loader = make_gpu_loaders(
+        X, y, valid_mask,
+        t_in=t_in, t_out=t_out,
+        batch_size=BATCH_SIZE, device=DEVICE,
     )
 
     # ── Model ──────────────────────────────────────────────────────────

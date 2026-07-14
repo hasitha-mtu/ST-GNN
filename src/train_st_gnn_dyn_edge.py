@@ -54,6 +54,7 @@ from src.utils.train_utils import compute_per_node_metrics
 from src.utils.train_utils import compute_per_step_metrics
 from src.utils.train_utils import masked_mse_horizon_weighted
 from src.utils.compile_utils import compile_model
+from src.utils.gpu_sampler import make_gpu_loaders
 
 from src.models.st_gnn_dyn_edge import STGNNDynEdge as STGNNFloodModel
 from src.models.sar_fno_encoder import SARFNOEncoder, compute_node_coords_norm
@@ -319,9 +320,9 @@ def train_epoch(
     total_loss = 0.0
 
     for batch_idx, (x_seq, y_seq, mask) in enumerate(loader):
-        x_seq = x_seq.to(DEVICE)   # [B, T_in, N, F]
-        y_seq = y_seq.to(DEVICE)   # [B, T_out, N]
-        mask  = mask.to(DEVICE)    # [B, T_out, N]
+        # x_seq = x_seq.to(DEVICE)   # [B, T_in, N, F]
+        # y_seq = y_seq.to(DEVICE)   # [B, T_out, N]
+        # mask  = mask.to(DEVICE)    # [B, T_out, N]
 
         last_obs     = x_seq[:, -1, :, 0]              # [B, N]
         delta_target = y_seq - last_obs.unsqueeze(1)   # [B, T_out, N]
@@ -362,9 +363,9 @@ def eval_epoch(
     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
 
     for batch_idx, (x_seq, y_seq, mask) in enumerate(loader):
-        x_seq = x_seq.to(DEVICE)
-        y_seq = y_seq.to(DEVICE)
-        mask  = mask.to(DEVICE)
+        # x_seq = x_seq.to(DEVICE)
+        # y_seq = y_seq.to(DEVICE)
+        # mask  = mask.to(DEVICE)
 
         last_obs     = x_seq[:, -1, :, 0]
         delta_target = y_seq - last_obs.unsqueeze(1)
@@ -494,18 +495,24 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
         len(train_rng), len(val_rng), len(test_rng),
     )
 
-    train_ds = make_dataset(X, y, valid_mask, train_rng, t_in, t_out)
-    val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
-    test_ds  = make_dataset(X, y, valid_mask, test_rng,  t_in, t_out)
+    # train_ds = make_dataset(X, y, valid_mask, train_rng, t_in, t_out)
+    # val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
+    # test_ds  = make_dataset(X, y, valid_mask, test_rng,  t_in, t_out)
+    #
+    # train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+    #                           shuffle=True,  num_workers=4,
+    #                           pin_memory=True, persistent_workers=True)
+    # val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 2,
+    #                           shuffle=False, num_workers=4,
+    #                           pin_memory=True, persistent_workers=True)
+    # test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
+    #                           shuffle=False, num_workers=0)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True,  num_workers=4,
-                              pin_memory=True, persistent_workers=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE * 2,
-                              shuffle=False, num_workers=4,
-                              pin_memory=True, persistent_workers=True)
-    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
-                              shuffle=False, num_workers=0)
+    train_loader, val_loader, test_loader = make_gpu_loaders(
+        X, y, valid_mask,
+        t_in=t_in, t_out=t_out,
+        batch_size=BATCH_SIZE, device=DEVICE,
+    )
 
     # ── Model ──────────────────────────────────────────────────────────
     f_static = node_attr.shape[1]
@@ -659,17 +666,27 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
             delta_pred = model(x_seq, node_attr, edge_index, edge_attr, sar_emb)
             abs_pred   = last_obs.unsqueeze(1) + delta_pred
 
+            # all_abs_pred.append(abs_pred.cpu())
+            # all_tgt.append(y_seq)
+            # all_mask.append(mask)
+
             all_abs_pred.append(abs_pred.cpu())
-            all_tgt.append(y_seq)
-            all_mask.append(mask)
+            all_tgt.append(y_seq.cpu())
+            all_mask.append(mask.cpu())
+
             all_persist.append(
                 last_obs.unsqueeze(1).expand(-1, t_out, -1).cpu()
             )
 
-    cat_pred    = torch.cat(all_abs_pred)
-    cat_tgt     = torch.cat(all_tgt)
-    cat_mask    = torch.cat(all_mask)
-    cat_persist = torch.cat(all_persist)
+    # cat_pred    = torch.cat(all_abs_pred)
+    # cat_tgt     = torch.cat(all_tgt)
+    # cat_mask    = torch.cat(all_mask)
+    # cat_persist = torch.cat(all_persist)
+
+    cat_pred = torch.cat(all_abs_pred).cpu()
+    cat_tgt = torch.cat(all_tgt).cpu()
+    cat_mask = torch.cat(all_mask).cpu()
+    cat_persist = torch.cat(all_persist).cpu()
 
     test_metrics = compute_metrics(cat_pred, cat_tgt, cat_mask)
     m_all        = cat_mask.bool()
