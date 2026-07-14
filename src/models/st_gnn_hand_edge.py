@@ -202,6 +202,12 @@ class STGNNHANDEdge(nn.Module):
         # and ramps up only when activation provides reliable signal.
         self.hand_scale = nn.Parameter(torch.zeros(1))
 
+        # Projection: hand_agg comes out of hand_msg_norm at [B*N, hidden=64].
+        # gat1 (concat=True, heads=gat_heads) produces h1_river at
+        # [B*N, hidden*gat_heads=128].  Without this projection, adding
+        # them on line 386 raises RuntimeError (128 ≠ 64).
+        self.hand_proj = nn.Linear(hidden, hidden * gat_heads, bias=False)
+
         # ── Output head ───────────────────────────────────────────────
         self.head = nn.Sequential(
             nn.Linear(hidden // 2, hidden // 4),
@@ -381,9 +387,13 @@ class STGNNHANDEdge(nn.Module):
         hand_agg.scatter_add_(0, hand_dst_exp, hand_msg_gated)
         hand_agg = self.hand_msg_norm(hand_agg)               # [B*N, hidden]
 
-        # Combine river + gated HAND contributions
-        # hand_scale starts at 0; grows as training demonstrates HAND utility
-        h1_combined = h1_river + torch.sigmoid(self.hand_scale) * hand_agg
+        # Combine river + gated HAND contributions.
+        # hand_proj lifts hand_agg from [B*N, hidden=64] to
+        # [B*N, hidden*gat_heads=128] so it matches h1_river and norm1.
+        # hand_scale starts at 0; grows as training demonstrates HAND utility.
+        h1_combined = (h1_river
+                       + torch.sigmoid(self.hand_scale)
+                       * self.hand_proj(hand_agg))
         h1 = F.elu(self.norm1(h1_combined + self.res1(h_flat)))
 
         h2 = F.elu(self.norm2(
