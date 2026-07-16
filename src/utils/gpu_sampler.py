@@ -156,52 +156,18 @@ class GPUSampler:
 
 
 # ── Factory function ──────────────────────────────────────────────────────────
-
-def make_gpu_loaders(
-    X:          np.ndarray,
-    y:          np.ndarray,
-    valid_mask: np.ndarray,
-    t_in:       int,
-    t_out:      int,
-    batch_size: int,
-    device:     torch.device,
-    train_frac: float = 0.70,
-    val_frac:   float = 0.15,
-) -> tuple[GPUSampler, GPUSampler, GPUSampler]:
-    """
-    Build train/val/test GPU samplers with the same 70/15/15 split
-    used by the existing make_dataset() / DataLoader pipeline.
-
-    Drop-in replacement for the DataLoader construction section in
-    each training script.  Tensors yielded by the returned samplers
-    are already on `device`; remove all .to(DEVICE) calls from the
-    train_epoch and eval_epoch loops after switching.
-
-    Parameters
-    ----------
-    X, y, valid_mask : raw numpy arrays from PROC_DIR
-    t_in, t_out      : sequence lengths (must match model hparams)
-    batch_size       : training batch size (val/test use 2× for speed)
-    device           : target GPU device
-    train_frac       : fraction of T assigned to training (default 0.70)
-    val_frac         : fraction of T assigned to validation (default 0.15)
-                       test_frac = 1 - train_frac - val_frac (default 0.15)
-
-    Returns
-    -------
-    train_loader, val_loader, test_loader : GPUSampler instances
-    """
+def make_gpu_loaders(X, y, valid_mask, t_in, t_out, batch_size, device,
+                      train_frac=0.70, val_frac=0.15, purge=None):
     T = X.shape[0]
+    if purge is None:
+        purge = t_in + t_out - 1   # one window's worth of separation at each boundary
 
-    # Split boundaries (same logic as existing make_splits())
     t1 = int(T * train_frac)
     t2 = int(T * (train_frac + val_frac))
 
-    # Window start indices for each split
-    # Valid range: [0, split_end - t_in - t_out] so last target fits
-    train_idx = np.arange(0,  t1 - t_in - t_out + 1, dtype=np.int64)
-    val_idx   = np.arange(t1, t2 - t_in - t_out + 1, dtype=np.int64)
-    test_idx  = np.arange(t2, T  - t_in - t_out + 1, dtype=np.int64)
+    train_idx = np.arange(0,          t1 - t_in - t_out + 1, dtype=np.int64)
+    val_idx   = np.arange(t1 + purge, t2 - t_in - t_out + 1, dtype=np.int64)
+    test_idx  = np.arange(t2 + purge, T  - t_in - t_out + 1, dtype=np.int64)
 
     print(f"  GPUSampler — windows: train={len(train_idx):,}  "
           f"val={len(val_idx):,}  test={len(test_idx):,}")
