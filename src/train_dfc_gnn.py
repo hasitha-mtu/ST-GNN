@@ -80,7 +80,7 @@ TAU_GATE     = 5.0   # elevation gate softness (m) — transitions over ±10m
 BATCH_SIZE   = 32
 LR           = 5e-4
 WEIGHT_DECAY = 1e-4
-PATIENCE     = 30    # early stopping patience (epochs)
+PATIENCE     = 38    # early stopping patience (epochs)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -214,31 +214,84 @@ def train_epoch(
     return {k: v / n for k, v in totals.items()}
 
 
+# @torch.no_grad()
+# def eval_epoch(
+#     model:        nn.Module,
+#     loader:       DataLoader,
+#     bankfull_thr: torch.Tensor,
+# ) -> tuple[float, dict, dict]:
+#     """
+#     One evaluation epoch.
+#
+#     Returns (val_loss, model_metrics, persist_metrics).
+#     Adds flood_acc to model_metrics.
+#     """
+#     model.eval()
+#     total_loss  = 0.0
+#     flood_hits  = 0
+#     flood_total = 0
+#
+#     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
+#
+#     for x_seq, y_seq, mask in loader:
+#         # x_seq = x_seq.to(DEVICE)
+#         # y_seq = y_seq.to(DEVICE)
+#         # mask  = mask.to(DEVICE)
+#
+#         last_obs     = x_seq[:, -1, :, 0]
+#         delta_target = y_seq - last_obs.unsqueeze(1)
+#         y_flood, node_valid = make_flood_labels(y_seq, bankfull_thr, mask)
+#
+#         delta_pred, flood_logits = model(x_seq)
+#         abs_pred = last_obs.unsqueeze(1) + delta_pred
+#
+#         loss_stage = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
+#         _ev_npos = (y_flood * node_valid).sum().clamp(min=1)
+#         _ev_nneg = ((1 - y_flood) * node_valid).sum().clamp(min=1)
+#         _ev_pw   = (_ev_nneg / _ev_npos).clamp(1.0, 100.0)
+#         loss_flood = F.binary_cross_entropy_with_logits(
+#             flood_logits, y_flood,
+#             weight=node_valid,
+#             pos_weight=_ev_pw.unsqueeze(0).expand_as(flood_logits))
+#         total_loss += (loss_stage + model.lambda_flood * loss_flood).item()
+#
+#         # Fix 2.5b: CSI/POD/FAR instead of accuracy
+#         flood_pred  = (flood_logits.sigmoid() > 0.5).float()
+#         _vm = node_valid.bool()
+#         flood_hits  += (flood_pred[_vm] * y_flood[_vm]).sum().item()     # TP
+#         flood_total += y_flood.numel()
+#
+#         all_abs_pred.append(abs_pred.cpu())
+#         all_tgt.append(y_seq.cpu())
+#         all_mask.append(mask.cpu())
+#         all_persist.append(
+#             last_obs.unsqueeze(1).expand(-1, y_seq.shape[1], -1).cpu()
+#         )
+#
+#     cat_pred    = torch.cat(all_abs_pred)
+#     cat_tgt     = torch.cat(all_tgt)
+#     cat_mask    = torch.cat(all_mask)
+#
+#     metrics         = compute_metrics(cat_pred, cat_tgt, cat_mask)
+#     persist_metrics = compute_metrics(torch.cat(all_persist), cat_tgt, cat_mask)
+#
+#     # Fix 2.5b: replace flood_acc with operationally meaningful metrics
+#     _TP_e = flood_hits  # accumulated TP
+#     _FP_e = 0.0         # not tracked in eval loop yet — use flood_acc fallback
+#     metrics["csi"]  = round(_TP_e / max(flood_total * 0.1, 1e-8), 4)   # approx
+#     metrics["flood_acc"] = round(flood_hits / max(flood_total, 1), 4)   # kept for compat
+#
+#     return total_loss / len(loader), metrics, persist_metrics
+
 @torch.no_grad()
-def eval_epoch(
-    model:        nn.Module,
-    loader:       DataLoader,
-    bankfull_thr: torch.Tensor,
-) -> tuple[float, dict, dict]:
-    """
-    One evaluation epoch.
-
-    Returns (val_loss, model_metrics, persist_metrics).
-    Adds flood_acc to model_metrics.
-    """
+def eval_epoch(model, loader, bankfull_thr):
     model.eval()
-    total_loss  = 0.0
-    flood_hits  = 0
-    flood_total = 0
-
+    total_loss = 0.0
+    flood_TP = flood_FP = flood_FN = 0.0
     all_abs_pred, all_tgt, all_mask, all_persist = [], [], [], []
 
     for x_seq, y_seq, mask in loader:
-        # x_seq = x_seq.to(DEVICE)
-        # y_seq = y_seq.to(DEVICE)
-        # mask  = mask.to(DEVICE)
-
-        last_obs     = x_seq[:, -1, :, 0]
+        last_obs = x_seq[:, -1, :, 0]
         delta_target = y_seq - last_obs.unsqueeze(1)
         y_flood, node_valid = make_flood_labels(y_seq, bankfull_thr, mask)
 
@@ -246,43 +299,36 @@ def eval_epoch(
         abs_pred = last_obs.unsqueeze(1) + delta_pred
 
         loss_stage = masked_mse_horizon_weighted(delta_pred, delta_target, mask)
-        _ev_npos = (y_flood * node_valid).sum().clamp(min=1)
-        _ev_nneg = ((1 - y_flood) * node_valid).sum().clamp(min=1)
-        _ev_pw   = (_ev_nneg / _ev_npos).clamp(1.0, 100.0)
+        _npos = (y_flood * node_valid).sum().clamp(min=1)
+        _nneg = ((1 - y_flood) * node_valid).sum().clamp(min=1)
+        _pw   = (_nneg / _npos).clamp(1.0, 100.0)
         loss_flood = F.binary_cross_entropy_with_logits(
-            flood_logits, y_flood,
-            weight=node_valid,
-            pos_weight=_ev_pw.unsqueeze(0).expand_as(flood_logits))
+            flood_logits, y_flood, weight=node_valid,
+            pos_weight=_pw.unsqueeze(0).expand_as(flood_logits))
         total_loss += (loss_stage + model.lambda_flood * loss_flood).item()
 
-        # Fix 2.5b: CSI/POD/FAR instead of accuracy
-        flood_pred  = (flood_logits.sigmoid() > 0.5).float()
+        flood_pred = (flood_logits.sigmoid() > 0.5).float()
         _vm = node_valid.bool()
-        flood_hits  += (flood_pred[_vm] * y_flood[_vm]).sum().item()     # TP
-        flood_total += y_flood.numel()
+        flood_TP += (flood_pred[_vm] * y_flood[_vm]).sum().item()
+        flood_FP += (flood_pred[_vm] * (1 - y_flood[_vm])).sum().item()
+        flood_FN += ((1 - flood_pred[_vm]) * y_flood[_vm]).sum().item()
 
-        all_abs_pred.append(abs_pred.cpu())
-        all_tgt.append(y_seq.cpu())
+        all_abs_pred.append(abs_pred.cpu()); all_tgt.append(y_seq.cpu())
         all_mask.append(mask.cpu())
-        all_persist.append(
-            last_obs.unsqueeze(1).expand(-1, y_seq.shape[1], -1).cpu()
-        )
+        all_persist.append(last_obs.unsqueeze(1).expand(-1, y_seq.shape[1], -1).cpu())
 
-    cat_pred    = torch.cat(all_abs_pred)
-    cat_tgt     = torch.cat(all_tgt)
-    cat_mask    = torch.cat(all_mask)
-
+    cat_pred, cat_tgt, cat_mask = torch.cat(all_abs_pred), torch.cat(all_tgt), torch.cat(all_mask)
     metrics         = compute_metrics(cat_pred, cat_tgt, cat_mask)
     persist_metrics = compute_metrics(torch.cat(all_persist), cat_tgt, cat_mask)
 
-    # Fix 2.5b: replace flood_acc with operationally meaningful metrics
-    _TP_e = flood_hits  # accumulated TP
-    _FP_e = 0.0         # not tracked in eval loop yet — use flood_acc fallback
-    metrics["csi"]  = round(_TP_e / max(flood_total * 0.1, 1e-8), 4)   # approx
-    metrics["flood_acc"] = round(flood_hits / max(flood_total, 1), 4)   # kept for compat
+    denom = flood_TP + flood_FP + flood_FN
+    metrics["csi"]        = round(flood_TP / max(denom, 1e-8), 4)
+    metrics["pod"]        = round(flood_TP / max(flood_TP + flood_FN, 1e-8), 4)
+    metrics["far"]        = round(flood_FP / max(flood_TP + flood_FP, 1e-8), 4)
+    metrics["f1"]         = round(2*flood_TP / max(2*flood_TP + flood_FP + flood_FN, 1e-8), 4)
+    metrics["flood_acc"]  = metrics["pod"]   # key kept for analyse_experiments.py compat
 
     return total_loss / len(loader), metrics, persist_metrics
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Main training function
@@ -339,12 +385,12 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
     _, _, node_attr = load_graph(logger, GRAPH_DIR, DEVICE)
 
     # ── Splits & dataloaders ───────────────────────────────────────────
-    n_windows = T - t_in - t_out + 1
-    train_rng, val_rng, test_rng = make_splits(n_windows, t_in, t_out)
-    logger.info(
-        "Windows — train: %d  val: %d  test: %d",
-        len(train_rng), len(val_rng), len(test_rng),
-    )
+    # n_windows = T - t_in - t_out + 1
+    # train_rng, val_rng, test_rng = make_splits(n_windows, t_in, t_out)
+    # logger.info(
+    #     "Windows — train: %d  val: %d  test: %d",
+    #     len(train_rng), len(val_rng), len(test_rng),
+    # )
 
     # train_ds = make_dataset(X, y, valid_mask, train_rng, t_in, t_out)
     # val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
@@ -403,8 +449,8 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
     all_params = list(model.parameters()) + list(decoder.parameters())
     optimiser  = torch.optim.AdamW(all_params, lr=LR,
                                    weight_decay=WEIGHT_DECAY)
-    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="min", factor=0.5, patience=20,
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimiser, mode="min", factor=0.5, patience=11, cooldown=2, min_lr=1e-6
     )
 
     # ── Training loop ──────────────────────────────────────────────────
@@ -423,28 +469,29 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
         scheduler.step(val_loss)
 
         current_lr = optimiser.param_groups[0]["lr"]
-        if current_lr <= 1e-5:
+        if current_lr <= 1e-6:
             logger.info("  LR floor reached — stopping")
             break
 
         history.append({
-            "epoch":        epoch,
-            "train_loss":   round(train_metrics["loss"],       6),
-            "train_stage":  round(train_metrics["loss_stage"], 6),
-            "train_flood":  round(train_metrics["loss_flood"], 6),
-            "val_loss":     round(val_loss, 6),
+            "epoch": epoch,
+            "train_loss": round(train_metrics["loss"], 6),
+            "train_stage": round(train_metrics["loss_stage"], 6),
+            "train_flood": round(train_metrics["loss_flood"], 6),
+            "val_loss": round(val_loss, 6),
+            "es_counter": patience_ctr,  
             **{f"val_{k}": round(v, 4) for k, v in val_metrics.items()},
         })
 
         logger.info(
-            "Epoch %3d  train=%.4f (stage=%.4f flood=%.4f)  "
-            "val=%.4f  RMSE=%.4f NSE=%.4f  flood_acc=%.3f  |  "
+            "Epoch %3d  train=%.6e (stage=%.6e flood=%.6e)  "
+            "val=%.6e  ES=%2d/%2d  RMSE=%.4f NSE=%.4f  flood_acc=%.3f  |  "
             "Persist RMSE=%.4f NSE=%.4f  LR=%.1e",
             epoch,
             train_metrics["loss"],
             train_metrics["loss_stage"],
             train_metrics["loss_flood"],
-            val_loss,
+            val_loss, patience_ctr, PATIENCE,
             val_metrics["rmse"],
             val_metrics["nse"],
             val_metrics.get("flood_acc", 0.0),

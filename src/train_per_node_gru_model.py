@@ -69,7 +69,7 @@ DROPOUT    = 0.1
 BATCH_SIZE   = 32
 LR           = 5e-4
 WEIGHT_DECAY = 1e-4
-PATIENCE     = 30   # early stopping patience (epochs)
+PATIENCE     = 38   # early stopping patience (epochs)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -177,12 +177,12 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     _, _, node_attr = load_graph(logger, GRAPH_DIR, DEVICE)
 
     # ── Splits ─────────────────────────────────────────────────────────
-    n_windows = T - t_in - t_out + 1
-    train_rng, val_rng, test_rng = make_splits(n_windows, t_in, t_out)
-    logger.info(
-        "Windows — train: %d  val: %d  test: %d",
-        len(train_rng), len(val_rng), len(test_rng),
-    )
+    # n_windows = T - t_in - t_out + 1
+    # train_rng, val_rng, test_rng = make_splits(n_windows, t_in, t_out)
+    # logger.info(
+    #     "Windows — train: %d  val: %d  test: %d",
+    #     len(train_rng), len(val_rng), len(test_rng),
+    # )
 
     # train_ds = make_dataset(X, y, valid_mask, train_rng, t_in, t_out)
     # val_ds   = make_dataset(X, y, valid_mask, val_rng,   t_in, t_out)
@@ -219,7 +219,7 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     # ── Optimiser & scheduler ──────────────────────────────────────────
     optimiser = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="min", factor=0.5, patience=20
+        optimiser, mode="min", factor=0.5, patience=11, cooldown=2, min_lr=1e-6
     )
 
     # ── Training loop ──────────────────────────────────────────────────
@@ -237,23 +237,24 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
 
         current_lr = optimiser.param_groups[0]["lr"]
         logger.info("  LR: %.2e", current_lr)
-        if current_lr <= 1e-5:
+        if current_lr <= 1e-6:
             logger.info("  LR floor reached — stopping")
             break
 
         history.append({
-            "epoch":      epoch,
+            "epoch": epoch,
             "train_loss": round(train_loss, 6),
-            "val_loss":   round(val_loss,   6),
+            "val_loss": round(val_loss, 6),
+            "es_counter": patience_ctr,  # ← added
             **{f"val_{k}": round(v, 4) for k, v in val_metrics.items()},
         })
 
         logger.info(
-            "Epoch %3d  train=%.4f  val=%.4f  "
+            "Epoch %3d  train=%.6e  val=%.6e  ES=%2d/%2d  "
             "Model  RMSE=%.4f NSE=%.4f  |  "
             "Persist RMSE=%.4f NSE=%.4f",
-            epoch, train_loss, val_loss,
-            val_metrics["rmse"],     val_metrics["nse"],
+            epoch, train_loss, val_loss, patience_ctr, PATIENCE,  # ← added
+            val_metrics["rmse"], val_metrics["nse"],
             persist_metrics["rmse"], persist_metrics["nse"],
         )
 
