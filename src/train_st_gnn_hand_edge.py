@@ -52,8 +52,6 @@ if project_root not in sys.path:
 from src.utils.config import load_config
 from src.utils.logger import get_logger
 from src.utils.common_utils import seed_everything
-from src.utils.train_utils import make_splits
-from src.utils.train_utils import make_dataset
 from src.utils.train_utils import load_graph
 from src.utils.train_utils import compute_metrics
 from src.utils.train_utils import compute_per_node_metrics
@@ -61,6 +59,7 @@ from src.utils.train_utils import compute_per_step_metrics
 from src.utils.train_utils import masked_mse_horizon_weighted
 from src.utils.compile_utils import compile_model
 from src.utils.gpu_sampler import make_gpu_loaders
+from src.utils.train_utils import get_split_boundary
 
 from src.models.st_gnn_hand_edge import STGNNHANDEdge, load_hand_edges
 from src.models.sar_fno_encoder import SARFNOEncoder, compute_node_coords_norm
@@ -543,13 +542,13 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
 
     # ── Model ──────────────────────────────────────────────────────────
     f_static = node_attr.shape[1]
-    f_edge   = edge_attr.shape[1]
-    # When SAR is active the fusion layer input is F_dyn + f_static + SAR_EMB_DIM;
-    # the model handles this via the sar_emb_dim constructor argument.
+    f_edge = edge_attr.shape[1]
     discharge_col = 3
-    q_ref = float(X[:len(train_rng), :, discharge_col].mean())
+
+    t1, _ = get_split_boundary(T)  # same boundary make_gpu_loaders used
+    q_ref = float(X[:t1, :, discharge_col].mean())
     q_ref = max(q_ref, 0.01)
-    logger.info("  Q_ref=%.4f (log1p-transformed)", q_ref)
+    logger.info("  Discharge reference Q_ref=%.4f (log1p-transformed)", q_ref)
 
     model = STGNNHANDEdge(
         f_dyn=F,
