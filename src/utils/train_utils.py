@@ -344,3 +344,70 @@ def compute_per_step_metrics(pred: torch.Tensor, target: torch.Tensor,
         })
 
     return results
+
+def get_split_boundary(
+    T: int,
+    train_frac: float = 0.70,
+    val_frac:   float = 0.15,
+) -> tuple[int, int]:
+    """
+    Single source of truth for chronological train/val/test split
+    boundaries, in raw timestep index space.
+
+    Used by:
+      - make_gpu_loaders() (src/utils/gpu_sampler.py) to build the
+        actual train/val/test window index ranges.
+      - Any training script that needs a train-only slice of the raw
+        feature array for a summary statistic (e.g. STGNNDynEdge's
+        discharge reference Q_ref) — use this instead of resurrecting
+        the deprecated make_splits()/train_rng path, which returns a
+        window count, not a timestep count, and is no longer wired to
+        the actual loaders.
+
+    Parameters
+    ----------
+    T          : total number of raw timesteps (X.shape[0])
+    train_frac : fraction of T assigned to training
+    val_frac   : fraction of T assigned to validation
+                 (test_frac = 1 - train_frac - val_frac)
+
+    Returns
+    -------
+    t1, t2 : int
+        train = X[0    : t1]
+        val   = X[t1   : t2]
+        test  = X[t2   : T]
+    """
+    if not (0.0 < train_frac < 1.0) or not (0.0 < val_frac < 1.0):
+        raise ValueError(
+            f"train_frac and val_frac must each be in (0, 1); "
+            f"got train_frac={train_frac}, val_frac={val_frac}"
+        )
+    if train_frac + val_frac >= 1.0:
+        raise ValueError(
+            f"train_frac + val_frac must be < 1 (test split needs a "
+            f"nonzero share); got {train_frac + val_frac}"
+        )
+
+    t1 = int(T * train_frac)
+    t2 = int(T * (train_frac + val_frac))
+    return t1, t2
+
+
+def train_slice(
+    X: np.ndarray,
+    train_frac: float = 0.70,
+    val_frac:   float = 0.15,
+) -> np.ndarray:
+    """
+    Return the training-only portion of a raw [T, N, F] (or [T, N]) array,
+    using the exact same boundary as make_gpu_loaders(). Convenience
+    wrapper around get_split_boundary() for the common case of computing
+    a train-set-only statistic (mean, std, reference value, etc.).
+
+    Example
+    -------
+        q_ref = float(train_slice(X, TRAIN_FRAC, VAL_FRAC)[:, :, discharge_col].mean())
+    """
+    t1, _ = get_split_boundary(X.shape[0], train_frac, val_frac)
+    return X[:t1]

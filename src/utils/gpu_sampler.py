@@ -156,15 +156,63 @@ class GPUSampler:
 
 
 # ── Factory function ──────────────────────────────────────────────────────────
-def make_gpu_loaders(X, y, valid_mask, t_in, t_out, batch_size, device,
-                      train_frac=0.70, val_frac=0.15, purge=None):
+
+def make_gpu_loaders(
+    X:          np.ndarray,
+    y:          np.ndarray,
+    valid_mask: np.ndarray,
+    t_in:       int,
+    t_out:      int,
+    batch_size: int,
+    device:     torch.device,
+    train_frac: float = 0.70,
+    val_frac:   float = 0.15,
+    purge:      int | None = None,
+) -> tuple[GPUSampler, GPUSampler, GPUSampler]:
+    """
+    Build train/val/test GPU samplers with the same 70/15/15 split
+    used by the existing make_dataset() / DataLoader pipeline.
+
+    Drop-in replacement for the DataLoader construction section in
+    each training script.  Tensors yielded by the returned samplers
+    are already on `device`; remove all .to(DEVICE) calls from the
+    train_epoch and eval_epoch loops after switching.
+
+    Parameters
+    ----------
+    X, y, valid_mask : raw numpy arrays from PROC_DIR
+    t_in, t_out      : sequence lengths (must match model hparams)
+    batch_size       : training batch size (val/test use 2× for speed)
+    device           : target GPU device
+    train_frac       : fraction of T assigned to training (default 0.70)
+    val_frac         : fraction of T assigned to validation (default 0.15)
+                       test_frac = 1 - train_frac - val_frac (default 0.15)
+    purge            : number of timesteps dropped at the start of the
+                       val and test splits, so no window's input+target
+                       span can cross a split boundary. Defaults to
+                       t_in + t_out - 1 (one full window's worth).
+                       See train_utils.get_split_boundary() for the
+                       underlying t1/t2 computation.
+
+    Returns
+    -------
+    train_loader, val_loader, test_loader : GPUSampler instances
+    """
     T = X.shape[0]
+
+    # Split boundaries — single source of truth, shared with any script
+    # that needs a train-only slice of X (e.g. STGNNDynEdge's Q_ref).
+    # See train_utils.get_split_boundary().
+    from src.utils.train_utils import get_split_boundary
+    t1, t2 = get_split_boundary(T, train_frac, val_frac)
+
     if purge is None:
-        purge = t_in + t_out - 1   # one window's worth of separation at each boundary
+        purge = t_in + t_out - 1   # one full window's worth of separation
+                                    # at each boundary, so no window's
+                                    # input+target span crosses splits
 
-    t1 = int(T * train_frac)
-    t2 = int(T * (train_frac + val_frac))
-
+    # Window start indices for each split
+    # Valid range: [0, split_end - t_in - t_out] so last target fits
     train_idx = np.arange(0,          t1 - t_in - t_out + 1, dtype=np.int64)
     val_idx   = np.arange(t1 + purge, t2 - t_in - t_out + 1, dtype=np.int64)
     test_idx  = np.arange(t2 + purge, T  - t_in - t_out + 1, dtype=np.int64)
