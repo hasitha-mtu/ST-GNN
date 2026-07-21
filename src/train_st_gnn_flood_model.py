@@ -158,7 +158,7 @@ def eval_epoch(
 def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     if base_dir is None:
         base_dir = BASE_DIR
-    run_tag  = "st_gnn_static"
+    run_tag  = "st_gnn"
     ckpt_dir = base_dir / "checkpoints" / run_tag / str(seed) / str(t_out)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
