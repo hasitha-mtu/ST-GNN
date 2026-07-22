@@ -114,15 +114,15 @@ _mod_hand.USE_SAR     = False   # STGNNHANDEdge: no SAR FNO embeddings
 _mod_dfc.USE_SAR_EDGE = False   # DFCGNNFlood: 4 terrain edge features only
 
 # ── Experiment configuration ───────────────────────────────────────────
-# SEEDS     = [42, 123, 456]
-# T_IN      = 32                          # 8-hour input window
-# T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
-# MAX_EPOCHS = 300
-
-SEEDS     = [42]
+SEEDS     = [42, 123, 456]
 T_IN      = 32                          # 8-hour input window
-T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
-MAX_EPOCHS = 4
+T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
+MAX_EPOCHS = 300
+
+# SEEDS     = [42]
+# T_IN      = 32                          # 8-hour input window
+# T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
+# MAX_EPOCHS = 4
 
 # Model registry in narrative order (baselines first, then graph models,
 # then the proposed unified model last — completes the ablation ladder
@@ -130,14 +130,14 @@ MAX_EPOCHS = 4
 # weight → +dynamic topology → +hard gate (dfc_gnn) → all three combined
 # (dfc_gnn_unified)).
 MODEL_REGISTRY = [
-    # ("gru",              _train_gru),
-    # ("lstm",             _train_lstm),
+    ("gru",              _train_gru),
+    ("lstm",             _train_lstm),
     ("ealstm",           _train_ealstm),
-    # ("st_gnn",           _train_st_gnn),
-    # ("st_gnn_dyn_edge",  _mod_dyn.train),
-    # ("st_gnn_hand_edge", _mod_hand.train),
-    # ("dfc_gnn",          _mod_dfc.train),
-    # ("dfc_gnn_unified",  _train_dfc_unified),
+    ("st_gnn",           _train_st_gnn),
+    ("st_gnn_dyn_edge",  _mod_dyn.train),
+    ("st_gnn_hand_edge", _mod_hand.train),
+    ("dfc_gnn",          _mod_dfc.train),
+    ("dfc_gnn_unified",  _train_dfc_unified),
 ]
 
 
