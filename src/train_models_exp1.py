@@ -1,10 +1,10 @@
 """
 train_models_exp1.py  —  Experiment 1 Orchestrator  (Journal of Hydrology)
 ══════════════════════════════════════════════════════════════════════════════
-Trains all six forecasting architectures for the Experiment 1 architectural
+Trains all seven forecasting architectures for the Experiment 1 architectural
 comparison paper targeting Journal of Hydrology.
 
-Model roster (6 trainable + 1 computed baseline):
+Model roster (7 trainable + 1 computed baseline):
 ──────────────────────────────────────────────────
   Persistence             computed from y.npy — zero-parameter reference
   PerNodeGRU              per-node GRU, no graph (temporal lower bound)
@@ -13,6 +13,12 @@ Model roster (6 trainable + 1 computed baseline):
   STGNNDynEdge            + Manning discharge conductance (5th edge feature)
   STGNNHANDEdge           + HAND-triggered cross-tributary topology
   DFCGNNFlood             redesigned PhysicallyBiasedGATConv + flood head
+                          (dense 702-edge set, hard elevation gate only)
+  DFCGNNUnified           proposed model — unifies all three physics
+                          mechanisms (conductance + HAND topology + hard
+                          gate) into one attention computation, on the
+                          SAME 28-edge topology as STGNNDynEdge/HANDEdge
+                          so the ablation ladder holds the graph constant
 
 SAR policy for Experiment 1
 ──────────────────────────────
@@ -26,6 +32,8 @@ SAR policy for Experiment 1
   • DFCGNNFlood:                 USE_SAR_EDGE = False patched at module level
                                  → uses only 4 terrain edge features
                                  → saved to checkpoints/dfc_gnn/ (not dfc_gnn_sar)
+  • DFCGNNUnified:                no SAR argument exists — Experiment 1 scope
+                                 by construction (see train_dfc_gnn_unified.py)
 
   train_st_gnn_flood_model_sar.py and sar_fno_encoder.py are NOT imported
   here.  They belong entirely to Experiment 2 (train_models_exp2.py).
@@ -38,6 +46,7 @@ Checkpoint structure
   checkpoints/st_gnn_dyn_edge/{seed}/{t_out}/
   checkpoints/st_gnn_hand_edge/{seed}/{t_out}/
   checkpoints/dfc_gnn/{seed}/{t_out}/            ← 4-feature, no SAR
+  checkpoints/dfc_gnn_unified/{seed}/{t_out}/    ← 28-edge topology, no SAR
 
   results/baselines/persistence_{t_out}steps.csv
 
@@ -74,6 +83,7 @@ if str(BASE_DIR/"src") not in sys.path: sys.path.insert(0, str(BASE_DIR/"src"))
 from train_per_node_gru_model  import train as _train_gru
 from train_per_node_lstm_model import train as _train_lstm
 from train_st_gnn_flood_model  import train as _train_st_gnn
+from train_dfc_gnn_unified import train as _train_dfc_unified
 
 # DynEdge and HANDEdge: import module objects so we can patch USE_SAR
 import train_st_gnn_dyn_edge  as _mod_dyn
@@ -93,24 +103,28 @@ _mod_hand.USE_SAR     = False   # STGNNHANDEdge: no SAR FNO embeddings
 _mod_dfc.USE_SAR_EDGE = False   # DFCGNNFlood: 4 terrain edge features only
 
 # ── Experiment configuration ───────────────────────────────────────────
-SEEDS     = [42, 123, 456]
-T_IN      = 32                          # 8-hour input window
-T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
-MAX_EPOCHS = 300
-
-# SEEDS     = [42]
+# SEEDS     = [42, 123, 456]
 # T_IN      = 32                          # 8-hour input window
-# T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
-# MAX_EPOCHS = 1
+# T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
+# MAX_EPOCHS = 300
 
-# Model registry in narrative order (baselines first, then graph models)
+SEEDS     = [42]
+T_IN      = 32                          # 8-hour input window
+T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
+MAX_EPOCHS = 3
+
+# Model registry in narrative order (baselines first, then graph models,
+# then the proposed unified model last — completes the ablation ladder
+# GRU/LSTM → static GAT → +dynamic edge weight → +dynamic topology →
+# +hard gate (dfc_gnn) → all three combined (dfc_gnn_unified)).
 MODEL_REGISTRY = [
-    ("gru",              _train_gru),
-    ("lstm",             _train_lstm),
-    ("st_gnn",           _train_st_gnn),
-    ("st_gnn_dyn_edge",  _mod_dyn.train),
-    ("st_gnn_hand_edge", _mod_hand.train),
-    ("dfc_gnn",          _mod_dfc.train),
+    # ("gru",              _train_gru),
+    # ("lstm",             _train_lstm),
+    # ("st_gnn",           _train_st_gnn),
+    # ("st_gnn_dyn_edge",  _mod_dyn.train),
+    # ("st_gnn_hand_edge", _mod_hand.train),
+    # ("dfc_gnn",          _mod_dfc.train),
+    ("dfc_gnn_unified",  _train_dfc_unified),
 ]
 
 
@@ -207,14 +221,13 @@ def compute_persistence_baseline(t_outs: list[int]) -> None:
 
 def run(seeds: list[int], t_outs: list[int], max_epochs: int,
         skip_existing: bool, logger):
-    """Train all 6 Experiment 1 models across seeds and horizons."""
+    """Train all 7 Experiment 1 models across seeds and horizons."""
 
     total = len(seeds) * len(t_outs) * len(MODEL_REGISTRY)
     done  = 0
 
     print("\n" + "═"*60)
     print("  EXPERIMENT 1 ")
-    print("  Six architectures, no SAR, all horizons")
     print("═"*60)
     print(f"\n  SAR flags patched:")
     print(f"    train_st_gnn_dyn_edge  .USE_SAR      = {_mod_dyn.USE_SAR}")
