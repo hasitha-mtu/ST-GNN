@@ -11,8 +11,20 @@ Output
     dataset/graph/hand_edges.npz  containing arrays:
         src              int32  [E_hand]
         dst              int32  [E_hand]
-        hand_threshold   float32 [E_hand]  minimum HAND along corridor (m)
+        hand_threshold   float32 [E_hand]  minimum HAND along corridor (m,
+                                            relative to nearest stream cell —
+                                            kept for backward compatibility /
+                                            diagnostics, no longer used
+                                            directly in the activation gate)
         overland_dist_km float32 [E_hand]  Euclidean distance between nodes (km)
+        z_saddle_m       float32 [E_hand]  ABSOLUTE elevation (m OD) at the
+                                            same pixel that produced
+                                            hand_threshold. This is what the
+                                            option-3 activation gate compares
+                                            reconstructed water-surface
+                                            elevation against — same datum as
+                                            node_elevation_m in
+                                            edge_features.npz.
 
 Usage
 -----
@@ -103,6 +115,12 @@ def compute_hand(dem_path: Path, fdir_path: Path | None = None) -> tuple:
     HAND using correct pad-based D8 + ITM reprojection.
     Fixes: CRS mismatch, np.roll sign error, endpoint sampling, perp offsets.
 
+    Returns (hand, affine, crs, dem_data) — dem_data (raw absolute elevation,
+    m OD) is returned alongside hand so callers can recover the ABSOLUTE
+    elevation at any HAND-derived location, not just the relative HAND value.
+    Needed for the option-3 datum fix: z_saddle must be an absolute m-OD
+    elevation, comparable to node_elev, not a HAND-relative value.
+
     If fdir_path is provided, saves dr/dc/nan_mask to that file so flood map
     scripts can do D8 catchment delineation rather than Voronoi partitioning.
     The arrays are saved here because they are already in memory from the ITM
@@ -182,7 +200,7 @@ def compute_hand(dem_path: Path, fdir_path: Path | None = None) -> tuple:
         print(f"  fdir.npz saved → {fdir_path.name}  "
               f"shape={dr.shape}  {size_mb:.1f} MB")
 
-    return hand, affine, crs
+    return hand, affine, crs, dem_data
 
 def _compute_hand_from_mask(
     dem:         np.ndarray,    # [H, W] elevation (m)
@@ -264,12 +282,13 @@ def world_to_pixel(x_world: float, y_world: float, affine) -> tuple[int, int]:
 
 def sample_corridor_hand(
     hand:    np.ndarray,
+    dem:     np.ndarray,
     affine,
     e1: float, n1: float,
     e2: float, n2: float,
     corridor_half_w: float = 500.0,
     n_samples: int = 50,
-) -> float:
+) -> tuple[float, float]:
     """
     Sample HAND values along a straight-line corridor between two ITM points.
 
@@ -277,8 +296,18 @@ def sample_corridor_hand(
     plus points offset perpendicular by ±corridor_half_w to widen the search
     and account for divide topology.
 
-    Returns the minimum valid HAND value found (ignoring NaN).
-    Returns NaN if all samples are NaN.
+    Returns (min_hand, z_saddle):
+        min_hand  — minimum valid HAND value found along the corridor (m,
+                    relative to nearest stream cell). NaN if all samples NaN.
+        z_saddle  — ABSOLUTE elevation (m OD) at the SAME pixel that produced
+                    min_hand. This is the quantity the option-3 activation
+                    gate compares against reconstructed water-surface
+                    elevation H — unlike min_hand, it's on the same datum as
+                    node_elev, so H ≥ z_saddle has a direct physical meaning
+                    ("the water surface has risen to or above the saddle
+                    point"), rather than requiring stage_anomaly (an
+                    elevation-free, rolling-baseline quantity) to be compared
+                    against a HAND-relative value on a different footing.
     """
     H, W = hand.shape
     # Sample the middle 70% of corridor (skip 15% at each end).
@@ -287,6 +316,7 @@ def sample_corridor_hand(
     t_vals = np.linspace(0.15, 0.85, n_samples)
 
     min_hand = np.inf
+    z_saddle = np.nan
     for t in t_vals:
         # Centreline point
         e = e1 + t * (e2 - e1)
@@ -307,8 +337,12 @@ def sample_corridor_hand(
             v = hand[row, col]
             if not np.isnan(v) and v < min_hand:
                 min_hand = float(v)
+                dv = dem[row, col]
+                z_saddle = float(dv) if not np.isnan(dv) else np.nan
 
-    return min_hand if np.isfinite(min_hand) else np.nan
+    if not np.isfinite(min_hand):
+        return np.nan, np.nan
+    return min_hand, z_saddle
 
 
 def find_candidate_pairs(
@@ -375,7 +409,7 @@ def run(
 
     # ── 1. Compute HAND ───────────────────────────────────────────────
     fdir_out = out_path.parent / "fdir.npz"
-    hand, affine, crs = compute_hand(dem_path, fdir_path=fdir_out)
+    hand, affine, crs, dem_data = compute_hand(dem_path, fdir_path=fdir_out)
 
     # ── 2. Load node ITM coordinates ──────────────────────────────────
     eastings, northings, refs = nodes_to_itm(nodes_path)
@@ -392,15 +426,16 @@ def run(
     print(f"\nCandidate pairs within {max_dist_km} km: {len(candidates)}")
 
     # ── 4. Sample HAND along each corridor ───────────────────────────
-    srcs, dsts, thresholds, dists = [], [], [], []
+    srcs, dsts, thresholds, dists, saddles = [], [], [], [], []
     skipped_low = 0
+    skipped_no_saddle = 0
 
     for k, (i, j, dist_km) in enumerate(candidates):
         if (k + 1) % 10 == 0 or k == len(candidates) - 1:
             print(f"  Processing pair {k+1}/{len(candidates)} …", end="\r")
 
-        min_hand = sample_corridor_hand(
-            hand, affine,
+        min_hand, z_saddle = sample_corridor_hand(
+            hand, dem_data, affine,
             eastings[i], northings[i],
             eastings[j], northings[j],
             corridor_half_w=CORRIDOR_W,
@@ -412,15 +447,25 @@ def run(
         if min_hand < hand_min_m:
             skipped_low += 1
             continue   # already in same drainage basin
+        if np.isnan(z_saddle):
+            # min_hand was valid but the DEM was NaN at that exact pixel
+            # (shouldn't normally happen since hand is NaN wherever dem is
+            # NaN, but guarded explicitly rather than silently saving NaN
+            # into a buffer the model will later read as a real elevation).
+            skipped_no_saddle += 1
+            continue
 
         srcs.append(i);         dsts.append(j)
         srcs.append(j);         dsts.append(i)   # bidirectional
         thresholds.append(min_hand); thresholds.append(min_hand)
         dists.append(dist_km);  dists.append(dist_km)
+        saddles.append(z_saddle); saddles.append(z_saddle)
 
     print()
     print(f"\nHAND edges accepted:   {len(srcs)//2} pairs → {len(srcs)} directed edges")
     print(f"Skipped (low HAND < {hand_min_m} m): {skipped_low} pairs")
+    if skipped_no_saddle:
+        print(f"Skipped (no valid DEM at saddle pixel): {skipped_no_saddle} pairs")
 
     if not srcs:
         print("WARNING: no HAND edges found. Check DEM coverage and node coordinates.")
@@ -434,20 +479,22 @@ def run(
         dst              = np.array(dsts,       dtype=np.int32),
         hand_threshold   = np.array(thresholds, dtype=np.float32),
         overland_dist_km = np.array(dists,      dtype=np.float32),
+        z_saddle_m       = np.array(saddles,    dtype=np.float32),
     )
     print(f"\nSaved: {out_path}")
     print(f"  src/dst:        {len(srcs)} entries")
     print(f"  hand_threshold: [{min(thresholds):.2f}, {max(thresholds):.2f}] m")
     print(f"  overland_dist:  [{min(dists):.2f}, {max(dists):.2f}] km")
+    print(f"  z_saddle_m:     [{min(saddles):.2f}, {max(saddles):.2f}] m OD")
 
     # Print summary table
     print("\nAccepted HAND edge pairs:")
-    print(f"  {'src_ref':12s} {'dst_ref':12s} {'dist_km':>8s} {'hand_thr_m':>12s}")
+    print(f"  {'src_ref':12s} {'dst_ref':12s} {'dist_km':>8s} {'hand_thr_m':>12s} {'z_saddle_m':>12s}")
     seen = set()
-    for i, (s, d, t, dist) in enumerate(zip(srcs, dsts, thresholds, dists)):
+    for i, (s, d, t, dist, z) in enumerate(zip(srcs, dsts, thresholds, dists, saddles)):
         if (min(s, d), max(s, d)) not in seen:
             seen.add((min(s, d), max(s, d)))
-            print(f"  {refs[s]:12s} {refs[d]:12s} {dist:8.2f} {t:12.3f}")
+            print(f"  {refs[s]:12s} {refs[d]:12s} {dist:8.2f} {t:12.3f} {z:12.2f}")
 
     print("\nDone.")
 
