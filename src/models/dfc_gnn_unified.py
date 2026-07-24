@@ -292,8 +292,21 @@ class DFCGNNUnified(nn.Module):
     edge_attr_static    : Tensor — [E_river, 4] static river edge features
     node_elev           : Tensor — [N] elevation (m OD), from edge_features.npz
     hand_src/hand_dst   : Tensor — [E_hand] HAND candidate edge endpoints
-    hand_threshold      : Tensor — [E_hand] minimum HAND (m) along overland path
+    hand_threshold      : Tensor — [E_hand] minimum HAND (m), diagnostics only
+                                    — NOT used in the activation gate (see
+                                    z_saddle below)
     hand_overland_dist  : Tensor — [E_hand] overland distance (km)
+    z_saddle            : Tensor — [E_hand] ABSOLUTE elevation (m OD) at each
+                                    HAND edge's corridor saddle point, from
+                                    precompute_hand_edges.py's z_saddle_m —
+                                    what the activation gate actually compares
+                                    reconstructed water-surface elevation
+                                    against (option-3 datum fix)
+    gauge_datum         : Tensor — [N] per-node station datum (m OD), from
+                                    nodes.csv's gauge_datum_mOSGM15
+    stage_range         : Tensor — [N] per-node p90_mAOD − gauge_datum_mOSGM15,
+                                    used to reconstruct absolute water-surface
+                                    elevation from normalised_stage
     n_gru_layers        : int    — GRU depth
     dropout             : float  — dropout rate
     lambda_flood        : float  — weight of auxiliary flood-flag BCE loss
@@ -318,6 +331,9 @@ class DFCGNNUnified(nn.Module):
         hand_dst:             Tensor | None = None,
         hand_threshold:       Tensor | None = None,
         hand_overland_dist:   Tensor | None = None,
+        z_saddle:             Tensor | None = None,
+        gauge_datum:          Tensor | None = None,
+        stage_range:          Tensor | None = None,
         n_gru_layers:         int   = 2,
         dropout:              float = 0.1,
         lambda_flood:         float = 0.1,
@@ -333,6 +349,13 @@ class DFCGNNUnified(nn.Module):
             "HAND candidate edges are required — run precompute_hand_edges.py"
         assert node_elev is not None, \
             "node_elev is required for the hard elevation gate"
+        assert z_saddle is not None, \
+            "z_saddle is required (option-3 datum fix) — rerun " \
+            "precompute_hand_edges.py to regenerate hand_edges.npz with " \
+            "z_saddle_m before using this model"
+        assert gauge_datum is not None and stage_range is not None, \
+            "gauge_datum / stage_range are required (option-3 datum fix) " \
+            "— load from nodes.csv's gauge_datum_mOSGM15 / p90_mAOD columns"
 
         self.n_nodes      = n_nodes
         self.d_model      = d_model
@@ -359,6 +382,18 @@ class DFCGNNUnified(nn.Module):
             "hand_dist_norm", (hand_overland_dist / 5.0).float())  # 5km max
         max_t = hand_threshold.max().clamp(min=1e-3)
         self.register_buffer("hand_thresh_norm", (hand_threshold / max_t).float())
+
+        # ── Option-3 datum-consistent activation gate buffers ───────────
+        # z_saddle: absolute elevation (m OD) at each HAND edge's corridor
+        # saddle point — same datum as node_elev. gauge_datum/stage_range:
+        # per-NODE quantities used to reconstruct absolute water-surface
+        # elevation from normalised_stage (see _build_edge_attr_and_
+        # activation). Replaces the earlier stage_anomaly-vs-hand_threshold
+        # comparison, which mixed an elevation-free rolling-baseline
+        # quantity with a HAND-relative one on inconsistent footing.
+        self.register_buffer("z_saddle", z_saddle.float())
+        self.register_buffer("gauge_datum", gauge_datum.float())
+        self.register_buffer("stage_range", stage_range.float())
 
         # ── Combined edge_index, built once (static structure) ─────────
         self.n_river = edge_index.shape[1]
@@ -462,15 +497,28 @@ class DFCGNNUnified(nn.Module):
             [river_static, log_conductance.unsqueeze(-1)], dim=-1)  # [B, E_river, 5]
         river_activation = torch.ones(B, self.n_river, device=device)
 
-        # ── HAND edges: stage-threshold activation (Class B) ───────────
-        # Feature index 0 is assumed to be stage_anomaly, matching the
-        # GAUGE_FEATURES ordering used throughout STGNNDynEdge/HANDEdge.
-        h_src = x_last[:, self.hand_src, 0]
-        h_dst = x_last[:, self.hand_dst, 0]
-        max_stage = torch.maximum(h_src, h_dst)
+        # ── HAND edges: datum-consistent activation (Class B) ───────────
+        # Option-3 fix: reconstruct ABSOLUTE water-surface elevation
+        # H = gauge_datum + normalised_stage * stage_range (feature index
+        # [1], NOT stage_anomaly at index [0] — stage_anomaly is an
+        # elevation-free deviation from a rolling 7-day baseline, per
+        # build_dataset.py's own documentation, and has no consistent
+        # physical footing against hand_threshold's DEM-relative scale).
+        # H is compared against z_saddle — the absolute elevation (m OD)
+        # at the same location hand_threshold was sampled from — so both
+        # sides of the comparison now live on the same vertical datum.
+        norm_stage_src = x_last[:, self.hand_src, 1]
+        norm_stage_dst = x_last[:, self.hand_dst, 1]
+
+        H_src = (self.gauge_datum[self.hand_src].unsqueeze(0)
+                 + norm_stage_src * self.stage_range[self.hand_src].unsqueeze(0))
+        H_dst = (self.gauge_datum[self.hand_dst].unsqueeze(0)
+                 + norm_stage_dst * self.stage_range[self.hand_dst].unsqueeze(0))
+        max_H = torch.maximum(H_src, H_dst)
+
         hand_activation = torch.sigmoid(
             self.activation_sharpness
-            * (max_stage - self.hand_threshold.unsqueeze(0)))    # [B, E_hand]
+            * (max_H - self.z_saddle.unsqueeze(0)))              # [B, E_hand]
 
         dist_t   = self.hand_dist_norm.unsqueeze(0).expand(B, -1)
         thresh_t = self.hand_thresh_norm.unsqueeze(0).expand(B, -1)
@@ -574,8 +622,14 @@ if __name__ == "__main__":
     hand_pairs = torch.randperm(N * (N - 1))[:E_hand * 2].reshape(E_hand, 2)
     hand_src   = hand_pairs[:, 0] % N
     hand_dst   = hand_pairs[:, 1] % N
-    hand_thr   = torch.rand(E_hand) * 2 + 1.0
+    hand_thr   = torch.rand(E_hand) * 2 + 1.0     # diagnostics only now
     hand_dist  = torch.rand(E_hand) * 3 + 1.0
+
+    # Option-3 datum buffers — realistic-ish m-OD values matching the
+    # actual nodes.csv range (roughly -5 to 120 m OD across the 27 gauges)
+    z_saddle    = node_elev[hand_src] + torch.rand(E_hand) * 3.0
+    gauge_datum = node_elev.clone()
+    stage_range = torch.rand(N) * 2.0 + 0.5       # 0.5-2.5 m
 
     model = DFCGNNUnified(
         n_nodes=N, f_dyn=F_dyn, d_model=64, n_heads=4, T_out=T_out,
@@ -583,6 +637,7 @@ if __name__ == "__main__":
         node_elev=node_elev,
         hand_src=hand_src, hand_dst=hand_dst,
         hand_threshold=hand_thr, hand_overland_dist=hand_dist,
+        z_saddle=z_saddle, gauge_datum=gauge_datum, stage_range=stage_range,
         discharge_idx=3, discharge_ref=1.0,
     )
 
@@ -606,13 +661,32 @@ if __name__ == "__main__":
     print("activation_sharpness grad: ✓")
 
     # Sanity check: an inactive HAND edge should contribute ~zero attention.
-    # Force all HAND thresholds far above any possible stage → activation≈0.
-    model.hand_threshold.fill_(1000.0)
+    # Force z_saddle far above any reconstructible water-surface elevation
+    # → activation≈0. (Note: z_saddle, not hand_threshold, now drives the
+    # gate — hand_threshold is retained only for diagnostics/edge_attr.)
+    model.z_saddle.fill_(1_000_000.0)
     edge_attr2, activation2 = model._build_edge_attr_and_activation(x_seq[:, -1])
     assert activation2[:, model.n_river:].max().item() < 1e-3, \
-        "HAND edges should be ~fully deactivated when threshold is unreachable"
+        "HAND edges should be ~fully deactivated when z_saddle is unreachable"
     print("HAND deactivation sanity check:  ✓  "
           f"(max activation={activation2[:, model.n_river:].max().item():.2e})")
+
+    # Sanity check: activation should respond meaningfully to a realistic
+    # normalised_stage sweep — this is the check that would have caught
+    # the original datum-mismatch bug (stage_anomaly vs hand_threshold),
+    # where the sigmoid could sit near a fixed operating point regardless
+    # of x_seq's actual values.
+    model.z_saddle.copy_(node_elev[hand_src] + torch.rand(E_hand) * 3.0)
+    x_low  = x_seq.clone(); x_low[:, -1, :, 1]  = -2.0
+    x_high = x_seq.clone(); x_high[:, -1, :, 1] =  5.0
+    _, act_low  = model._build_edge_attr_and_activation(x_low[:, -1])
+    _, act_high = model._build_edge_attr_and_activation(x_high[:, -1])
+    spread = (act_high[:, model.n_river:] - act_low[:, model.n_river:]).abs().mean().item()
+    assert spread > 0.3, (
+        f"HAND activation barely responds to normalised_stage "
+        f"(mean |Δactivation|={spread:.4f}) — datum mismatch likely."
+    )
+    print(f"Activation responds to stage sweep:  ✓  (mean |Δ|={spread:.3f})")
 
     n = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n:,}")

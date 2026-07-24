@@ -18,20 +18,41 @@ Two edge classes coexist in every forward pass:
              stage_activation is the soft switch: approaches 1 when stage
              exceeds the HAND threshold, 0 when stage is well below it.
 
-Soft activation (differentiable)
----------------------------------
+Soft activation (differentiable) — datum-consistent formulation
+------------------------------------------------------------------
 Rather than a hard binary switch (which would give zero gradients when inactive),
-stage-based activation uses a sigmoid:
+stage-based activation uses a sigmoid on ABSOLUTE water-surface elevation:
 
-    activation(i,j,t) = sigmoid( α × (max(h_i(t), h_j(t)) − τ_ij) )
+    H_i(t)   = gauge_datum_i + normalised_stage_i(t) × stage_range_i
+    activation(i,j,t) = sigmoid( α × (max(H_i(t), H_j(t)) − z_saddle_ij) )
 
 where:
-  h_i(t), h_j(t)  — normalised stage anomaly at the two endpoints  [dim 0]
-  τ_ij            — HAND threshold for this pair (precomputed from DEM)
-  α               — learnable sharpness parameter (init 5.0)
+  normalised_stage_i(t) — feature index [1] of x, i.e. (level−gauge_datum)/
+                           (p90−gauge_datum), dimensionless position within
+                           the station's normal-to-p90 range
+  gauge_datum_i          — station datum (m OD), per node, from nodes.csv
+  stage_range_i          — p90_mAOD − gauge_datum_mOSGM15 (m), per node
+  z_saddle_ij             — ABSOLUTE elevation (m OD) at the corridor's
+                           lowest-connectivity point, from
+                           precompute_hand_edges.py's z_saddle_m output
+  α                      — learnable sharpness parameter (init 5.0)
 
-When stage ≪ τ_ij: activation ≈ 0 → HAND edge contributes ~nothing
-When stage ≫ τ_ij: activation ≈ 1 → HAND edge contributes fully
+IMPORTANT — this replaces an earlier, datum-inconsistent version of this
+gate that compared feature index [0] (stage_anomaly = level − rolling_7d_
+mean, an elevation-free deviation from a moving per-station baseline —
+see build_dataset.py's own comment: "removes elevation offset") directly
+against hand_threshold (a HAND-relative, not absolute, quantity). Since
+stage_anomaly resets its zero-point every ~7 days independent of the
+station's actual elevation, and hand_threshold is a fixed geometric
+quantity, that comparison had no consistent physical footing — for most
+candidate edges the sigmoid could sit near a fixed operating point
+regardless of true flood state. H_i(t) above is anchored to gauge_datum
+(m OD, the same absolute vertical datum the DEM-derived node_elev and
+z_saddle live on), so H_i(t) ≥ z_saddle_ij has a direct physical reading:
+"the water surface at node i has risen to or above the saddle point."
+
+When H ≪ z_saddle: activation ≈ 0 → HAND edge contributes ~nothing
+When H ≫ z_saddle: activation ≈ 1 → HAND edge contributes fully
 Gradient flows through sigmoid at all times during training.
 
 Physical basis
@@ -52,7 +73,17 @@ hand_edges.npz  — written by precompute_hand_edges.py, contains:
     src              int32  [E_hand]   source node indices
     dst              int32  [E_hand]   destination node indices
     hand_threshold   float32 [E_hand] minimum HAND (m) along overland path
+                                       (relative — kept for diagnostics only,
+                                       NOT used in the activation gate below)
     overland_dist_km float32 [E_hand] overland distance between nodes
+    z_saddle_m       float32 [E_hand] ABSOLUTE elevation (m OD) at the same
+                                       location as hand_threshold — this IS
+                                       used in the activation gate
+
+nodes.csv  — must contain gauge_datum_mOSGM15 and p90_mAOD columns (m OD /
+             mOSGM15, treated as the same absolute vertical datum family as
+             the DEM). Loaded and passed in as gauge_datum / stage_range by
+             the training script, NOT read directly by this module.
 
 References
 ----------
@@ -88,9 +119,22 @@ class STGNNHANDEdge(nn.Module):
     hand_dst : torch.Tensor [E_hand]
         Destination node indices for HAND candidate edges.
     hand_threshold : torch.Tensor [E_hand]
-        Minimum HAND (m) along overland path; normalised stage threshold.
+        Minimum HAND (m) along overland path. Kept for diagnostics /
+        backward compatibility; NOT used in the activation gate (see
+        z_saddle below).
     hand_overland_dist : torch.Tensor [E_hand]
         Overland distance (km), used as first HAND edge attribute.
+    z_saddle : torch.Tensor [E_hand]
+        ABSOLUTE elevation (m OD) at the corridor's lowest-connectivity
+        point — the quantity the activation gate actually compares
+        reconstructed water-surface elevation against. From
+        precompute_hand_edges.py's z_saddle_m output.
+    gauge_datum : torch.Tensor [N]
+        Per-node station datum (m OD), from nodes.csv's
+        gauge_datum_mOSGM15 column.
+    stage_range : torch.Tensor [N]
+        Per-node p90_mAOD − gauge_datum_mOSGM15 (m). Used to reconstruct
+        absolute water-surface elevation from normalised_stage.
     hidden, gat_heads, gru_layers, t_out, dropout : same as STGNNFloodModel.
     sar_emb_dim : int
         SAR embedding dimension. 0 = no SAR.
@@ -111,6 +155,9 @@ class STGNNHANDEdge(nn.Module):
         hand_dst:            torch.Tensor,
         hand_threshold:      torch.Tensor,
         hand_overland_dist:  torch.Tensor,
+        z_saddle:            torch.Tensor,
+        gauge_datum:         torch.Tensor,
+        stage_range:         torch.Tensor,
         hidden:              int   = 64,
         gat_heads:           int   = 2,
         gru_layers:          int   = 2,
@@ -138,9 +185,21 @@ class STGNNHANDEdge(nn.Module):
             (hand_overland_dist / 5.0).float())   # normalise by 5 km max
 
         # Normalise HAND threshold for use as edge attribute (0–1 range)
+        # (retained for the static edge-feature vector; no longer used in
+        # the activation gate itself — see z_saddle below)
         max_t = hand_threshold.max().clamp(min=1e-3)
         self.register_buffer("hand_thresh_norm",
             (hand_threshold / max_t).float())
+
+        # ── Option-3 datum-consistent activation gate buffers ───────────
+        # z_saddle: absolute elevation (m OD) at the corridor saddle point,
+        # per HAND edge — same datum as node_elev / DEM.
+        self.register_buffer("z_saddle", z_saddle.float())
+        # gauge_datum / stage_range: per-NODE (not per-edge) quantities,
+        # indexed by hand_src/hand_dst inside _hand_edge_attr to reconstruct
+        # absolute water-surface elevation from normalised_stage.
+        self.register_buffer("gauge_datum", gauge_datum.float())
+        self.register_buffer("stage_range",  stage_range.float())
 
         # ── Learnable parameters ──────────────────────────────────────
         self.conductance_scale    = nn.Parameter(torch.tensor(3.0))
@@ -249,24 +308,37 @@ class STGNNHANDEdge(nn.Module):
           [1] hand_thresh_norm     precomputed, static
           [2] 0.0                  (no area_ratio for cross-tributary edges)
           [3] 0.0                  (same_tributary = 0 by construction)
-          [4] stage_activation     dynamic: sigmoid( α × (max_stage − τ) )
+          [4] stage_activation     dynamic: sigmoid( α × (max_H − z_saddle) )
 
         The sigmoid activation approaches 1 when the higher of the two
-        endpoint stages exceeds the HAND threshold, and 0 when well below.
-        Gradients flow through sigmoid at all values, enabling the model
-        to learn the appropriate activation sharpness α.
+        endpoints' reconstructed absolute water-surface elevation exceeds
+        the corridor's saddle elevation, and 0 when well below. Gradients
+        flow through sigmoid at all values, enabling the model to learn
+        the appropriate activation sharpness α.
+
+        H is reconstructed from normalised_stage (feature index [1], NOT
+        stage_anomaly at index [0] — see module docstring for why) and the
+        per-node gauge_datum / stage_range buffers, giving an absolute m-OD
+        quantity directly comparable to z_saddle.
         """
         B       = x_last.shape[0]
         E_hand  = self.hand_src.shape[0]
 
-        h_src = x_last[:, self.hand_src, 0]   # [B, E_hand] stage at source
-        h_dst = x_last[:, self.hand_dst, 0]   # [B, E_hand] stage at dest
+        # Reconstruct absolute water-surface elevation H = gauge_datum +
+        # normalised_stage * stage_range, at each HAND edge's two endpoints.
+        norm_stage_src = x_last[:, self.hand_src, 1]   # [B, E_hand]
+        norm_stage_dst = x_last[:, self.hand_dst, 1]   # [B, E_hand]
 
-        # Activation based on the higher of the two endpoint stages
-        max_stage  = torch.maximum(h_src, h_dst)                  # [B, E_hand]
+        H_src = (self.gauge_datum[self.hand_src].unsqueeze(0)
+                 + norm_stage_src * self.stage_range[self.hand_src].unsqueeze(0))
+        H_dst = (self.gauge_datum[self.hand_dst].unsqueeze(0)
+                 + norm_stage_dst * self.stage_range[self.hand_dst].unsqueeze(0))
+
+        # Activation based on the higher of the two endpoints' water surface
+        max_H      = torch.maximum(H_src, H_dst)                   # [B, E_hand]
         activation = torch.sigmoid(
             self.activation_sharpness
-            * (max_stage - self.hand_threshold.unsqueeze(0))
+            * (max_H - self.z_saddle.unsqueeze(0))
         )                                                          # [B, E_hand]
 
         # Static components tiled across batch
@@ -416,15 +488,29 @@ def load_hand_edges(npz_path: str) -> dict:
     """
     Load HAND candidate edges from precompute_hand_edges.py output.
 
-    Returns dict with keys: src, dst, hand_threshold, overland_dist_km
-    (all torch.Tensor).
+    Returns dict with keys: src, dst, hand_threshold, overland_dist_km,
+    z_saddle_m (all torch.Tensor).
+
+    z_saddle_m requires hand_edges.npz to have been regenerated with the
+    option-3 datum fix (precompute_hand_edges.py's updated version). If an
+    older hand_edges.npz is loaded (no z_saddle_m key), this raises rather
+    than silently falling back — the datum-consistent activation gate is
+    meaningless without it, and a silent fallback risks reintroducing the
+    exact bug this fix addresses.
     """
     data = np.load(npz_path)
+    if "z_saddle_m" not in data:
+        raise KeyError(
+            f"{npz_path} has no 'z_saddle_m' array. This hand_edges.npz "
+            f"predates the option-3 datum fix — rerun "
+            f"precompute_hand_edges.py to regenerate it before training."
+        )
     return {
         "src":              torch.from_numpy(data["src"].astype(np.int64)),
         "dst":              torch.from_numpy(data["dst"].astype(np.int64)),
         "hand_threshold":   torch.from_numpy(data["hand_threshold"]),
         "overland_dist_km": torch.from_numpy(data["overland_dist_km"]),
+        "z_saddle_m":       torch.from_numpy(data["z_saddle_m"]),
     }
 
 
@@ -448,13 +534,21 @@ if __name__ == "__main__":
     hand_pairs = torch.randperm(N * (N - 1))[:E_hand * 2].reshape(E_hand, 2)
     hand_src   = hand_pairs[:, 0] % N
     hand_dst   = hand_pairs[:, 1] % N
-    hand_thr   = torch.rand(E_hand) * 2 + 1.0   # 1–3 m
+    hand_thr   = torch.rand(E_hand) * 2 + 1.0   # 1–3 m (diagnostics only now)
     hand_dist  = torch.rand(E_hand) * 3 + 1.0   # 1–4 km
+
+    # Realistic-ish synthetic m-OD values, matching nodes.csv's actual range
+    # (roughly -5 to 120 m OD across the 27 Lee gauges)
+    node_elev_synth  = torch.rand(N) * 120.0 - 5.0
+    z_saddle         = node_elev_synth[hand_src] + torch.rand(E_hand) * 3.0
+    gauge_datum      = node_elev_synth.clone()
+    stage_range      = torch.rand(N) * 2.0 + 0.5   # 0.5–2.5 m, matches nodes.csv scale
 
     model = STGNNHANDEdge(
         f_dyn=F_dyn, f_static=F_static, f_edge=F_edge,
         hand_src=hand_src, hand_dst=hand_dst,
         hand_threshold=hand_thr, hand_overland_dist=hand_dist,
+        z_saddle=z_saddle, gauge_datum=gauge_datum, stage_range=stage_range,
         hidden=64, gat_heads=2, gru_layers=2, t_out=T_out,
         sar_emb_dim=SAR_DIM, discharge_idx=3,
     )
@@ -469,6 +563,24 @@ if __name__ == "__main__":
     # Verify activation sharpness gradient flows
     assert model.activation_sharpness.grad is not None
     print("Sharpness gradient:  ✓")
+
+    # Sanity check: activation should vary meaningfully (not be stuck near 0
+    # or near 1 for every edge) when normalised_stage sweeps a realistic
+    # range — this is the check that would have caught the original bug,
+    # where hand_threshold (metres) dominated stage_anomaly (~[-2,5], often
+    # near 0) and activation collapsed toward a fixed operating point
+    # regardless of x_seq's actual values.
+    with torch.no_grad():
+        x_low  = x_seq.clone(); x_low[:, -1, :, 1]  = -2.0   # low normalised_stage
+        x_high = x_seq.clone(); x_high[:, -1, :, 1] =  5.0   # high normalised_stage
+        _, act_low  = model._hand_edge_attr(x_low[:, -1, :, :])
+        _, act_high = model._hand_edge_attr(x_high[:, -1, :, :])
+        spread = (act_high - act_low).abs().mean().item()
+        assert spread > 0.3, (
+            f"HAND activation barely responds to normalised_stage "
+            f"(mean |Δactivation|={spread:.4f}) — datum mismatch likely."
+        )
+    print(f"Activation responds to stage sweep:  ✓  (mean |Δ|={spread:.3f})")
 
     n = sum(p.numel() for p in model.parameters())
     n_buf = sum(b.numel() for b in model.buffers())
