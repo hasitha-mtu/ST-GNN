@@ -10,9 +10,15 @@ Architecture
     Class A  permanent river-network edges (Phase 1 dynamic conductance)
     Class B  HAND candidate edges (5 km search, soft sigmoid activation)
 
-  activation(i,j,t) = sigmoid(α × (max(stage_i, stage_j) − τ_ij))
-  where τ_ij = minimum HAND along the overland path between i and j (from DEM)
-  and α is a learnable sharpness parameter.
+  activation(i,j,t) = sigmoid(α × (max(H_i, H_j) − z_saddle_ij))
+  where H_i = gauge_datum_i + normalised_stage_i × stage_range_i is the
+  reconstructed absolute water-surface elevation (m OD) at node i, z_saddle_ij
+  is the absolute elevation (m OD) at the corridor's lowest-connectivity
+  point (from precompute_hand_edges.py), and α is a learnable sharpness
+  parameter. (Option-3 datum fix: this replaces an earlier version that
+  compared stage_anomaly — an elevation-free, rolling-baseline-relative
+  quantity — directly against a HAND-relative threshold; see
+  st_gnn_hand_edge.py's module docstring for the full derivation.)
 
 Prerequisites
 -------------
@@ -63,6 +69,7 @@ from src.utils.train_utils import get_split_boundary
 
 from src.models.st_gnn_hand_edge import STGNNHANDEdge, load_hand_edges
 from src.models.sar_fno_encoder import SARFNOEncoder, compute_node_coords_norm
+from src.models.dfc_gnn import load_edge_features
 
 # ── Paths ──────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -70,7 +77,16 @@ PROC_DIR = BASE_DIR / "dataset/processed"
 GRAPH_DIR = BASE_DIR / "dataset/graph"
 SAR_DIR         = BASE_DIR / "dataset/sar"
 HAND_EDGES_PATH = BASE_DIR / "dataset/graph/hand_edges.npz"
+EDGE_FEAT_PATH  = BASE_DIR / "dataset/graph/edge_features.npz"
 LIVE_METRICS_PATH = BASE_DIR / "checkpoints"
+
+# Nodes whose gauge_datum_mOSGM15 is a known placeholder (0.0, physically
+# inconsistent with their p90_mAOD — see option-3 datum-fix discussion).
+# For these specific nodes, gauge_datum is substituted with the DEM-sampled
+# node_elev as an approximation, with a loud warning logged at runtime.
+# Replace with the real station datum if/when it becomes available —
+# this is a stopgap, not a verified value.
+RESERVOIR_DATUM_FALLBACK_REFS = {"19095", "19094"}  # Carrigadrohid/Inniscarra Headrace
 # ── Feature dimensions ─────────────────────────────────────────────────
 SAR_EMB_DIM = 16     # FNO encoder output channels per node
 # Fusion input = GRU output (HIDDEN_DIM=64) + SAR embedding (16) = 80
@@ -298,6 +314,72 @@ def build_event_lookup(sar_events: dict, T: int,
     return lookup
 
 
+def load_gauge_datum_and_stage_range(
+    nodes_df: "pd.DataFrame",
+    node_elev: torch.Tensor,
+    logger,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build per-node gauge_datum [N] and stage_range [N] (= p90 - gauge_datum)
+    from nodes.csv, for the option-3 datum-consistent HAND activation gate.
+
+    Applies a fallback for nodes with a known-bad gauge_datum_mOSGM15 (0.0,
+    physically inconsistent with their p90_mAOD — see
+    RESERVOIR_DATUM_FALLBACK_REFS): substitutes the DEM-sampled node_elev
+    for gauge_datum at those nodes specifically, with a loud warning. This
+    is an approximation, not a verified station datum — replace with the
+    real value if/when available.
+
+    nodes_df must be in the SAME row order as node_elev / edge_index /
+    X.npy's node axis (i.e. loaded via the same nodes.csv used everywhere
+    else in the pipeline).
+    """
+    gauge_datum = nodes_df["gauge_datum_mOSGM15"].to_numpy(dtype=np.float32).copy()
+    p90         = nodes_df["p90_mAOD"].to_numpy(dtype=np.float32).copy()
+    refs        = nodes_df["ref"].astype(str).to_numpy()
+
+    fallback_idx = [i for i, r in enumerate(refs) if r in RESERVOIR_DATUM_FALLBACK_REFS]
+    if fallback_idx:
+        node_elev_np = node_elev.detach().cpu().numpy()
+        for i in fallback_idx:
+            logger.warning(
+                "  gauge_datum fallback: node ref=%s (%s) has gauge_datum_"
+                "mOSGM15=%.2f m paired with p90_mAOD=%.2f m — physically "
+                "inconsistent (implausible stage range). Substituting "
+                "DEM-sampled node_elev=%.2f m OD as an APPROXIMATION. "
+                "Replace with the real station datum if available.",
+                refs[i], nodes_df.iloc[i].get("name", "?"),
+                gauge_datum[i], p90[i], node_elev_np[i],
+            )
+            gauge_datum[i] = node_elev_np[i]
+            # p90 wasn't the broken value for these nodes, but stage_range
+            # must still be positive and physically reasonable — reuse the
+            # typical stage_range magnitude seen elsewhere rather than the
+            # (now stale) original p90-gauge_datum gap for this node.
+            p90[i] = gauge_datum[i] + 1.5   # ~1.5 m default range, mid-pack
+                                             # of the observed 0.18-60.9 m
+                                             # range prior to this fallback
+
+    stage_range = p90 - gauge_datum
+    bad = stage_range <= 0.01
+    if bad.any():
+        logger.warning(
+            "  %d node(s) have non-positive stage_range after fallback — "
+            "clamping to 1.0 m: refs=%s",
+            int(bad.sum()), refs[bad].tolist(),
+        )
+        stage_range[bad] = 1.0
+
+    logger.info(
+        "  gauge_datum: [%.2f, %.2f] m OD   stage_range: [%.2f, %.2f] m",
+        gauge_datum.min(), gauge_datum.max(),
+        stage_range.min(), stage_range.max(),
+    )
+
+    return (torch.from_numpy(gauge_datum).float(),
+            torch.from_numpy(stage_range).float())
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Training loop
 # ═══════════════════════════════════════════════════════════════════════
@@ -444,13 +526,35 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     hand_data = load_hand_edges(str(HAND_EDGES_PATH))
     logger.info(
         "HAND edges loaded: %d directed edges  threshold=[%.2f, %.2f] m  "
-        "dist=[%.2f, %.2f] km",
+        "z_saddle=[%.2f, %.2f] m OD  dist=[%.2f, %.2f] km",
         len(hand_data["src"]),
         hand_data["hand_threshold"].min().item(),
         hand_data["hand_threshold"].max().item(),
+        hand_data["z_saddle_m"].min().item(),
+        hand_data["z_saddle_m"].max().item(),
         hand_data["overland_dist_km"].min().item(),
         hand_data["overland_dist_km"].max().item(),
     )
+
+    # ── Option-3 datum fix: node_elev + gauge_datum/stage_range ─────────
+    # node_elev isn't otherwise used by STGNNHANDEdge (no hard elevation
+    # gate here, unlike DFCGNNUnified) — loaded solely to supply the
+    # reservoir-node gauge_datum fallback below.
+    if not EDGE_FEAT_PATH.exists():
+        logger.error(
+            "edge_features.npz not found at %s — needed for node_elev "
+            "(gauge_datum fallback source). Run: "
+            "python src/data/compute_edge_features.py", EDGE_FEAT_PATH,
+        )
+        import sys; sys.exit(1)
+    ef = load_edge_features(str(EDGE_FEAT_PATH), device="cpu")
+    node_elev_cpu = ef["node_elev"]
+
+    nodes_df = pd.read_csv(GRAPH_DIR / "nodes.csv")
+    gauge_datum, stage_range = load_gauge_datum_and_stage_range(
+        nodes_df, node_elev_cpu, logger,
+    )
+    z_saddle = hand_data["z_saddle_m"]
 
     # ── SAR encoder + cache ────────────────────────────────────────────
     sar_cache    = None
@@ -558,6 +662,9 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
         hand_dst=hand_data["dst"],
         hand_threshold=hand_data["hand_threshold"],
         hand_overland_dist=hand_data["overland_dist_km"],
+        z_saddle=z_saddle,
+        gauge_datum=gauge_datum,
+        stage_range=stage_range,
         hidden=HIDDEN_DIM,
         gat_heads=GAT_HEADS,
         gru_layers=GRU_LAYERS,

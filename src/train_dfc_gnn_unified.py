@@ -108,6 +108,75 @@ def load_node_elevation(logger) -> torch.Tensor:
     return node_elev
 
 
+# Nodes whose gauge_datum_mOSGM15 is a known placeholder (0.0, physically
+# inconsistent with their p90_mAOD — see option-3 datum-fix discussion in
+# train_st_gnn_hand_edge.py, where this same constant/helper originates).
+# For these specific nodes, gauge_datum is substituted with the DEM-sampled
+# node_elev as an approximation, with a loud warning logged at runtime.
+# Replace with the real station datum if/when it becomes available —
+# this is a stopgap, not a verified value.
+RESERVOIR_DATUM_FALLBACK_REFS = {"19095", "19094"}  # Carrigadrohid/Inniscarra Headrace
+
+
+def load_gauge_datum_and_stage_range(
+    nodes_df: "pd.DataFrame",
+    node_elev: torch.Tensor,
+    logger,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build per-node gauge_datum [N] and stage_range [N] (= p90 - gauge_datum)
+    from nodes.csv, for the option-3 datum-consistent HAND activation gate.
+    Identical logic to train_st_gnn_hand_edge.py's version of this helper —
+    duplicated rather than imported, matching this codebase's existing
+    convention of independent, self-contained training scripts (see e.g.
+    make_flood_labels, duplicated between train_dfc_gnn.py and this file).
+
+    nodes_df must be in the SAME row order as node_elev / edge_index /
+    X.npy's node axis (i.e. loaded via the same nodes.csv used everywhere
+    else in the pipeline).
+    """
+    gauge_datum = nodes_df["gauge_datum_mOSGM15"].to_numpy(dtype=np.float32).copy()
+    p90         = nodes_df["p90_mAOD"].to_numpy(dtype=np.float32).copy()
+    refs        = nodes_df["ref"].astype(str).to_numpy()
+
+    fallback_idx = [i for i, r in enumerate(refs) if r in RESERVOIR_DATUM_FALLBACK_REFS]
+    if fallback_idx:
+        node_elev_np = node_elev.detach().cpu().numpy()
+        for i in fallback_idx:
+            logger.warning(
+                "  gauge_datum fallback: node ref=%s (%s) has gauge_datum_"
+                "mOSGM15=%.2f m paired with p90_mAOD=%.2f m — physically "
+                "inconsistent (implausible stage range). Substituting "
+                "DEM-sampled node_elev=%.2f m OD as an APPROXIMATION. "
+                "Replace with the real station datum if available.",
+                refs[i], nodes_df.iloc[i].get("name", "?"),
+                gauge_datum[i], p90[i], node_elev_np[i],
+            )
+            gauge_datum[i] = node_elev_np[i]
+            p90[i] = gauge_datum[i] + 1.5   # ~1.5 m default range, mid-pack
+                                             # of the observed 0.18-60.9 m
+                                             # range prior to this fallback
+
+    stage_range = p90 - gauge_datum
+    bad = stage_range <= 0.01
+    if bad.any():
+        logger.warning(
+            "  %d node(s) have non-positive stage_range after fallback — "
+            "clamping to 1.0 m: refs=%s",
+            int(bad.sum()), refs[bad].tolist(),
+        )
+        stage_range[bad] = 1.0
+
+    logger.info(
+        "  gauge_datum: [%.2f, %.2f] m OD   stage_range: [%.2f, %.2f] m",
+        gauge_datum.min(), gauge_datum.max(),
+        stage_range.min(), stage_range.max(),
+    )
+
+    return (torch.from_numpy(gauge_datum).float(),
+            torch.from_numpy(stage_range).float())
+
+
 def load_bankfull_thresholds(graph_dir: Path, n_nodes: int,
                              device: torch.device) -> torch.Tensor:
     """Per-node bankfull stage anomaly thresholds. Same as train_dfc_gnn.py."""
@@ -268,9 +337,19 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
         )
     hand_data = load_hand_edges(str(HAND_EDGES_PATH))
     logger.info("  HAND candidate edges: %d", hand_data["src"].shape[0])
+    logger.info(
+        "  z_saddle: [%.2f, %.2f] m OD",
+        hand_data["z_saddle_m"].min().item(), hand_data["z_saddle_m"].max().item(),
+    )
 
     # ── Load node elevation (for the hard gate) ─────────────────────────
     node_elev = load_node_elevation(logger).to(DEVICE)
+
+    # ── Option-3 datum fix: gauge_datum / stage_range for the HAND gate ─
+    nodes_df = pd.read_csv(GRAPH_DIR / "nodes.csv")
+    gauge_datum, stage_range = load_gauge_datum_and_stage_range(
+        nodes_df, node_elev.cpu(), logger,
+    )
 
     # ── Load bankfull thresholds (for flood label generation) ──────────
     bankfull_thr = load_bankfull_thresholds(GRAPH_DIR, N, DEVICE)
@@ -296,6 +375,9 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
         hand_src=hand_data["src"].to(DEVICE), hand_dst=hand_data["dst"].to(DEVICE),
         hand_threshold=hand_data["hand_threshold"].to(DEVICE),
         hand_overland_dist=hand_data["overland_dist_km"].to(DEVICE),
+        z_saddle=hand_data["z_saddle_m"].to(DEVICE),
+        gauge_datum=gauge_datum.to(DEVICE),
+        stage_range=stage_range.to(DEVICE),
         n_gru_layers=GRU_LAYERS, dropout=DROPOUT, lambda_flood=LAMBDA_FLOOD,
         tau_gate=TAU_GATE, discharge_idx=discharge_col, discharge_ref=q_ref,
     ).to(DEVICE)
