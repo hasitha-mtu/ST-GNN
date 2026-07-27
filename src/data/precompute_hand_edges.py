@@ -1,30 +1,37 @@
 """
 precompute_hand_edges.py  –  Precompute HAND candidate edges for Phase 2
 =========================================================================
-One-time script. Reads the Lee DEM, computes HAND, then for every pair of
-gauge nodes within 5 km overland distance finds the minimum HAND value along
-a straight-line corridor between them.  The minimum corridor HAND is the
-stage height at which inundation would connect the two drainage sub-basins.
+One-time script. Reads the Lee DEM, computes HAND following the
+algorithm of Nobre et al. (2011) exactly, then for every pair of gauge
+nodes within 5 km overland distance that are not already connected by a
+river-network edge, finds the minimum HAND value along the straight-line
+corridor between them.  The minimum corridor HAND represents the
+topographic saddle — the stage height at which inundation would connect
+the two sub-catchments.
+
+HAND algorithm (Nobre et al. 2011, Journal of Hydrology 404, 13-29)
+--------------------------------------------------------------------
+1. Obtain a Digital Elevation Model.
+2. Fill sinks/depressions (Priority-Flood; Barnes et al. 2014).
+3. Compute D8 flow direction from the pit-filled DEM
+   (O'Callaghan & Mark 1984; Jenson & Domingue 1988).
+4. Compute D8 flow accumulation; threshold to define the drainage
+   network.
+5. For each terrain cell, trace the D8 flow path downslope until
+   the nearest stream cell is reached.
+   HAND = elevation(cell) − elevation(stream cell at end of D8 path).
 
 Output
 ------
     dataset/graph/hand_edges.npz  containing arrays:
         src              int32  [E_hand]
         dst              int32  [E_hand]
-        hand_threshold   float32 [E_hand]  minimum HAND along corridor (m,
-                                            relative to nearest stream cell —
-                                            kept for backward compatibility /
-                                            diagnostics, no longer used
-                                            directly in the activation gate)
-        overland_dist_km float32 [E_hand]  Euclidean distance between nodes (km)
-        z_saddle_m       float32 [E_hand]  ABSOLUTE elevation (m OD) at the
-                                            same pixel that produced
-                                            hand_threshold. This is what the
-                                            option-3 activation gate compares
-                                            reconstructed water-surface
-                                            elevation against — same datum as
-                                            node_elevation_m in
-                                            edge_features.npz.
+        hand_threshold   float32 [E_hand]  minimum HAND along corridor (m)
+        overland_dist_km float32 [E_hand]  Euclidean distance between nodes
+        z_saddle_m       float32 [E_hand]  absolute elevation (m OD) at the
+                                            minimum-HAND pixel (the
+                                            topographic saddle between the
+                                            two sub-catchments).
 
 Usage
 -----
@@ -35,28 +42,51 @@ Usage
                                          --max-dist 5.0
                                          --hand-min 0.5
 
-Distance threshold justification
----------------------------------
-5 km is consistent with:
-  - Godbout et al. (2019) / Zheng et al. (2018): ≤5 km recommended for HAND
-    reach hydraulic discretisation (cited in Aristizabal et al. 2023).
-  - Lee catchment tributary spacing: Bride–Lee confluence to Shournagh–Lee
-    confluence is ~4–5 km overland — the closest cross-tributary distance
-    in the Lee network (Irish Examiner, 2024; Wikipedia, Shournagh River).
-  - Nature Geoscience global connectivity analysis (2026) used 6 km as
-    sensitivity threshold for river–floodplain connectivity.
+Distance threshold (5 km)
+--------------------------
+Consistent with reach hydraulic discretisation recommendations for
+HAND-based inundation mapping (Zheng et al. 2018, Water Resources
+Research) and the ~4-5 km Bride–Lee to Shournagh–Lee interfluve
+distance in the Lee catchment.
 
-HAND threshold floor
---------------------
-Pairs with minimum corridor HAND < hand_min are excluded: a very low
-minimum HAND between two nodes means they share a drainage basin and are
-already connected through the river network — creating a HAND edge between
-them would be redundant.  Default 0.5 m.
+HAND threshold floor (0.5 m)
+-----------------------------
+Pairs with minimum corridor HAND < 0.5 m are excluded because a near-
+zero interfluve HAND indicates the two nodes share the same drainage
+basin and are already connected through the river network.
+
+References
+----------
+Nobre, A.D., et al., 2011. Height Above the Nearest Drainage.
+    Journal of Hydrology 404, 13-29.
+    https://doi.org/10.1016/j.jhydrol.2011.03.051
+
+Barnes, R., Lehman, C., Mulla, D., 2014. Priority-Flood: An optimal
+    depression-filling and watershed-labeling algorithm for digital
+    elevation models. Computers & Geosciences 62, 117-127.
+    https://doi.org/10.1016/j.cageo.2013.04.024
+
+O'Callaghan, J.F., Mark, D.M., 1984. The extraction of drainage
+    networks from digital elevation data. Computer Vision, Graphics,
+    and Image Processing 28, 323-344.
+    https://doi.org/10.1016/S0734-189X(84)80011-0
+
+Jenson, S.K., Domingue, J.O., 1988. Extracting topographic structure
+    from digital elevation data for GIS analysis. Photogrammetric
+    Engineering and Remote Sensing 54, 1593-1600.
+
+Zheng, X., et al., 2018. GeoFlood: Large-scale flood inundation mapping
+    based on high-resolution terrain analysis. Water Resources Research
+    54, 10013-10033. https://doi.org/10.1029/2018WR023457
+
+European Space Agency, 2022. Copernicus Global Digital Elevation Model
+    (GLO-30). https://doi.org/10.5069/G9028PQB
 """
 
 from __future__ import annotations
 
 import argparse
+import heapq
 import sys
 from pathlib import Path
 
@@ -72,28 +102,265 @@ OUT_PATH   = BASE_DIR / "dataset/graph/hand_edges.npz"
 
 MAX_DIST_KM  = 5.0    # maximum overland distance to consider (km)
 HAND_MIN_M   = 0.5    # minimum HAND threshold to accept (m)
-CORRIDOR_W   = 500.0  # corridor half-width for HAND sampling (m)
-SAMPLE_STEP  = 60     # sample every N DEM pixels along corridor
+SAMPLE_STEP  = 60     # sample points along corridor centreline
+ACC_THRESH   = 500    # flow accumulation threshold for stream definition
+                      # 500 cells × (30m)² = 0.45 km² drainage area
 
 
-def reproject_dem_to_itm(dem_path, out_path):
+# ══════════════════════════════════════════════════════════════════════
+#  Step 2 — Pit filling (Barnes et al. 2014, Priority-Flood)
+# ══════════════════════════════════════════════════════════════════════
+
+def fill_pits_priority_flood(
+    dem_data: np.ndarray,
+    nan_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Fill all sinks and depressions in the DEM using the Priority-Flood
+    algorithm (Barnes et al. 2014, Computers & Geosciences 62, 117-127).
+
+    Priority-Flood guarantees that the output surface is hydrologically
+    conditioned: every cell has a downslope path to the DEM boundary,
+    eliminating spurious pits that would otherwise produce undefined D8
+    flow directions and break the accumulation chain.
+
+    The algorithm initialises a min-heap with all DEM border cells and
+    processes cells in order of ascending elevation.  Each unvisited
+    neighbour is assigned max(its own elevation, current cell elevation),
+    ensuring that inward-draining depressions are raised to the lowest
+    outlet elevation that allows drainage.
+
+    Parameters
+    ----------
+    dem_data : [H, W] float64  raw DEM elevations (NaN for nodata)
+    nan_mask : [H, W] bool     True where cell is nodata
+
+    Returns
+    -------
+    filled : [H, W] float64  pit-filled DEM (NaN preserved at nodata)
+    """
+    H, W    = dem_data.shape
+    filled  = dem_data.copy().astype(np.float64)
+    visited = np.zeros((H, W), dtype=bool)
+    heap    = []
+
+    # Seed the heap with all valid border cells
+    for r in range(H):
+        for c in [0, W - 1]:
+            if not nan_mask[r, c]:
+                heapq.heappush(heap, (filled[r, c], r, c))
+                visited[r, c] = True
+    for c in range(1, W - 1):
+        for r in [0, H - 1]:
+            if not nan_mask[r, c] and not visited[r, c]:
+                heapq.heappush(heap, (filled[r, c], r, c))
+                visited[r, c] = True
+
+    neighbours = [(-1,-1),(-1, 0),(-1, 1),
+                  ( 0,-1),         ( 0, 1),
+                  ( 1,-1),( 1, 0),( 1, 1)]
+
+    while heap:
+        elev, r, c = heapq.heappop(heap)
+        for dr, dc in neighbours:
+            nr, nc = r + dr, c + dc
+            if (0 <= nr < H and 0 <= nc < W
+                    and not visited[nr, nc]
+                    and not nan_mask[nr, nc]):
+                visited[nr, nc] = True
+                # Raise neighbour to at least the current cell's elevation
+                filled[nr, nc]  = max(filled[nr, nc], elev)
+                heapq.heappush(heap, (filled[nr, nc], nr, nc))
+
+    n_raised = int(((filled > dem_data) & ~nan_mask).sum())
+    print(f"  Priority-Flood: {n_raised:,} cells raised to fill depressions")
+    return filled
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Steps 3 & 4 — D8 flow direction and flow accumulation
+# ══════════════════════════════════════════════════════════════════════
+
+def compute_d8_and_accumulation(
+    filled_dem: np.ndarray,
+    nan_mask:   np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute D8 flow direction and D8 flow accumulation from the
+    pit-filled DEM, following O'Callaghan & Mark (1984) and
+    Jenson & Domingue (1988).
+
+    D8 assigns each cell to the steepest downslope neighbour among its
+    eight cardinal and diagonal neighbours.  Diagonal slopes are
+    normalised by sqrt(2) to account for the longer diagonal path
+    length (O'Callaghan & Mark 1984).
+
+    Flow accumulation is computed by processing cells in descending
+    elevation order and propagating the accumulation count to the single
+    D8 downstream neighbour (Jenson & Domingue 1988).
+
+    Parameters
+    ----------
+    filled_dem : [H, W] float64  pit-filled DEM
+    nan_mask   : [H, W] bool     True where cell is nodata
+
+    Returns
+    -------
+    dr       : [H, W] int8   row offset to D8 downstream neighbour
+    dc       : [H, W] int8   col offset to D8 downstream neighbour
+    acc      : [H, W] float32 flow accumulation (upstream cell count)
+    """
+    H, W = filled_dem.shape
+
+    # ── D8 flow direction ─────────────────────────────────────────────
+    sentinel = float(np.nanmax(filled_dem)) + 1e6
+    dem_work = filled_dem.copy()
+    dem_work[nan_mask] = sentinel
+
+    pad = np.pad(dem_work, 1, mode="constant", constant_values=sentinel)
+    dr  = np.zeros((H, W), dtype=np.int8)
+    dc  = np.zeros((H, W), dtype=np.int8)
+    max_slope = np.full((H, W), -np.inf)
+
+    for di, dj, dist in [(-1,-1,1.4142),(-1, 0,1.0),(-1, 1,1.4142),
+                          ( 0,-1,1.0),              ( 0, 1,1.0),
+                          ( 1,-1,1.4142),( 1, 0,1.0),( 1, 1,1.4142)]:
+        ri   = 1 + di
+        ci   = 1 + dj
+        neigh = pad[ri:ri+H, ci:ci+W]
+        slope = (dem_work - neigh) / dist
+        update = (slope > max_slope) & ~nan_mask
+        dr[update]        = di
+        dc[update]        = dj
+        max_slope[update] = slope[update]
+
+    # ── Flow accumulation ─────────────────────────────────────────────
+    acc = np.ones((H, W), dtype=np.float32)
+    acc[nan_mask] = 0.0
+
+    flat_order = np.argsort(dem_work.ravel())[::-1]   # high → low
+    for idx in flat_order:
+        r, c = divmod(int(idx), W)
+        if nan_mask[r, c] or (dr[r, c] == 0 and dc[r, c] == 0):
+            continue
+        nr, nc = r + int(dr[r, c]), c + int(dc[r, c])
+        if 0 <= nr < H and 0 <= nc < W and not nan_mask[nr, nc]:
+            acc[nr, nc] += acc[r, c]
+
+    print(f"  Accumulation range: [1, {acc.max():.0f}] cells")
+    return dr, dc, acc
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Step 5 — HAND via D8 flow-path tracing (Nobre et al. 2011)
+# ══════════════════════════════════════════════════════════════════════
+
+def compute_hand_d8_path(
+    dem:         np.ndarray,    # [H, W] float64  raw (unfilled) elevations
+    dr:          np.ndarray,    # [H, W] int8     D8 row offset
+    dc:          np.ndarray,    # [H, W] int8     D8 col offset
+    stream_mask: np.ndarray,    # [H, W] uint8    1=stream
+    nan_mask:    np.ndarray,    # [H, W] bool
+    filled_dem:  np.ndarray,    # [H, W] float64  pit-filled (for sort order)
+) -> np.ndarray:
+    """
+    Compute HAND following the definition of Nobre et al. (2011):
+    for each terrain cell, follow the D8 flow path downslope until
+    the nearest stream cell is reached; HAND equals the vertical
+    distance between the terrain cell's own elevation and the
+    elevation of that stream cell.
+
+        HAND(cell) = z(cell) − z(stream cell at end of D8 path)
+
+    Implementation: processing cells in ascending elevation order
+    (lowest first) guarantees that the downstream neighbour of every
+    non-stream cell has already received its stream-elevation
+    assignment before the current cell is processed, because D8 flow
+    is always directed to a lower (or equal) neighbour.  Stream cells
+    are seeded with their own elevation, and the stream elevation
+    propagates upslope through the assignment
+        stream_elev[cell] = stream_elev[downstream neighbour].
+
+    This is equivalent to tracing every D8 flow path individually but
+    is O(H × W × log(H × W)) rather than O(H × W × path_length).
+
+    Parameters
+    ----------
+    dem         : raw DEM — used for HAND subtraction
+    dr / dc     : D8 flow direction offsets computed from pit-filled DEM
+    stream_mask : 1 at stream cells, 0 elsewhere
+    nan_mask    : True at nodata cells
+    filled_dem  : pit-filled DEM — used only for sort order
+
+    Returns
+    -------
+    hand : [H, W] float32  HAND values (m); NaN at nodata and off-network
+    """
+    H, W = dem.shape
+
+    # For every cell, record the elevation of the stream cell
+    # it ultimately drains to via the D8 path.
+    stream_elev = np.full((H, W), np.nan, dtype=np.float64)
+
+    # Seed: stream cells drain to themselves
+    sr, sc = np.where((stream_mask == 1) & ~nan_mask)
+    stream_elev[sr, sc] = dem[sr, sc]
+
+    # Process in ascending elevation order (lowest → highest).
+    # Because D8 always points downhill, the downstream neighbour
+    # of any non-stream cell is always lower and therefore already
+    # processed when we reach the current cell.
+    sort_key = filled_dem.copy()
+    sort_key[nan_mask] = np.inf
+    ascending_order = np.argsort(sort_key.ravel())
+
+    for idx in ascending_order:
+        r, c = divmod(int(idx), W)
+        if nan_mask[r, c] or stream_mask[r, c]:
+            continue                               # nodata or already seeded
+        if dr[r, c] == 0 and dc[r, c] == 0:
+            continue                               # no valid D8 direction
+        nr, nc = r + int(dr[r, c]), c + int(dc[r, c])
+        if 0 <= nr < H and 0 <= nc < W and not nan_mask[nr, nc]:
+            stream_elev[r, c] = stream_elev[nr, nc]
+
+    # HAND = raw elevation − stream elevation along D8 path
+    hand = (dem - stream_elev).astype(np.float32)
+    hand = np.clip(hand, 0.0, None)               # negative → same stream level
+    hand[nan_mask]                        = np.nan
+    hand[np.isnan(stream_elev) & ~nan_mask] = np.nan   # off-network cells
+
+    n_valid = int((~np.isnan(hand)).sum())
+    valid   = hand[~np.isnan(hand)]
+    print(f"  HAND (D8-path): {n_valid:,} valid cells  "
+          f"range=[{valid.min():.2f}, {valid.max():.2f}] m")
+    return hand
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Top-level HAND computation (Steps 1–5)
+# ══════════════════════════════════════════════════════════════════════
+
+def reproject_dem_to_itm(dem_path: Path, out_path: Path) -> Path:
+    """Reproject DEM to ITM (EPSG:2157) at 30 m if not already projected."""
     import rasterio
     from rasterio.warp import calculate_default_transform, reproject, Resampling
     from rasterio.crs import CRS as _CRS
-    from pathlib import Path as _Path
-    dem_path = _Path(dem_path)
-    out_path = _Path(out_path)
+
     if out_path.exists():
         print(f"  Using cached ITM DEM: {out_path.name}")
         return out_path
+
     with rasterio.open(dem_path) as src:
         if src.crs and src.crs.to_epsg() == 2157:
             print("  DEM already in ITM.")
             return dem_path
-        print(f"  Reprojecting {src.crs} to EPSG:2157 at 30 m ...")
+
+        print(f"  Reprojecting {src.crs} → EPSG:2157 at 30 m …")
         dst_crs = _CRS.from_epsg(2157)
         transform, width, height = calculate_default_transform(
-            src.crs, dst_crs, src.width, src.height, *src.bounds, resolution=30.0)
+            src.crs, dst_crs, src.width, src.height, *src.bounds,
+            resolution=30.0)
         kwargs = src.meta.copy()
         kwargs.update({"crs": dst_crs, "transform": transform,
                        "width": width, "height": height,
@@ -106,156 +373,90 @@ def reproject_dem_to_itm(dem_path, out_path):
                           src_transform=src.transform, src_crs=src.crs,
                           dst_transform=transform, dst_crs=dst_crs,
                           resampling=Resampling.bilinear)
-    print(f"  Reprojected: {out_path.name}  ({height} x {width} px at 30 m)")
+
+    print(f"  Reprojected → {out_path.name}  ({height} × {width} px at 30 m)")
     return out_path
 
 
-def compute_hand(dem_path: Path, fdir_path: Path | None = None) -> tuple:
+def compute_hand(
+    dem_path:   Path,
+    fdir_path:  Path | None = None,
+    acc_thresh: int = ACC_THRESH,
+) -> tuple[np.ndarray, object, str, np.ndarray]:
     """
-    HAND using correct pad-based D8 + ITM reprojection.
-    Fixes: CRS mismatch, np.roll sign error, endpoint sampling, perp offsets.
+    Execute the complete Nobre et al. (2011) HAND pipeline.
 
-    Returns (hand, affine, crs, dem_data) — dem_data (raw absolute elevation,
-    m OD) is returned alongside hand so callers can recover the ABSOLUTE
-    elevation at any HAND-derived location, not just the relative HAND value.
-    Needed for the option-3 datum fix: z_saddle must be an absolute m-OD
-    elevation, comparable to node_elev, not a HAND-relative value.
-
-    If fdir_path is provided, saves dr/dc/nan_mask to that file so flood map
-    scripts can do D8 catchment delineation rather than Voronoi partitioning.
-    The arrays are saved here because they are already in memory from the ITM
-    DEM — saving elsewhere risks loading a different DEM and getting a shape
-    mismatch between fdir.npz and the raster used for visualisation.
+    Returns (hand, affine, crs, dem_data):
+        hand     [H, W] float32  HAND values (m, D8 flow-path definition)
+        affine   rasterio Affine  transform for pixel ↔ world conversion
+        crs      str             coordinate reference system string
+        dem_data [H, W] float64  raw DEM elevations (for z_saddle lookup)
     """
     import rasterio
-    dem_path = Path(dem_path)
+
+    # ── Load DEM ─────────────────────────────────────────────────────
     itm_path = dem_path.parent / (dem_path.stem + "_itm.tif")
     dem_path = reproject_dem_to_itm(dem_path, itm_path)
+
     print(f"Loading DEM: {dem_path.name}")
     with rasterio.open(dem_path) as src:
         dem_data = src.read(1).astype(np.float64)
         affine   = src.transform
         crs      = str(src.crs) if src.crs else "EPSG:2157"
         nodata   = src.nodata if src.nodata is not None else -9999.0
+
     H, W = dem_data.shape
     nan_mask = (dem_data == nodata) | np.isnan(dem_data)
     dem_data[nan_mask] = np.nan
-    print(f"  DEM shape: {H} x {W}  CRS: {crs}")
-    print(f"  Elevation range: [{np.nanmin(dem_data):.1f}, {np.nanmax(dem_data):.1f}] m")
-    print("  Computing D8 flow accumulation ...")
-    sentinel = float(np.nanmax(dem_data)) + 1e6
-    dem_work = dem_data.copy()
-    dem_work[nan_mask] = sentinel
-    pad = np.pad(dem_work, 1, mode="constant", constant_values=sentinel)
-    dr  = np.zeros((H, W), dtype=np.int8)
-    dc  = np.zeros((H, W), dtype=np.int8)
-    max_slope = np.full((H, W), -np.inf)
-    for di, dj, dist in [(-1,-1,1.4142),(-1,0,1.0),(-1,1,1.4142),
-                          ( 0,-1,1.0),             ( 0,1,1.0),
-                          ( 1,-1,1.4142),( 1,0,1.0),( 1,1,1.4142)]:
-        ri = 1 + di
-        ci = 1 + dj
-        neigh = pad[ri:ri+H, ci:ci+W]
-        slope = (dem_work - neigh) / dist
-        update = (slope > max_slope) & ~nan_mask
-        dr[update] = di
-        dc[update] = dj
-        max_slope[update] = slope[update]
-    acc = np.ones((H, W), dtype=np.float32)
-    acc[nan_mask] = 0.0
-    flat_order = np.argsort(dem_work.ravel())[::-1]
-    for r, c in zip(flat_order // W, flat_order % W):
-        if nan_mask[r, c] or (dr[r,c] == 0 and dc[r,c] == 0):
-            continue
-        nr, nc = r + int(dr[r,c]), c + int(dc[r,c])
-        if 0 <= nr < H and 0 <= nc < W and not nan_mask[nr, nc]:
-            acc[nr, nc] += acc[r, c]
-    print(f"  Accumulation range: [1, {acc.max():.0f}] cells")
-    acc_threshold = 500
-    if acc.max() < acc_threshold:
-        acc_threshold = float(acc.max() * 0.9)
-    stream_mask = ((acc >= acc_threshold) & ~nan_mask).astype(np.uint8)
-    n_stream = int(stream_mask.sum())
-    n_valid  = int((~nan_mask).sum())
-    print(f"  Stream cells: {n_stream:,} / {n_valid:,} ({n_stream/max(n_valid,1)*100:.2f}%)")
-    if n_stream == 0:
-        raise ValueError("No stream cells. Check DEM coverage.")
-    print("  Computing HAND ...")
-    hand = _compute_hand_from_mask(dem_data.astype(np.float32), stream_mask, affine)
-    valid = hand[~np.isnan(hand)]
-    print(f"  HAND shape={hand.shape}  NaN={np.isnan(hand).mean():.2%}")
-    if valid.size > 0:
-        print(f"  HAND range: [{valid.min():.2f}, {valid.max():.2f}] m")
-    # Save D8 flow direction arrays if requested
+    print(f"  DEM shape: {H} × {W}  CRS: {crs}")
+    print(f"  Elevation range: [{np.nanmin(dem_data):.1f}, "
+          f"{np.nanmax(dem_data):.1f}] m")
+
+    # ── Step 2: Priority-Flood pit filling ────────────────────────────
+    print("  Step 2: Priority-Flood depression filling …")
+    filled_dem = fill_pits_priority_flood(dem_data, nan_mask)
+
+    # ── Steps 3 & 4: D8 direction + accumulation ─────────────────────
+    print("  Steps 3–4: D8 flow direction and accumulation …")
+    dr, dc, acc = compute_d8_and_accumulation(filled_dem, nan_mask)
+
+    # Optionally save D8 direction arrays for downstream use
     if fdir_path is not None:
         fdir_path = Path(fdir_path)
         fdir_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            fdir_path,
-            dr       = dr,
-            dc       = dc,
-            nan_mask = nan_mask.astype(np.bool_),
-        )
-        size_mb = fdir_path.stat().st_size / 1024 ** 2
-        print(f"  fdir.npz saved → {fdir_path.name}  "
-              f"shape={dr.shape}  {size_mb:.1f} MB")
+        np.savez_compressed(fdir_path,
+                            dr=dr, dc=dc,
+                            nan_mask=nan_mask.astype(np.bool_))
+        size_mb = fdir_path.stat().st_size / 1024**2
+        print(f"  fdir.npz saved → {fdir_path.name}  {size_mb:.1f} MB")
+
+    # Define stream network by accumulation threshold
+    eff_thresh = acc_thresh if acc.max() >= acc_thresh else float(acc.max() * 0.9)
+    stream_mask = ((acc >= eff_thresh) & ~nan_mask).astype(np.uint8)
+    n_stream = int(stream_mask.sum())
+    n_valid  = int((~nan_mask).sum())
+    print(f"  Stream cells: {n_stream:,} / {n_valid:,} "
+          f"({n_stream/max(n_valid,1)*100:.2f}%)  "
+          f"threshold = {eff_thresh:.0f} cells "
+          f"(≈ {eff_thresh * 30**2 / 1e6:.3f} km²)")
+    if n_stream == 0:
+        raise ValueError("No stream cells. Check DEM coverage and threshold.")
+
+    # ── Step 5: HAND via D8 flow-path tracing (Nobre et al. 2011) ────
+    print("  Step 5: HAND via D8 flow-path tracing (Nobre et al. 2011) …")
+    hand = compute_hand_d8_path(
+        dem_data, dr, dc, stream_mask, nan_mask, filled_dem)
 
     return hand, affine, crs, dem_data
 
-def _compute_hand_from_mask(
-    dem:         np.ndarray,    # [H, W] elevation (m)
-    stream_mask: np.ndarray,    # [H, W] 1=stream, 0=land
-    affine,
-    max_search_m: float = 10_000.0,  # maximum search radius (10 km)
-) -> np.ndarray:
-    """
-    Compute HAND as vertical distance from each cell to its nearest stream cell.
 
-    Uses scipy distance_transform_edt to find the nearest stream pixel for
-    each land cell, then subtracts stream elevation from land elevation.
-
-    This is an approximation of true flow-path HAND — it uses Euclidean
-    nearest-stream distance rather than D8 flow-path distance. For the Lee
-    catchment at 30m resolution with the gauge node spacing used here (~km),
-    the difference is small relative to the activation thresholds (0.5–5 m).
-
-    Parameters
-    ----------
-    max_search_m : float
-        Cells further than this from any stream are assigned NaN (off-network).
-    """
-    from scipy.ndimage import distance_transform_edt
-
-    pixel_size_m = abs(affine.a)   # assumes square pixels
-
-    # Distance in pixels from each non-stream cell to nearest stream cell
-    dist_px, nearest_idx = distance_transform_edt(
-        stream_mask == 0,
-        return_indices=True
-    )
-    dist_m = dist_px * pixel_size_m
-
-    # Elevation at the nearest stream cell for every land cell
-    stream_elev = dem[nearest_idx[0], nearest_idx[1]]
-
-    # HAND = land elevation − nearest stream elevation
-    hand = dem - stream_elev
-    hand = np.clip(hand, 0.0, None)      # negative values = below stream (set 0)
-
-    # Mask cells too far from any stream
-    hand[dist_m > max_search_m] = np.nan
-    hand[np.isnan(dem)]          = np.nan
-
-    return hand.astype(np.float32)
-
+# ══════════════════════════════════════════════════════════════════════
+#  Spatial utilities — node coordinates and corridor sampling
+# ══════════════════════════════════════════════════════════════════════
 
 def nodes_to_itm(nodes_csv: Path) -> tuple[np.ndarray, np.ndarray, list]:
-    """
-    Read gauge nodes and return ITM eastings, northings, and refs.
-    Converts from lat/lon if ITM columns are absent.
-    """
+    """Return ITM eastings, northings, and refs for all gauge nodes."""
     df = pd.read_csv(nodes_csv)
-
     if "easting_itm" in df.columns and "northing_itm" in df.columns:
         eastings  = df["easting_itm"].values.astype(np.float64)
         northings = df["northing_itm"].values.astype(np.float64)
@@ -265,18 +466,16 @@ def nodes_to_itm(nodes_csv: Path) -> tuple[np.ndarray, np.ndarray, list]:
         eastings, northings = t.transform(df["lon"].values, df["lat"].values)
     else:
         raise KeyError(
-            "nodes.csv must have either 'easting_itm'/'northing_itm' or 'lat'/'lon' columns."
-        )
-
-    refs = df["ref"].astype(str).tolist() if "ref" in df.columns \
-           else [str(i) for i in range(len(df))]
+            "nodes.csv must have 'easting_itm'/'northing_itm' or 'lat'/'lon'.")
+    refs = (df["ref"].astype(str).tolist()
+            if "ref" in df.columns else [str(i) for i in range(len(df))])
     return eastings.astype(np.float32), northings.astype(np.float32), refs
 
 
-def world_to_pixel(x_world: float, y_world: float, affine) -> tuple[int, int]:
-    """Convert world coordinates to pixel row/col using inverse affine."""
-    col = (x_world - affine.c) / affine.a
-    row = (y_world - affine.f) / affine.e
+def world_to_pixel(x: float, y: float, affine) -> tuple[int, int]:
+    """Convert ITM world coordinates to DEM row/col."""
+    col = (x - affine.c) / affine.a
+    row = (y - affine.f) / affine.e
     return int(round(row)), int(round(col))
 
 
@@ -286,52 +485,36 @@ def sample_corridor_hand(
     affine,
     e1: float, n1: float,
     e2: float, n2: float,
-    corridor_half_w: float = 500.0,
-    n_samples: int = 50,
+    n_samples: int = SAMPLE_STEP,
 ) -> tuple[float, float]:
     """
-    Sample HAND values along a straight-line corridor between two ITM points.
+    Find the minimum HAND value along the straight-line corridor
+    between two ITM node coordinates.
 
-    The corridor samples N evenly-spaced points along the line (e1,n1)→(e2,n2)
-    plus points offset perpendicular by ±corridor_half_w to widen the search
-    and account for divide topology.
+    Samples n_samples evenly-spaced points along the centreline,
+    restricted to the central 70% of the line (t ∈ [0.15, 0.85]) to
+    exclude the gauge locations themselves (where HAND ≈ 0, since
+    gauges sit on or adjacent to the stream network).
 
-    Returns (min_hand, z_saddle):
-        min_hand  — minimum valid HAND value found along the corridor (m,
-                    relative to nearest stream cell). NaN if all samples NaN.
-        z_saddle  — ABSOLUTE elevation (m OD) at the SAME pixel that produced
-                    min_hand. This is the quantity the option-3 activation
-                    gate compares against reconstructed water-surface
-                    elevation H — unlike min_hand, it's on the same datum as
-                    node_elev, so H ≥ z_saddle has a direct physical meaning
-                    ("the water surface has risen to or above the saddle
-                    point"), rather than requiring stage_anomaly (an
-                    elevation-free, rolling-baseline quantity) to be compared
-                    against a HAND-relative value on a different footing.
+    The minimum HAND along the corridor approximates the topographic
+    saddle between the two sub-catchments — the stage height at which
+    inundation from either side would connect the two nodes' floodplains.
+
+    Returns
+    -------
+    min_hand : minimum HAND value along corridor (m); NaN if all NaN
+    z_saddle : absolute DEM elevation (m OD) at the minimum-HAND pixel;
+               used by the activation gate in st_gnn_hand_edge.py to
+               compare against reconstructed water-surface elevation.
     """
-    H, W = hand.shape
-    # Sample the middle 70% of corridor (skip 15% at each end).
-    # OPW gauges sit on rivers — HAND≈0 at t=0 and t=1 (endpoints).
-    # We want the divide HAND in the middle, not the gauge stream cells.
-    t_vals = np.linspace(0.15, 0.85, n_samples)
-
+    H, W    = hand.shape
+    t_vals  = np.linspace(0.15, 0.85, n_samples)
     min_hand = np.inf
     z_saddle = np.nan
+
     for t in t_vals:
-        # Centreline point
         e = e1 + t * (e2 - e1)
         n = n1 + t * (n2 - n1)
-
-        # Perpendicular direction (normalised)
-        dx, dy = e2 - e1, n2 - n1
-        length = max(np.sqrt(dx**2 + dy**2), 1.0)
-        perp_e, perp_n = -dy / length, dx / length
-
-        # Centreline-only sampling.
-        # Perpendicular offsets (±500 m) were removed because they cross into
-        # adjacent river channels, returning HAND≈0 and masking real divides.
-        # Profile diagnostic confirmed centreline values of 14–72 m being
-        # overridden by perpendicular samples hitting nearby stream cells.
         row, col = world_to_pixel(e, n, affine)
         if 0 <= row < H and 0 <= col < W:
             v = hand[row, col]
@@ -346,20 +529,13 @@ def sample_corridor_hand(
 
 
 def find_candidate_pairs(
-    eastings:  np.ndarray,
-    northings: np.ndarray,
+    eastings:          np.ndarray,
+    northings:         np.ndarray,
     static_edge_index: np.ndarray | None,
-    max_dist_km: float,
+    max_dist_km:       float,
 ) -> list[tuple[int, int, float]]:
-    """
-    Find all gauge node pairs within max_dist_km that are NOT already
-    connected by a permanent river network edge.
-
-    Returns list of (src_idx, dst_idx, dist_km).
-    """
-    N = len(eastings)
-
-    # Existing edges to exclude
+    """Return all gauge pairs within max_dist_km not in static edge set."""
+    N        = len(eastings)
     existing = set()
     if static_edge_index is not None:
         for i in range(static_edge_index.shape[1]):
@@ -371,20 +547,18 @@ def find_candidate_pairs(
         for j in range(i + 1, N):
             if (i, j) in existing:
                 continue
-            de = eastings[i]  - eastings[j]
-            dn = northings[i] - northings[j]
+            de  = eastings[i]  - eastings[j]
+            dn  = northings[i] - northings[j]
             dist_km = np.sqrt(de**2 + dn**2) / 1000.0
             if dist_km <= max_dist_km:
                 candidates.append((i, j, dist_km))
-
     return candidates
 
 
 def load_static_edges(graph_dir: Path) -> np.ndarray | None:
-    """Load existing static edge_index from edges.csv or return None."""
     edges_csv = graph_dir / "edges.csv"
     if not edges_csv.exists():
-        print(f"  edges.csv not found at {edges_csv} — no edges excluded")
+        print(f"  edges.csv not found — no pairs excluded")
         return None
     df = pd.read_csv(edges_csv)
     if "src" in df.columns and "dst" in df.columns:
@@ -392,26 +566,33 @@ def load_static_edges(graph_dir: Path) -> np.ndarray | None:
     return None
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════════════
+
 def run(
     dem_path:    Path,
     nodes_path:  Path,
     out_path:    Path,
     max_dist_km: float,
     hand_min_m:  float,
-):
-    print("=" * 60)
+) -> None:
+    print("=" * 62)
     print("HAND edge precomputation — Lee catchment")
-    print(f"  DEM:          {dem_path}")
-    print(f"  Nodes:        {nodes_path}")
-    print(f"  Max distance: {max_dist_km} km")
-    print(f"  HAND floor:   {hand_min_m} m")
-    print("=" * 60)
+    print(f"  Algorithm : Nobre et al. (2011), J. Hydrology 404, 13-29")
+    print(f"  Pit fill  : Priority-Flood (Barnes et al. 2014)")
+    print(f"  D8        : O'Callaghan & Mark (1984)")
+    print(f"  DEM       : {dem_path}")
+    print(f"  Nodes     : {nodes_path}")
+    print(f"  Max dist  : {max_dist_km} km")
+    print(f"  HAND floor: {hand_min_m} m")
+    print("=" * 62)
 
-    # ── 1. Compute HAND ───────────────────────────────────────────────
+    # ── 1–5: Full HAND pipeline ───────────────────────────────────────
     fdir_out = out_path.parent / "fdir.npz"
     hand, affine, crs, dem_data = compute_hand(dem_path, fdir_path=fdir_out)
 
-    # ── 2. Load node ITM coordinates ──────────────────────────────────
+    # ── Node ITM coordinates ──────────────────────────────────────────
     eastings, northings, refs = nodes_to_itm(nodes_path)
     N = len(eastings)
     print(f"\nNodes loaded: {N}")
@@ -420,58 +601,56 @@ def run(
     if N > 5:
         print(f"  … (+{N-5} more)")
 
-    # ── 3. Find candidate pairs ───────────────────────────────────────
-    static_ei = load_static_edges(nodes_path.parent)
+    # ── Candidate pairs ───────────────────────────────────────────────
+    static_ei  = load_static_edges(nodes_path.parent)
     candidates = find_candidate_pairs(eastings, northings, static_ei, max_dist_km)
     print(f"\nCandidate pairs within {max_dist_km} km: {len(candidates)}")
 
-    # ── 4. Sample HAND along each corridor ───────────────────────────
+    # ── Sample corridor HAND ──────────────────────────────────────────
     srcs, dsts, thresholds, dists, saddles = [], [], [], [], []
-    skipped_low = 0
-    skipped_no_saddle = 0
+    skipped_low     = 0
+    skipped_nodata  = 0
 
     for k, (i, j, dist_km) in enumerate(candidates):
         if (k + 1) % 10 == 0 or k == len(candidates) - 1:
-            print(f"  Processing pair {k+1}/{len(candidates)} …", end="\r")
+            print(f"  Pair {k+1}/{len(candidates)} …", end="\r")
 
         min_hand, z_saddle = sample_corridor_hand(
             hand, dem_data, affine,
-            eastings[i], northings[i],
-            eastings[j], northings[j],
-            corridor_half_w=CORRIDOR_W,
+            eastings[i],  northings[i],
+            eastings[j],  northings[j],
             n_samples=SAMPLE_STEP,
         )
 
         if np.isnan(min_hand):
-            continue   # off-raster or all NaN
+            continue                       # corridor entirely off-raster
         if min_hand < hand_min_m:
             skipped_low += 1
-            continue   # already in same drainage basin
+            continue                       # same drainage basin
         if np.isnan(z_saddle):
-            # min_hand was valid but the DEM was NaN at that exact pixel
-            # (shouldn't normally happen since hand is NaN wherever dem is
-            # NaN, but guarded explicitly rather than silently saving NaN
-            # into a buffer the model will later read as a real elevation).
-            skipped_no_saddle += 1
-            continue
+            skipped_nodata += 1
+            continue                       # DEM nodata at saddle pixel
 
-        srcs.append(i);         dsts.append(j)
-        srcs.append(j);         dsts.append(i)   # bidirectional
-        thresholds.append(min_hand); thresholds.append(min_hand)
-        dists.append(dist_km);  dists.append(dist_km)
-        saddles.append(z_saddle); saddles.append(z_saddle)
+        # Add both directions (inundation can spread either way)
+        for src, dst in [(i, j), (j, i)]:
+            srcs.append(src); dsts.append(dst)
+            thresholds.append(min_hand)
+            dists.append(dist_km)
+            saddles.append(z_saddle)
 
     print()
-    print(f"\nHAND edges accepted:   {len(srcs)//2} pairs → {len(srcs)} directed edges")
-    print(f"Skipped (low HAND < {hand_min_m} m): {skipped_low} pairs")
-    if skipped_no_saddle:
-        print(f"Skipped (no valid DEM at saddle pixel): {skipped_no_saddle} pairs")
+    n_pairs = len(srcs) // 2
+    print(f"\nHAND edges accepted : {n_pairs} pairs → {len(srcs)} directed")
+    print(f"Skipped (HAND < {hand_min_m} m): {skipped_low} pairs "
+          f"(same basin)")
+    if skipped_nodata:
+        print(f"Skipped (DEM nodata at saddle): {skipped_nodata} pairs")
 
     if not srcs:
-        print("WARNING: no HAND edges found. Check DEM coverage and node coordinates.")
+        print("WARNING: no HAND edges. Check DEM coverage and node coords.")
         sys.exit(1)
 
-    # ── 5. Save ───────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         out_path,
@@ -482,41 +661,36 @@ def run(
         z_saddle_m       = np.array(saddles,    dtype=np.float32),
     )
     print(f"\nSaved: {out_path}")
-    print(f"  src/dst:        {len(srcs)} entries")
-    print(f"  hand_threshold: [{min(thresholds):.2f}, {max(thresholds):.2f}] m")
-    print(f"  overland_dist:  [{min(dists):.2f}, {max(dists):.2f}] km")
-    print(f"  z_saddle_m:     [{min(saddles):.2f}, {max(saddles):.2f}] m OD")
+    print(f"  hand_threshold : [{min(thresholds):.2f}, {max(thresholds):.2f}] m")
+    print(f"  overland_dist  : [{min(dists):.2f}, {max(dists):.2f}] km")
+    print(f"  z_saddle_m     : [{min(saddles):.2f}, {max(saddles):.2f}] m OD")
 
-    # Print summary table
     print("\nAccepted HAND edge pairs:")
-    print(f"  {'src_ref':12s} {'dst_ref':12s} {'dist_km':>8s} {'hand_thr_m':>12s} {'z_saddle_m':>12s}")
+    print(f"  {'src':12s} {'dst':12s} {'dist_km':>8s} "
+          f"{'hand_thr_m':>12s} {'z_saddle_m':>12s}")
     seen = set()
-    for i, (s, d, t, dist, z) in enumerate(zip(srcs, dsts, thresholds, dists, saddles)):
-        if (min(s, d), max(s, d)) not in seen:
-            seen.add((min(s, d), max(s, d)))
-            print(f"  {refs[s]:12s} {refs[d]:12s} {dist:8.2f} {t:12.3f} {z:12.2f}")
-
+    for s, d, t, dist, z in zip(srcs, dsts, thresholds, dists, saddles):
+        key = (min(s, d), max(s, d))
+        if key not in seen:
+            seen.add(key)
+            print(f"  {refs[s]:12s} {refs[d]:12s} {dist:8.2f} "
+                  f"{t:12.3f} {z:12.2f}")
     print("\nDone.")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
-        description="Precompute HAND candidate edges for Phase 2 ST-GNN"
-    )
+        description="Precompute HAND edges following Nobre et al. (2011)")
     p.add_argument("--dem",      type=Path, default=DEM_PATH)
     p.add_argument("--nodes",    type=Path, default=NODES_PATH)
     p.add_argument("--out",      type=Path, default=OUT_PATH)
-    p.add_argument("--max-dist", type=float, default=MAX_DIST_KM,
-                   help="Maximum overland search distance (km). Default 5.0")
-    p.add_argument("--hand-min", type=float, default=HAND_MIN_M,
-                   help="Minimum HAND threshold to accept (m). Default 0.5")
+    p.add_argument("--max-dist", type=float, default=MAX_DIST_KM)
+    p.add_argument("--hand-min", type=float, default=HAND_MIN_M)
     args = p.parse_args()
 
     if not args.dem.exists():
-        print(f"ERROR: DEM not found: {args.dem}")
-        sys.exit(1)
+        print(f"ERROR: DEM not found: {args.dem}"); sys.exit(1)
     if not args.nodes.exists():
-        print(f"ERROR: nodes.csv not found: {args.nodes}")
-        sys.exit(1)
+        print(f"ERROR: nodes.csv not found: {args.nodes}"); sys.exit(1)
 
     run(args.dem, args.nodes, args.out, args.max_dist, args.hand_min)
