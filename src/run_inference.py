@@ -109,20 +109,38 @@ def group_by_model_and_horizon(leaves: list[Path]) -> dict:
 # Module paths relative to src/ (which is on sys.path after the fix above).
 # Do NOT include the "src." prefix — that caused "src.models is not a package"
 # when running from the project root.
+# MODEL_REGISTRY = {
+#     "gru":              "models.baseline_gru.PerNodeGRU",
+#     "lstm":             "models.baseline_lstm.PerNodeLSTM",
+#     "st_gnn_static":    "models.st_gnn_flood.STGNNFloodModel",
+#     "st_gnn_sar":       "models.st_gnn_flood.STGNNFloodModel",
+#     "st_gnn_dyn_edge":  "models.st_gnn_dyn_edge.STGNNDynEdge",
+#     "st_gnn_hand_edge": "models.st_gnn_hand_edge.STGNNHANDEdge",
+#     "dfc_gnn": "models.dfc_gnn.DFCGNNFlood",
+# }
+
 MODEL_REGISTRY = {
     "gru":              "models.baseline_gru.PerNodeGRU",
     "lstm":             "models.baseline_lstm.PerNodeLSTM",
-    "st_gnn_static":    "models.st_gnn_flood.STGNNFloodModel",
-    "st_gnn_sar":       "models.st_gnn_flood.STGNNFloodModel",
+    "ealstm":           "models.baseline_ealstm.PerNodeEALSTM",
+
+    "st_gnn":           "models.st_gnn_flood.STGNNFloodModel",
     "st_gnn_dyn_edge":  "models.st_gnn_dyn_edge.STGNNDynEdge",
     "st_gnn_hand_edge": "models.st_gnn_hand_edge.STGNNHANDEdge",
-    "dfc_gnn": "models.dfc_gnn.DFCGNNFlood",
+
+    "dfc_gnn":          "models.dfc_gnn.DFCGNNFlood",
+    "dfc_gnn_unified":  "models.dfc_gnn_unified.DFCGNNUnified",
 }
 
 def resolve_model_tag(ckpt_dir: Path) -> str:
     """Infer model tag from checkpoint path (first part after CKPT_ROOT)."""
     rel   = ckpt_dir.relative_to(CKPT_ROOT)
     first = rel.parts[0]
+    # Exact match first — prevents "dfc_gnn_unified" being matched
+    # as "dfc_gnn" by the startswith prefix rule below.
+    if first in MODEL_REGISTRY:
+        return first
+    # Prefix fallback for legacy or variant checkpoint names
     for key in MODEL_REGISTRY:
         if first.startswith(key) or key.startswith(first):
             return key
@@ -192,14 +210,28 @@ def load_model(ckpt_dir: Path, device: torch.device):
         dropout    = hp.get("dropout", 0.1),
     )
 
-    if tag in ("gru", "lstm"):
-        n_layers = hp.get("gru_layers", hp.get("lstm_layers", 2))
-        key      = "gru_layers" if tag == "gru" else "lstm_layers"
+    # Prepare cleaned state dict BEFORE model construction so that
+    # dfc_gnn_unified can read buffer shapes from the checkpoint itself,
+    # guaranteeing size consistency regardless of which hand_edges.npz
+    # is currently on disk.
+    state_key = "state_dict" if "state_dict" in ckpt else "model_state_dict"
+    sd = ckpt[state_key]
+    # Strip torch.compile() _orig_mod prefix (full-model and submodule).
+    if any("_orig_mod." in k for k in sd):
+        sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+
+    if tag in ("gru", "lstm", "ealstm"):
+        # Each baseline uses a different kwarg name for layer depth
+        _LAYER_KEY = {"gru": "gru_layers", "lstm": "lstm_layers",
+                      "ealstm": "ea_layers"}
+        key      = _LAYER_KEY[tag]
+        n_layers = hp.get("gru_layers", hp.get("lstm_layers",
+                   hp.get("ea_layers", 2)))
         model    = cls(f_dyn=f_dyn, f_static=f_static,
                        hidden=hp.get("hidden", 64),
                        **{key: n_layers},
                        t_out=t_out, dropout=hp.get("dropout", 0.1))
-    elif tag in ("st_gnn_static", "st_gnn_sar"):
+    elif tag == "st_gnn":
         model = cls(**common,
                     f_edge      = f_edge_raw,
                     gat_heads   = hp.get("gat_heads", 2),
@@ -216,7 +248,16 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     discharge_ref  = hp.get("discharge_ref", 1.0))
     elif tag == "st_gnn_hand_edge":
         # Phase 2: f_edge = raw + 1 (dynamic feature for both edge classes)
-        hand  = np.load(GRAPH_DIR / "hand_edges.npz")
+        gauge_datum = sd["gauge_datum"].cpu()
+        stage_range = sd["stage_range"].cpu()
+        z_saddle = sd["z_saddle"].cpu()
+
+        hand_src = sd["hand_src"].cpu()
+        hand_dst = sd["hand_dst"].cpu()
+        hand_thr = sd["hand_threshold"].cpu()
+        hand_dist = sd["hand_dist_norm"].cpu() * 5.0
+
+        # hand  = np.load(GRAPH_DIR / "hand_edges.npz")
         model = cls(**common,
                     f_edge             = f_edge_raw + 1,
                     gat_heads          = hp.get("gat_heads", 2),
@@ -224,10 +265,15 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     sar_emb_dim        = hp.get("sar_emb_dim", 0),
                     discharge_idx      = hp.get("discharge_idx", 3),
                     discharge_ref      = hp.get("discharge_ref", 1.0),
-                    hand_src           = torch.from_numpy(hand["src"].astype(np.int64)),
-                    hand_dst           = torch.from_numpy(hand["dst"].astype(np.int64)),
-                    hand_threshold     = torch.from_numpy(hand["hand_threshold"]),
-                    hand_overland_dist = torch.from_numpy(hand["overland_dist_km"]))
+
+                    z_saddle           = z_saddle,
+                    gauge_datum        = gauge_datum,
+                    stage_range        = stage_range,
+
+                    hand_src           = hand_src,
+                    hand_dst           = hand_dst,
+                    hand_threshold     = hand_thr,
+                    hand_overland_dist = hand_dist)
     elif tag == "dfc_gnn":
         # DFC-GNN: edge features are buffers inside the model;
         # use build_dfc_gnn() factory so they are loaded correctly.
@@ -250,12 +296,55 @@ def load_model(ckpt_dir: Path, device: torch.device):
             lambda_flood = hp.get("lambda_flood", 0.1),
             device       = "cpu",
         )
+    elif tag == "dfc_gnn_unified":
+        # DFCGNNUnified: Manning conductance + HAND topology + elevation
+        # gate on the 28-edge river network.
+        # IMPORTANT: read ALL graph buffer shapes from the checkpoint state
+        # dict (sd), not from hand_edges.npz on disk.  The on-disk file may
+        # have been regenerated with a different HAND threshold after training,
+        # producing a different number of candidate edges (e.g. 50 vs 54).
+        # Using sd guarantees the model is constructed with the exact shapes
+        # that were used during training, so load_state_dict succeeds.
+        from models.dfc_gnn_unified import DFCGNNUnified
+        # Extract graph topology from checkpoint buffers
+        river_ei    = sd["river_edge_index"].cpu()
+        river_ea    = sd["river_edge_attr_static"].cpu()
+        node_elev   = sd["node_elev"].cpu()
+        gauge_datum = sd["gauge_datum"].cpu()
+        stage_range = sd["stage_range"].cpu()
+        hand_src    = sd["hand_src"].cpu()
+        hand_dst    = sd["hand_dst"].cpu()
+        hand_thr    = sd["hand_threshold"].cpu()    # raw metres
+        z_saddle    = sd["z_saddle"].cpu()
+        # hand_dist_norm = overland_dist / 5.0 in the checkpoint;
+        # pass un-normalised value so the constructor normalises correctly
+        hand_dist   = sd["hand_dist_norm"].cpu() * 5.0
+        model = DFCGNNUnified(
+            n_nodes              = node_elev.shape[0],
+            f_dyn                = f_dyn,
+            d_model              = hp.get("hidden", 64),
+            n_heads              = hp.get("gat_heads", 4),
+            T_out                = t_out,
+            edge_index           = river_ei,
+            edge_attr_static     = river_ea,
+            node_elev            = node_elev,
+            hand_src             = hand_src,
+            hand_dst             = hand_dst,
+            hand_threshold       = hand_thr,
+            hand_overland_dist   = hand_dist,
+            z_saddle             = z_saddle,
+            gauge_datum          = gauge_datum,
+            stage_range          = stage_range,
+            n_gru_layers         = hp.get("gru_layers", 2),
+            dropout              = hp.get("dropout", 0.1),
+            lambda_flood         = hp.get("lambda_flood", 0.1),
+            discharge_idx        = hp.get("discharge_idx", 3),
+        )
     else:
         raise ValueError(f"Unhandled tag: {tag}. Known: {list(MODEL_REGISTRY)}")
 
     # Load weights — training scripts save under "state_dict"
-    state_key = "state_dict" if "state_dict" in ckpt else "model_state_dict"
-    model.load_state_dict(ckpt[state_key])
+    model.load_state_dict(sd)
     model.eval().to(device)
 
     # Write back derived dimensions so test_dataloader can use them
@@ -535,6 +624,10 @@ def compute_extended_metrics(
         else:
             with open(bf_path) as f:
                 bf_dict = json.load(f)
+            # Filter out non-numeric entries (description/metadata strings)
+            # that may appear as top-level keys in bankfull_thresholds.json.
+            bf_dict = {k: v for k, v in bf_dict.items()
+                       if isinstance(v, (int, float))}
             N = target.shape[1]
             # bankfull_thresholds.json is {node_ref: threshold_m} in mOD.
             # Convert to stage anomaly: threshold_anom = threshold_mOD - mean_stage_mOD
@@ -604,33 +697,40 @@ def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
     # needs_graph: models that take (x_seq, na, ei, ea) as forward args
     # DFC-GNN stores edge_index/edge_attr as registered buffers internally;
     # it only takes x_seq and returns (stage_pred, flood_logits).
-    needs_graph = tag not in ("gru", "lstm", "dfc_gnn")
+    # Models that take (x_seq, node_attr, edge_index, edge_attr) as forward args.
+    # No-graph baselines (gru/lstm/ealstm) and DFC variants (internal buffers)
+    # are excluded; they use (x_seq, node_attr) or (x_seq,) respectively.
+    needs_graph = tag not in ("gru", "lstm", "ealstm",
+                              "dfc_gnn", "dfc_gnn_unified")
     ei, ea, na  = load_graph(device)
     if not needs_graph:
         ei, ea = None, None
-    if tag == "dfc_gnn":
-        na = None   # DFC-GNN does not use static node_attr
+    # DFC variants store edges as registered buffers; no external node_attr.
+    if tag in ("dfc_gnn", "dfc_gnn_unified"):
+        na = None
 
     preds = []
     for x_seq, y_seq, mask in dl:
         x_seq = x_seq.to(device)
-        if tag == "dfc_gnn":
-            # DFC-GNN: forward(x) → (stage_pred [B,T_out,N], flood_logits [B,N])
-            # Stage head outputs delta predictions; take step 0.
+        if tag in ("dfc_gnn", "dfc_gnn_unified"):
+            # Both DFC variants: forward(x) → (stage [B,T_out,N], flood [B,N])
+            # Edge_index/attr are registered buffers, not forward() arguments.
             output = model(x_seq)
             delta  = output[0] if isinstance(output, (tuple, list)) else output
         elif needs_graph:
             delta = model(x_seq, na, ei, ea)
         else:
+            # No-graph baselines (gru / lstm / ealstm):
+            # forward(x_seq, node_attr, **kwargs) — node_attr required.
             delta = model(x_seq, na)
         # Absolute stage = predicted delta + last observed stage anomaly.
-        # x_seq[:, -1, :, 0] = stage anomaly at the last input timestep
-        # (feature 0 is stage_anomaly in X.npy, same variable as y.npy).
-        # This reconstruction matches the training eval in all train_*.py scripts:
-        #   abs_pred = last_obs.unsqueeze(1) + delta_pred
+        # x_seq[:, -1, :, 0] = stage anomaly at the last input timestep.
+        # .detach() required: DFC models have requires_grad=True params
+        # (HANDDecoder log_tau) whose gradient propagates through the
+        # output tensor when called outside torch.no_grad().
         last_obs  = x_seq[:, -1, :, 0]                   # [B, N]
         abs_pred  = delta[:, 0, :] + last_obs             # [B, N] — 1-step ahead
-        preds.append(abs_pred.cpu().numpy())
+        preds.append(abs_pred.detach().cpu().numpy())
 
     pred = np.concatenate(preds, axis=0)   # [T_test, N]
     np.save(ckpt_dir / "test_predictions.npy", pred)
