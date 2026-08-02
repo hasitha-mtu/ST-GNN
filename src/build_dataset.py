@@ -632,10 +632,19 @@ if __name__ == "__main__":
     build_dataset(save=True)
     inspect_dataset()
 
+    # import xarray as xr
+    #
+    # data = xr.open_dataset("dataset/era5/era5_land_sm_lee.nc")
+    # print(f'mean swvl1: {data["swvl1"].values.mean()}')
+
+
 # if __name__ == "__main__":
 #     import xarray as xr  # reads and handles netcdf files with metadata
 #     data = xr.open_dataset(ERA5_SM_FILE)
 #     # print(data.variables)
 #     print(data.variables.keys())
+#     ds_sm = compute_sm_features(str(ERA5_SM_FILE), layers=SM_LAYERS)
+#     print(f'ds_sm.keys : {ds_sm.keys()}')
+#     ds_sm.to_dataframe().to_csv("ds_sm.csv")
 
 

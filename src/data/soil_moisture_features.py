@@ -46,53 +46,304 @@ def download_era5_land_sm(
     layers: list[str] = ACTIVE_LAYERS,
 ) -> None:
     """
-    Download ERA5-Land volumetric soil water layers from the Copernicus
-    Climate Data Store (CDS).
+    DEPRECATED: single-block download fails silently with new CDS API.
+    Use download_era5_land_sm_yearly() + merge_yearly_era5() instead.
 
-    Prerequisites:
-        pip install cdsapi
-        ~/.cdsapirc:
-            url: https://cds.climate.copernicus.eu/api/v2
-            key: <your-uid>:<your-api-key>
+    Left in place for backward compatibility — delegates to the
+    corrected yearly downloader.
+    """
+    import os
+    out_p   = Path(output_path)
+    out_dir = out_p.parent / "yearly"
+    paths   = download_era5_land_sm_yearly(
+        output_dir=str(out_dir),
+        years=years,
+        months=months,
+        layers=layers,
+    )
+    merge_yearly_era5(paths, output_path)
 
-    Saves hourly netCDF to output_path.
-    Dataset DOI: https://doi.org/10.24381/cds.e2161bac
+
+def download_era5_land_sm_yearly(
+    output_dir:  str,
+    years:       list[int],
+    months:      list[int] = list(range(1, 13)),
+    layers:      list[str] = ACTIVE_LAYERS,
+) -> list[str]:
+    """
+    Download ERA5-Land soil moisture month-by-month (one CDS request per month).
+
+    Why month-by-month instead of year-by-year:
+        A full-year request (12 months × 31 days × 24 hr × Lee bbox × 2 vars)
+        exceeds the CDS cost/size limit per request, causing a 403 error:
+            "cost limits exceeded / Your request is too large".
+        Monthly requests (~31 days each) stay well within the limit and match
+        the approach used in the working download_era5_sm.py script
+        (download_chunk_gridded, default --chunk-days 30).
+
+    Request format mirrors download_era5_sm.py (download_chunk_gridded):
+        "data_format":     "netcdf"
+        "download_format": "unarchived"   ← required post-2024 CDS API
+        "product_type":    ["reanalysis"]
+
+    Parameters
+    ----------
+    output_dir : str
+        Directory for per-month NetCDF files.
+        Each file is saved as era5_land_sm_{year}_{month:02d}.nc
+        Existing files larger than 10 KB are skipped (resume support).
+    years : list[int]
+        Calendar years, e.g. [2023, 2024, 2025, 2026].
+    months : list[int]
+        Months to include (default: all 12). For the current year,
+        months within the NRT lag (7 days before today) are skipped.
+    layers : list[str]
+        Soil water layer keys, e.g. ["swvl1", "swvl2"].
+
+    Returns
+    -------
+    list[str]  sorted paths to all downloaded per-month NetCDF files.
+               Pass these to merge_yearly_era5() to create the combined file.
+
+    Usage
+    -----
+    from src.data.soil_moisture_features import (
+        download_era5_land_sm_yearly, merge_yearly_era5)
+
+    paths = download_era5_land_sm_yearly(
+        output_dir="dataset/era5/monthly",
+        years=[2023, 2024, 2025, 2026],
+    )
+    merge_yearly_era5(paths, "dataset/era5/era5_land_sm_lee.nc")
     """
     import cdsapi
-    c = cdsapi.Client()
+    import datetime
+    import calendar
+    import time as _time
+    import zipfile
+    import xarray as xr
 
-    # Map internal names to CDS variable names
-    cds_var_map = {
+    CDS_VAR_MAP = {
         "swvl1": "volumetric_soil_water_layer_1",
         "swvl2": "volumetric_soil_water_layer_2",
         "swvl3": "volumetric_soil_water_layer_3",
         "swvl4": "volumetric_soil_water_layer_4",
     }
-    variables = [cds_var_map[l] for l in layers]
+    variables = [CDS_VAR_MAP[l] for l in layers]
 
-    year_strs  = [str(y) for y in years]
-    month_strs = [f"{m:02d}" for m in months]
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    c.retrieve(
-        "reanalysis-era5-land",
-        {
-            "variable":      variables,
-            "product_type":  "reanalysis",
-            "year":          year_strs,
-            "month":         month_strs,
-            "day":           [f"{d:02d}" for d in range(1, 32)],
-            "time":          [f"{h:02d}:00" for h in range(24)],
-            "area":          [
-                ERA5_BBOX["north"],
-                ERA5_BBOX["west"],
-                ERA5_BBOX["south"],
-                ERA5_BBOX["east"],
-            ],
-            "format": "netcdf",
-        },
-        output_path,
-    )
-    print(f"ERA5-Land soil moisture saved to {output_path}")
+    today     = datetime.date.today()
+    safe_date = today - datetime.timedelta(days=7)
+
+    # One CDS client for the entire session
+    client = cdsapi.Client()
+
+    saved: list[str] = []
+
+    for year in sorted(years):
+        for month in sorted(months):
+
+            # Skip months beyond the NRT lag for the current year
+            if year == today.year and month > safe_date.month:
+                print(f"  [{year}-{month:02d}] Skipping: beyond NRT lag "
+                      f"(safe up to {safe_date.month:02d})")
+                continue
+            if year > today.year:
+                print(f"  [{year}] Skipping: future year")
+                break
+
+            out_path = out_dir / f"era5_land_sm_{year}_{month:02d}.nc"
+
+            # Resume support: skip if already downloaded and valid
+            if out_path.exists() and out_path.stat().st_size > 10_000:
+                print(f"  [{year}-{month:02d}] Already exists "
+                      f"({out_path.stat().st_size // 1024:,} KB) — skipping")
+                saved.append(str(out_path))
+                continue
+
+            # All days in this month
+            n_days = calendar.monthrange(year, month)[1]
+            day_strs = [f"{d:02d}" for d in range(1, n_days + 1)]
+
+            print(f"  [{year}-{month:02d}] Requesting {n_days} days × "
+                  f"{len(variables)} variables …")
+
+            # Request format identical to the working download_chunk_gridded()
+            request = {
+                "product_type":     ["reanalysis"],
+                "variable":         variables,
+                "year":             str(year),
+                "month":            f"{month:02d}",
+                "day":              day_strs,
+                "time":             [f"{h:02d}:00" for h in range(24)],
+                "area": [
+                    ERA5_BBOX["north"],   # N
+                    ERA5_BBOX["west"],    # W
+                    ERA5_BBOX["south"],   # S
+                    ERA5_BBOX["east"],    # E
+                ],
+                "data_format":      "netcdf",
+                "download_format":  "unarchived",
+            }
+
+            success = False
+            for attempt in range(1, 4):   # 3 attempts with backoff
+                try:
+                    client.retrieve("reanalysis-era5-land", request,
+                                    str(out_path))
+
+                    # Handle case where CDS returned a zip despite "unarchived"
+                    if out_path.exists() and zipfile.is_zipfile(out_path):
+                        print(f"  [{year}-{month:02d}] CDS returned zip — extracting …")
+                        _recovered = _extract_zip_nc(out_path)
+                        if _recovered:
+                            out_path = _recovered
+                        else:
+                            raise ValueError("Zip extraction failed")
+
+                    # Validate: catch silent NaN downloads
+                    with xr.open_dataset(str(out_path), engine="netcdf4") as _ds:
+                        _v = layers[0]
+                        if _v in _ds:
+                            _mean = float(_ds[_v].mean())
+                            if not (_mean == _mean) or abs(_mean) < 1e-9:
+                                raise ValueError(
+                                    f"{_v}.mean()={_mean:.6f} — expected ~0.30 "
+                                    f"m³/m³. CDS may have returned a zip archive "
+                                    f"instead of a plain .nc despite "
+                                    f"download_format='unarchived'.")
+                            print(f"  [{year}-{month:02d}] OK — "
+                                  f"{_v}.mean()={_mean:.4f} m³/m³  "
+                                  f"→ {out_path.name}")
+
+                    saved.append(str(out_path))
+                    success = True
+                    break
+
+                except Exception as exc:
+                    print(f"  [{year}-{month:02d}] Attempt {attempt}/3 failed: {exc}")
+                    if out_path.exists():
+                        out_path.unlink()
+                    if attempt < 3:
+                        wait = 60 * attempt
+                        print(f"  Retrying in {wait}s …")
+                        _time.sleep(wait)
+
+            if not success:
+                print(f"  [{year}-{month:02d}] ALL 3 ATTEMPTS FAILED — skipping")
+
+    return sorted(saved)
+
+
+def _extract_zip_nc(zip_path: Path) -> Path | None:
+    """
+    Extract NetCDF file(s) from a CDS zip delivery and merge into one file.
+    Returns the path to the extracted/merged NetCDF, or None on failure.
+    Internal helper for download_era5_land_sm_yearly().
+    """
+    import zipfile, tempfile
+    import xarray as xr
+
+    if not zipfile.is_zipfile(zip_path):
+        return None
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            nc_members = [m for m in zf.namelist() if m.endswith(".nc")]
+            if not nc_members:
+                return None
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                extracted = []
+                for member in nc_members:
+                    dst = Path(tmp_dir) / Path(member).name
+                    with zf.open(member) as src_f, open(dst, "wb") as df:
+                        df.write(src_f.read())
+                    extracted.append(dst)
+                datasets = [xr.open_dataset(p, engine="netcdf4")
+                            for p in extracted]
+                merged = xr.merge(datasets, compat="override")
+                tmp_out = zip_path.with_suffix(".nc.tmp")
+                merged.to_netcdf(str(tmp_out))
+                for ds in datasets: ds.close()
+                merged.close()
+        zip_path.unlink()
+        tmp_out.rename(zip_path)
+        return zip_path
+    except Exception:
+        return None
+
+
+def merge_yearly_era5(
+    yearly_paths: list[str],
+    output_path:  str,
+    overwrite:    bool = True,
+) -> None:
+    """
+    Concatenate per-year ERA5-Land NetCDF files into one merged file.
+
+    Call this after download_era5_land_sm_yearly().
+
+    Parameters
+    ----------
+    yearly_paths : list[str]
+        Paths returned by download_era5_land_sm_yearly(), in any order.
+        Will be sorted by filename (which sorts by year).
+    output_path : str
+        Destination for the merged NetCDF (e.g. era5_land_sm_lee.nc).
+    overwrite : bool
+        If False and output_path exists, skip merging. Default True.
+    """
+    import xarray as xr
+
+    out_p = Path(output_path)
+    if out_p.exists() and not overwrite:
+        print(f"Merge skipped — {out_p.name} exists (overwrite=False)")
+        return
+
+    if not yearly_paths:
+        raise ValueError("No yearly files to merge — yearly_paths is empty")
+
+    # Sort by path (filename encodes year)
+    sorted_paths = sorted(yearly_paths)
+    print(f"Merging {len(sorted_paths)} yearly files into {out_p.name} …")
+    for p in sorted_paths:
+        print(f"  + {Path(p).name}")
+
+    # Detect the time dimension name from the first file
+    with xr.open_dataset(sorted_paths[0]) as _probe:
+        time_dim = next(
+            (d for d in _probe.dims if "time" in d.lower()), "time")
+
+    # open_mfdataset handles large files without loading into RAM
+    with xr.open_mfdataset(
+        sorted_paths,
+        combine="nested",
+        concat_dim=time_dim,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+    ) as merged:
+        # Validate before writing
+        first_var = list(merged.data_vars)[0]
+        val = float(merged[first_var].mean())
+        if not (val == val) or abs(val) < 1e-9:
+            raise ValueError(
+                f"Merged dataset has {first_var}.mean()={val:.6f} — "
+                "check individual year files for NaN content")
+
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_netcdf(str(out_p))
+
+    size_mb = out_p.stat().st_size / 1024**2
+    print(f"Merged: {out_p.name}  ({size_mb:.1f} MB)")
+    print(f"  {first_var}.mean() = {val:.4f} m³/m³  "
+          f"(expected ~0.28–0.38 for Irish Atlantic soils)")
+    if 0.20 <= val <= 0.47:
+        print("  Validation OK — values in physical range [0.20, 0.47]")
+    else:
+        print(f"  WARNING: {first_var}.mean()={val:.4f} is outside the "
+              f"expected range [0.20, 0.47] for Irish clay-loam soils")
 
 
 # ── Step 2: Feature engineering ───────────────────────────────────────
@@ -382,6 +633,15 @@ def extract_node_sm_features(
         time_coord = "time" if "time" in ds_features.coords else "valid_time"
 
         era5_times = pd.DatetimeIndex(ds_features[time_coord].values)
+        # Strip timezone from ERA5-Land timestamps if target is tz-naive.
+        # ERA5-Land CDS files often return tz-aware UTC timestamps
+        # (2023-01-01 00:00:00+00:00) while common_index / target_timestamps
+        # is tz-naive (2023-01-01 00:00:00). pandas reindex() silently
+        # returns all-NaN when comparing aware vs naive — no error raised.
+        if era5_times.tz is not None and target_timestamps.tz is None:
+            era5_times = era5_times.tz_localize(None)
+        elif era5_times.tz is None and target_timestamps.tz is not None:
+            era5_times = era5_times.tz_localize("UTC")
 
         for feat_idx, feat_name in enumerate(feature_names):
             if feat_name not in ds_features:
@@ -403,6 +663,12 @@ def extract_node_sm_features(
         sm_matrix = np.full((T, N_nodes, n_features), np.nan, dtype=np.float32)
 
         time_coord = "time" if "time" in ds_features.coords else "valid_time"
+        # Ensure era5 time index is tz-naive for reindex compatibility
+        _era5_check = pd.DatetimeIndex(ds_features[time_coord].values)
+        if _era5_check.tz is not None and target_timestamps.tz is None:
+            # Convert era5 times to naive UTC before slicing
+            ds_features = ds_features.assign_coords(
+                {time_coord: _era5_check.tz_localize(None)})
         ds_sub = ds_features.sel(
             {time_coord: slice(
                 str(target_timestamps[0]  - pd.Timedelta("1h")),
@@ -479,3 +745,12 @@ def sm_event_report(
             f"  {sm_matrix[np.where(mask)[0][t], node_idx, sat1_idx]:>14.3f}"
             f"  {sm_matrix[np.where(mask)[0][t], node_idx, anom1_idx]:>14.4f}"
         )
+
+if __name__ == "__main__":
+    # paths = download_era5_land_sm_yearly(
+    #     output_dir="dataset/era5/monthly",
+    #     years=[2023, 2024, 2025, 2026],
+    # )
+    import glob
+    paths = sorted(glob.glob("dataset/era5/monthly/era5_land_sm_*.nc"))
+    merge_yearly_era5(paths, "dataset/era5/era5_land_sm_lee.nc")
