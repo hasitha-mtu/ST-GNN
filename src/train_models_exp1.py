@@ -94,6 +94,7 @@ from train_dfc_gnn_unified import train as _train_dfc_unified
 # DynEdge and HANDEdge: import module objects so we can patch USE_SAR
 import train_st_gnn_dyn_edge  as _mod_dyn
 import train_st_gnn_hand_edge as _mod_hand
+import train_st_gnn_soil_gate as _mod_soil
 import train_dfc_gnn          as _mod_dfc
 
 # DFC-GNN Unified: no SAR path to patch (Experiment 1 scope only — see
@@ -111,6 +112,7 @@ from utils.logger       import get_logger
 # ══════════════════════════════════════════════════════════════════════
 _mod_dyn.USE_SAR      = False   # STGNNDynEdge: no SAR FNO embeddings
 _mod_hand.USE_SAR     = False   # STGNNHANDEdge: no SAR FNO embeddings
+_mod_soil.USE_SAR     = False   # STGNNSoilGate: no SAR FNO embeddings
 _mod_dfc.USE_SAR_EDGE = False   # DFCGNNFlood: 4 terrain edge features only
 
 # ── Experiment configuration ───────────────────────────────────────────
@@ -119,10 +121,10 @@ T_IN      = 32                          # 8-hour input window
 T_OUTS    = [4, 12, 16, 24, 48]         # 1hr, 3hr, 4hr, 6hr, 12hr
 MAX_EPOCHS = 300
 
-# SEEDS     = [123]
+# SEEDS     = [43]
 # T_IN      = 32                          # 8-hour input window
-# T_OUTS    = [12]         # 1hr, 3hr, 4hr, 6hr, 12hr
-# MAX_EPOCHS = 300
+# T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
+# MAX_EPOCHS = 1
 
 # Model registry in narrative order (baselines first, then graph models,
 # then the proposed unified model last — completes the ablation ladder3
@@ -136,6 +138,7 @@ MODEL_REGISTRY = [
     ("st_gnn",           _train_st_gnn),
     ("st_gnn_dyn_edge",  _mod_dyn.train),
     ("st_gnn_hand_edge", _mod_hand.train),
+    ("st_gnn_soil_gate", _mod_soil.train),  # anticipatory SM gate
     ("dfc_gnn",          _mod_dfc.train),
     ("dfc_gnn_unified",  _train_dfc_unified),
 ]
