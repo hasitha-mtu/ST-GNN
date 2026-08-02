@@ -174,8 +174,7 @@ def train(
     t_in:      int,
     t_out:     int,
     max_epochs: int,
-    base_dir:  Path | None = None,
-) -> None:
+    base_dir:  Path | None = None):
     """
     Train STGNNSoilGate for one (seed, t_out) combination.
     Checkpoint saved to checkpoints/st_gnn_soil_gate/{seed}/{t_out}/.
@@ -439,14 +438,20 @@ def train(
     test_metrics    = compute_metrics(cat_pred, cat_tgt, cat_mask)
     persist_metrics = compute_metrics(cat_persist, cat_tgt, cat_mask)
 
+    mbe_global = float(
+        (cat_pred - cat_tgt)[cat_mask.bool()].mean()
+        if cat_mask.bool().any() else float("nan")
+    )
+
     logger.info(
-        "Test results — NSE=%.4f  RMSE=%.4f  MAE=%.4f  "
+        "Test results — NSE=%.4f  RMSE=%.4f  MAE=%.4f  MBE=%.4f  "
         "(Persist NSE=%.4f  RMSE=%.4f)",
-        test_metrics["nse"], test_metrics["rmse"], test_metrics["mae"],
+        test_metrics["nse"], test_metrics["rmse"],
+        test_metrics["mae"], mbe_global,
         persist_metrics["nse"], persist_metrics["rmse"],
     )
 
-    # Log learned gate parameters at convergence
+    # Learned gate parameters at convergence
     sat_thr_final = model.sat_threshold.item()
     sat_shp_final = model.sat_sharpness.item()
     logger.info(
@@ -457,19 +462,58 @@ def train(
     )
 
     import json
+
+    # ── test_metrics.json ─────────────────────────────────────────
     with open(ckpt_dir / "test_metrics.json", "w") as f:
         json.dump({
             **{k: round(v, 6) for k, v in test_metrics.items()},
+            "mbe":                   round(mbe_global, 6),
             "sat_threshold_learned": round(sat_thr_final, 4),
             "sat_sharpness_learned": round(sat_shp_final, 4),
+            "model":                 "st_gnn_soil_gate",
         }, f, indent=2)
 
-    # Per-node and per-step metrics for analysis scripts
-    node_df = compute_per_node_metrics(cat_pred, cat_tgt, cat_mask)
-    node_df.to_csv(ckpt_dir / "per_node_metrics.csv", index=False)
+    # ── per_node_metrics.csv ──────────────────────────────────────
+    # compute_per_node_metrics returns a list of dicts (one per node).
+    # Add ref, name, persist_nse and skill to match the format that
+    # analyse_experiments.py expects.
+    nodes_csv    = pd.read_csv(GRAPH_DIR / "nodes.csv")
+    node_rows    = compute_per_node_metrics(cat_pred,    cat_tgt, cat_mask)
+    persist_rows = compute_per_node_metrics(cat_persist, cat_tgt, cat_mask)
 
-    step_metrics = compute_per_step_metrics(cat_pred, cat_tgt, cat_mask, t_out)
+    pn_df = pd.DataFrame(node_rows)
+    pn_df["ref"]          = nodes_csv["ref"].astype(str).values
+    pn_df["name"]         = nodes_csv["name"].values
+    pn_df["persist_nse"]  = [r["nse"] for r in persist_rows]
+    pn_df["skill"]        = (
+        (pn_df["nse"] - pn_df["persist_nse"])
+        / (1 - pn_df["persist_nse"]).clip(lower=1e-8)
+    ).round(4)
+    pn_df = pn_df[["ref", "name", "n_valid", "rmse", "mae",
+                    "mbe", "nse", "persist_nse", "skill"]]
+    pn_df.to_csv(ckpt_dir / "per_node_metrics.csv", index=False)
+    logger.info("  Saved per_node_metrics.csv")
+
+    # ── per_step_metrics.json ─────────────────────────────────────
+    per_step         = compute_per_step_metrics(cat_pred,    cat_tgt, cat_mask)
+    per_step_persist = compute_per_step_metrics(cat_persist, cat_tgt, cat_mask)
+
+    for h_dict, p_dict in zip(per_step, per_step_persist):
+        pn = p_dict["nse"]
+        mn = h_dict["nse"]
+        if not (np.isnan(pn) or np.isnan(mn)) and pn < 1.0:
+            h_dict["persist_nse"] = round(pn, 6)
+            h_dict["skill"]       = round((mn - pn) / (1 - pn), 4)
+        else:
+            h_dict["persist_nse"] = float("nan")
+            h_dict["skill"]       = float("nan")
+
     with open(ckpt_dir / "per_step_metrics.json", "w") as f:
-        json.dump(step_metrics, f, indent=2)
+        json.dump(per_step, f, indent=2)
+    logger.info("  Saved per_step_metrics.json (%d steps)", len(per_step))
 
     logger.info("Done — %s", ckpt_dir)
+
+    return model, test_metrics
+
+
