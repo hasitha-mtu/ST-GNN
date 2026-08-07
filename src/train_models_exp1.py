@@ -1,46 +1,5 @@
 """
-train_models_exp1.py  —  Experiment 1 Orchestrator  (Journal of Hydrology)
 ══════════════════════════════════════════════════════════════════════════════
-Trains all eight forecasting architectures for the Experiment 1 architectural
-comparison paper targeting Journal of Hydrology.
-
-Model roster (8 trainable + 1 computed baseline):
-──────────────────────────────────────────────────
-  Persistence             computed from y.npy — zero-parameter reference
-  PerNodeGRU              per-node GRU, no graph (temporal lower bound)
-  PerNodeLSTM             per-node LSTM, no graph (temporal lower bound)
-  PerNodeEALSTM           per-node EA-LSTM (Kratzert et al. 2019),
-                          static-gated input vs. symmetric concatenation —
-                          isolates that mechanism against PerNodeLSTM
-  STGNNFloodModel         static GATConv over river network
-  STGNNDynEdge            + Manning discharge conductance (5th edge feature)
-  STGNNHANDEdge           + HAND-triggered cross-tributary topology
-  DFCGNNFlood             redesigned PhysicallyBiasedGATConv + flood head
-                          (dense 702-edge set, hard elevation gate only)
-  DFCGNNUnified           proposed model — unifies all three physics
-                          mechanisms (conductance + HAND topology + hard
-                          gate) into one attention computation, on the
-                          SAME 28-edge topology as STGNNDynEdge/HANDEdge
-                          so the ablation ladder holds the graph constant
-
-SAR policy for Experiment 1
-──────────────────────────────
-  ALL models are trained WITHOUT any Sentinel-1 SAR input.
-
-  • PerNodeGRU / PerNodeLSTM /
-    PerNodeEALSTM:                no SAR by design (no sar_emb argument)
-  • STGNNFloodModel:             trained via train_st_gnn_flood_model.py
-                                 (no-SAR script — separate from _sar variant)
-  • STGNNDynEdge:                USE_SAR = False patched at module level
-  • STGNNHANDEdge:               USE_SAR = False patched at module level
-  • DFCGNNFlood:                 USE_SAR_EDGE = False patched at module level
-                                 → uses only 4 terrain edge features
-                                 → saved to checkpoints/dfc_gnn/ (not dfc_gnn_sar)
-  • DFCGNNUnified:                no SAR argument exists — Experiment 1 scope
-                                 by construction (see train_dfc_gnn_unified.py)
-
-  train_st_gnn_flood_model_sar.py and sar_fno_encoder.py are NOT imported
-  here.  They belong entirely to Experiment 2 (train_models_exp2.py).
 
 Checkpoint structure
 ────────────────────
@@ -49,11 +8,6 @@ Checkpoint structure
   checkpoints/ealstm/{seed}/{t_out}/
   checkpoints/st_gnn/{seed}/{t_out}/
   checkpoints/st_gnn_dyn_edge/{seed}/{t_out}/
-  checkpoints/st_gnn_hand_edge/{seed}/{t_out}/
-  checkpoints/dfc_gnn/{seed}/{t_out}/            ← 4-feature, no SAR
-  checkpoints/dfc_gnn_unified/{seed}/{t_out}/    ← 28-edge topology, no SAR
-
-  results/baselines/persistence_{t_out}steps.csv
 
 Horizons
 ────────
@@ -63,12 +17,6 @@ Horizons
   T_out = 24 (6 hr)  — Irish Civil Defence activation threshold
   T_out = 48 (12 hr) — Evacuation planning threshold
 
-Usage
-──────
-  python src/train_models_exp1.py
-  python src/train_models_exp1.py --horizons 4 12 16    # subset of horizons
-  python src/train_models_exp1.py --seeds 42            # single seed (debug)
-  python src/train_models_exp1.py --skip-existing       # skip trained checkpoints
 """
 
 from __future__ import annotations
