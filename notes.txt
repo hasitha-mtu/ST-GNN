@@ -1,0 +1,20 @@
+Running SAR data preprocessing script
+ src/preprocess_sar.py --input  .\dataset\satellite\sentinel1\ --outdir dataset/sar --dtm .\dataset\dem\COP-DEM-30m.tif --shapefile .\shapefiles\Lee-catchment\Lee-catchment.shp --buffer 5000
+
+# Count how many test_metrics.json files exist
+Get-ChildItem -Recurse -Filter "test_metrics.json" .\checkpoints\ | Measure-Object
+# Should be 120
+
+$models = @("gru","lstm","ealstm","st_gnn","st_gnn_dyn_edge","st_gnn_hand_edge", "st_gnn_soil_gate", "dfc_gnn","dfc_gnn_unified")
+$seeds  = @("42","123","456")
+$horizons = @("4","12","16","24","48")
+foreach ($m in $models) {
+    foreach ($s in $seeds) {
+        foreach ($h in $horizons) {
+            $path = ".\checkpoints\$m\$s\$h\test_metrics.json"
+            if (-not (Test-Path $path)) {
+                Write-Host "MISSING: $path"
+            }
+        }
+    }
+}
