@@ -47,13 +47,15 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ── Model registry ────────────────────────────────────────────────────
 # Ordered: no-graph baselines → graph baselines → DFC-GNN (contribution)
 MODELS   = [
-    "gru",             # PerNodeGRU — temporal lower bound
-    "lstm",            # PerNodeLSTM — temporal lower bound
-    "st_gnn_static",   # STGNNFlood (static graph)
-    "st_gnn_sar",      # STGNNFlood + SAR embedding
-    "st_gnn_dyn_edge", # STGNNDynEdge — dynamic edge weights
-    "st_gnn_hand_edge",# STGNNHANDEdge — HAND-threshold topology
-    "dfc_gnn",         # DFC-GNN — physically-biased dynamic attention
+    "gru",              # PerNodeGRU            — temporal lower bound
+    "lstm",             # PerNodeLSTM           — temporal lower bound
+    "ealstm",           # PerNodeEALSTM         — static-gated temporal baseline
+    "st_gnn",           # STGNNFloodModel       — static graph baseline
+    "st_gnn_dyn_edge",  # STGNNDynEdge          — Manning conductance edges
+    "st_gnn_hand_edge", # STGNNHANDEdge         — HAND-triggered topology
+    "st_gnn_soil_gate", # STGNNSoilGate         — HAND + catchment soil-saturation gate
+    "dfc_gnn",          # DFCGNNFlood           — elevation gate + flood head
+    "dfc_gnn_unified",  # PC-DFC-GNN (proposed) — all three mechanisms unified
 ]
 SEEDS    = [42, 123, 456]
 HORIZONS = [4, 12, 16, 24, 48]  # T_out steps at 15-min → 1hr–12hr
@@ -63,38 +65,78 @@ HZ_LABEL = {4: "1 hr", 12: "3 hr", 16: "4 hr", 24: "6 hr", 48: "12 hr"}
 # Graph baselines: blue family
 # DFC-GNN (primary contribution): gold — stands out visually
 MODEL_COLORS = {
-    "gru":             "#1D9E75",   # teal
-    "lstm":            "#D85A30",   # orange-red
-    "st_gnn_static":   "#185FA5",   # dark blue
-    "st_gnn_sar":      "#4A90D9",   # medium blue
-    "st_gnn_dyn_edge": "#7B68EE",   # slate blue
-    "st_gnn_hand_edge":"#9B59B6",   # purple
-    "dfc_gnn":         "#D4A017",   # gold — primary contribution
+    "gru":              "#1D9E75",   # teal
+    "lstm":             "#D85A30",   # orange-red
+    "ealstm":           "#E67E22",   # amber — third temporal baseline
+    "st_gnn":           "#185FA5",   # dark blue
+    "st_gnn_dyn_edge":  "#7B68EE",   # slate blue
+    "st_gnn_hand_edge": "#9B59B6",   # purple
+    "st_gnn_soil_gate": "#5B2C6F",   # deep violet — HAND + soil saturation gate
+    "dfc_gnn":          "#B8860B",   # dark gold — stepping-stone DFC
+    "dfc_gnn_unified":  "#D4A017",   # bright gold — proposed model (headline)
 }
 MODEL_LABELS = {
-    "gru":             "GRU (no graph)",
-    "lstm":            "LSTM (no graph)",
-    "st_gnn_static":   "ST-GNN (static)",
-    "st_gnn_sar":      "ST-GNN+SAR",
-    "st_gnn_dyn_edge": "ST-GNN DynEdge",
-    "st_gnn_hand_edge":"ST-GNN HAND",
-    "dfc_gnn":         "DFC-GNN (proposed)",
+    "gru":              "GRU (no graph)",
+    "lstm":             "LSTM (no graph)",
+    "ealstm":           "EA-LSTM (no graph)",
+    "st_gnn":           "ST-GNN (static)",
+    "st_gnn_dyn_edge":  "ST-GNN DynEdge",
+    "st_gnn_hand_edge": "ST-GNN HAND",
+    "st_gnn_soil_gate": "ST-GNN Soil Gate",
+    "dfc_gnn":          "DFC-GNN",
+    "dfc_gnn_unified":  "PC-DFC-GNN (proposed)",
 }
 MODEL_MARKERS = {
-    "gru":             "o",
-    "lstm":            "s",
-    "st_gnn_static":   "^",
-    "st_gnn_sar":      "D",
-    "st_gnn_dyn_edge": "P",
-    "st_gnn_hand_edge":"X",
-    "dfc_gnn":         "*",
+    "gru":              "o",
+    "lstm":             "s",
+    "ealstm":           "d",   # thin diamond
+    "st_gnn":           "^",
+    "st_gnn_dyn_edge":  "P",
+    "st_gnn_hand_edge": "X",
+    "st_gnn_soil_gate": "v",   # downward triangle
+    "dfc_gnn":          "h",   # hexagon
+    "dfc_gnn_unified":  "*",   # star — proposed model
 }
 # Subset for legacy three-model comparisons (backward-compatible)
-MODELS_CORE = ["gru", "lstm", "st_gnn_static"]
+MODELS_CORE = ["gru", "lstm", "ealstm", "st_gnn"]
 
-# Persistence baseline (constant across runs — same dataset, same mask)
-PERSIST_NSE  = 0.9160
-PERSIST_RMSE = 0.0732
+# Persistence baseline — loaded per horizon from results/baselines/
+# persistence_{hz}steps.csv (written by train_models_exp1.py).
+# These are multi-step mean NSE / mean RMSE over all T_out steps,
+# averaged across all N=27 nodes.
+# Fall-back scalars used where the CSV has not been generated yet;
+# the T_out=4 value 0.6813 is confirmed from the training log.
+PERSIST_NSE_FALLBACK  = 0.6813   # T_out=4 (1 hr); from train log
+PERSIST_RMSE_FALLBACK = 0.0731
+
+def load_persistence() -> tuple[dict, dict]:
+    """Load per-horizon persistence NSE and RMSE from CSV baselines.
+
+    Returns (nse_dict, rmse_dict) keyed by horizon int.
+    Missing horizons fall back to PERSIST_NSE_FALLBACK / PERSIST_RMSE_FALLBACK.
+    """
+    base_dir = BASE_DIR / "results" / "baselines"
+    nse_d, rmse_d = {}, {}
+    for hz in HORIZONS:
+        csv_path = base_dir / f"persistence_{hz}steps.csv"
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                # CSV columns: node, nse, rmse  (one row per node)
+                nse_d[hz]  = float(df["nse"].mean())
+                rmse_d[hz] = float(df["rmse"].mean())
+                continue
+            except Exception:
+                pass
+        nse_d[hz]  = PERSIST_NSE_FALLBACK
+        rmse_d[hz] = PERSIST_RMSE_FALLBACK
+    return nse_d, rmse_d
+
+# Load at module level so all plot functions can reference these dicts.
+PERSIST_NSE_HZ, PERSIST_RMSE_HZ = load_persistence()
+# Scalar fallbacks for backward-compatible code that expects a single value.
+PERSIST_NSE  = PERSIST_NSE_HZ.get(4,  PERSIST_NSE_FALLBACK)
+PERSIST_RMSE = PERSIST_RMSE_HZ.get(4, PERSIST_RMSE_FALLBACK)
 
 # Nodes classified as having strong upstream connections (high accumulation)
 UPSTREAM_NODES = {
@@ -151,9 +193,17 @@ def load_all() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                     "nse":       tm.get("nse",       np.nan),
                     "mbe":       tm.get("mbe",       np.nan),
                     "test_loss": tm.get("test_loss", np.nan),
-                    # DFC-GNN extras (NaN for other models)
+                    # DFC-GNN stage regression extras (NaN for other models)
                     "flood_acc": tm.get("flood_acc", np.nan),
                     "n_edges":   tm.get("n_edges",   np.nan),
+                    # DFC-GNN auxiliary flood HEAD metrics from training
+                    # test evaluation (distinct from extended_metrics.json
+                    # POD/FAR which evaluate stage regression threshold
+                    # exceedance at the last forecast step only).
+                    "csi_head":  tm.get("csi",  np.nan),
+                    "pod_head":  tm.get("pod",  np.nan),
+                    "far_head":  tm.get("far",  np.nan),
+                    "f1_head":   tm.get("f1",   np.nan),
                 })
 
                 pn = pd.read_csv(pn_path)
@@ -231,7 +281,9 @@ def summary_table(global_df: pd.DataFrame) -> pd.DataFrame:
             nse_std   = sub.nse.std(ddof=1)
             rmse_mean = sub.rmse.mean()
             rmse_std  = sub.rmse.std(ddof=1)
-            skill     = (nse_mean - PERSIST_NSE) / (1 - PERSIST_NSE)
+            persist_nse_hz = PERSIST_NSE_HZ.get(hz, PERSIST_NSE_FALLBACK)
+            skill     = ((nse_mean - persist_nse_hz)
+                         / (1 - persist_nse_hz))
             row = {
                 "model":      MODEL_LABELS.get(model, model),
                 "horizon":    HZ_LABEL[hz],
@@ -248,10 +300,15 @@ def summary_table(global_df: pd.DataFrame) -> pd.DataFrame:
                 ("kge_r_mean",           "KGE r"),
                 ("kge_alpha_mean",       "KGE alpha"),
                 ("kge_beta_mean",        "KGE beta"),
-                ("pod",                  "POD"),
-                ("far",                  "FAR"),
+                ("pod",                  "POD (stage, last step)"),
+                ("far",                  "FAR (stage, last step)"),
                 ("peak_timing_mean_hr",  "Peak timing mean (hr)"),
                 ("peak_timing_median_hr","Peak timing median (hr)"),
+                # DFC-GNN flood head metrics from training test evaluation
+                ("csi_head",             "CSI (flood head)"),
+                ("pod_head",             "POD (flood head)"),
+                ("far_head",             "FAR (flood head)"),
+                ("f1_head",              "F1  (flood head)"),
             ]:
                 if col in sub.columns and sub[col].notna().any():
                     row[label] = round(float(sub[col].mean(skipna=True)), 4)
@@ -270,18 +327,36 @@ def wilcoxon_gru_vs_stgnn(node_df: pd.DataFrame) -> pd.DataFrame:
 
     The Wilcoxon signed-rank test (Wilcoxon 1945, Biometrics 1(6)) is
     appropriate here because:
-    - Paired observations (same node, same seed, aligned by index)
+    - Paired observations (same node, same seed, EXPLICITLY aligned by
+      an inner merge on ["ref", "seed"] below — not by raw row order.
+      Positional slicing (nse_a[:n], nse_b[:n]) silently mispairs
+      observations the moment either model is missing a node/seed
+      combination (e.g. a masked reservoir node, a failed run), because
+      it just truncates to the shorter array length without checking
+      that the same (node, seed) is being compared on both sides.
     - NSE differences are asymmetric and bounded above at 1.0
     - n=27 nodes × 3 seeds = 81 paired observations per comparison
+      (fewer if any model is missing rows for some node/seed)
     """
-    # Comparison pairs: all baselines vs GRU + DFC-GNN vs each baseline
+    # Comparison pairs for the ablation ladder.
+    # Each tuple: (model_a, model_b, label)
+    # Hypothesis: moving up the ladder should give significant NSE gains.
     COMPARE_PAIRS = [
-        ("gru",   "st_gnn_static",   "GRU vs ST-GNN(static)"),
-        ("gru",   "st_gnn_sar",      "GRU vs ST-GNN+SAR"),
-        ("gru",   "st_gnn_dyn_edge", "GRU vs DynEdge"),
-        ("gru",   "st_gnn_hand_edge","GRU vs HAND"),
-        ("gru",   "dfc_gnn",         "GRU vs DFC-GNN"),
-        ("st_gnn","dfc_gnn",         "ST-GNN(static) vs DFC-GNN"),
+        # Step 1: does any graph model beat the best temporal baseline?
+        ("gru",             "ealstm",           "GRU vs EA-LSTM"),
+        ("gru",             "st_gnn",           "GRU vs ST-GNN(static)"),
+        # Step 2: does physics in edges beat static graph?
+        ("st_gnn",          "st_gnn_dyn_edge",  "ST-GNN vs DynEdge"),
+        ("st_gnn",          "st_gnn_hand_edge",  "ST-GNN vs HAND"),
+        # Step 2b: does catchment-mean soil saturation gating beat
+        # datum-corrected HAND alone?
+        ("st_gnn_hand_edge","st_gnn_soil_gate",  "HAND vs Soil Gate"),
+        # Step 3: does redesigned attention beat best GATConv model?
+        ("st_gnn_hand_edge","dfc_gnn",           "HAND vs DFC-GNN"),
+        # Step 4 — KEY ABLATION: does unifying all three mechanisms help?
+        ("dfc_gnn",         "dfc_gnn_unified",   "DFC-GNN vs PC-DFC-GNN"),
+        # End-to-end: proposed vs temporal lower bound
+        ("gru",             "dfc_gnn_unified",   "GRU vs PC-DFC-GNN (proposed)"),
     ]
     avail = node_df["model"].unique()
     rows  = []
@@ -291,13 +366,23 @@ def wilcoxon_gru_vs_stgnn(node_df: pd.DataFrame) -> pd.DataFrame:
             if m_a not in avail or m_b not in avail:
                 row[label] = "n/a"
                 continue
-            nse_a = node_df[(node_df.model==m_a) & (node_df.horizon==hz)]["nse"].values
-            nse_b = node_df[(node_df.model==m_b) & (node_df.horizon==hz)]["nse"].values
-            n = min(len(nse_a), len(nse_b))
+            sub_a = node_df[(node_df.model==m_a) & (node_df.horizon==hz)][["ref", "seed", "nse"]]
+            sub_b = node_df[(node_df.model==m_b) & (node_df.horizon==hz)][["ref", "seed", "nse"]]
+            # Explicit paired merge on (ref, seed) — see docstring above.
+            # Guarantees nse_a[i] and nse_b[i] are the same node & seed,
+            # rather than relying on both DataFrames having been built in
+            # the same row order (which load_all() usually gives, but
+            # silently breaks if a run is missing for either model).
+            paired = sub_a.merge(sub_b, on=["ref", "seed"],
+                                 suffixes=("_a", "_b"), how="inner")
+            n_a, n_b, n = len(sub_a), len(sub_b), len(paired)
+            if n < n_a or n < n_b:
+                print(f"  [warn] {label} @ {HZ_LABEL[hz]}: {n_a} vs {n_b} rows, "
+                      f"only {n} paired by (ref, seed) — some data excluded")
             if n < 8:
                 row[label] = "n/a (too few)"
                 continue
-            nse_a, nse_b = nse_a[:n], nse_b[:n]
+            nse_a, nse_b = paired["nse_a"].values, paired["nse_b"].values
             try:
                 _, p = stats.wilcoxon(nse_a, nse_b, alternative="two-sided")
                 winner = MODEL_LABELS.get(m_b, m_b) \
@@ -342,17 +427,16 @@ def plot_horizon_curves(global_df: pd.DataFrame) -> None:
             rmse_means.append(sub_r.mean())
             rmse_stds.append(sub_r.std(ddof=1) if len(sub_r) > 1 else 0)
 
-        c = MODEL_COLORS[model]
-        mk = MODEL_MARKERS[model]
+        c  = MODEL_COLORS.get(model, "#888888")
+        mk = MODEL_MARKERS.get(model, "o")
+        lbl = MODEL_LABELS.get(model, model)
         ax1.errorbar(hz_ticks, nse_means, yerr=nse_stds,
-                     color=c, marker=mk, ms=7, lw=2, capsize=4,
-                     label=MODEL_LABELS[model])
+                     color=c, marker=mk, ms=7, lw=2, capsize=4, label=lbl)
         ax2.errorbar(hz_ticks, rmse_means, yerr=rmse_stds,
-                     color=c, marker=mk, ms=7, lw=2, capsize=4,
-                     label=MODEL_LABELS[model])
+                     color=c, marker=mk, ms=7, lw=2, capsize=4, label=lbl)
 
     ax1.axhline(PERSIST_NSE, color="#888780", lw=1.2, ls="--",
-                label=f"Persistence ({PERSIST_NSE})")
+                label=f"Persistence T_out=4 ({PERSIST_NSE:.4f})")
     ax1.set_xlabel("Forecast horizon", fontsize=10)
     ax1.set_ylabel("NSE (mean ± std, 3 seeds)", fontsize=10)
     ax1.set_title("NSE vs forecast horizon", fontsize=11)
@@ -676,16 +760,16 @@ def plot_per_step_advantage(step_df: pd.DataFrame) -> None:
                     skill_stds.append(row["skill"].std(ddof=1) if len(row) > 1 else 0)
 
             labels = [f"h+{s}" for s in steps_present]
-            c  = MODEL_COLORS[model]
-            mk = MODEL_MARKERS[model]
+            c   = MODEL_COLORS.get(model, "#888888")
+            mk  = MODEL_MARKERS.get(model, "o")
+            lbl = MODEL_LABELS.get(model, model)
 
             ax1.errorbar(labels, nse_means, yerr=nse_stds,
-                         color=c, marker=mk, ms=7, lw=2, capsize=4,
-                         label=MODEL_LABELS[model])
+                         color=c, marker=mk, ms=7, lw=2, capsize=4, label=lbl)
             if skill_means:
                 ax2.errorbar(labels, skill_means, yerr=skill_stds,
                              color=c, marker=mk, ms=7, lw=2, capsize=4,
-                             label=MODEL_LABELS[model])
+                             label=lbl)
 
         ax1.axhline(PERSIST_NSE, color="#888780", lw=1.2, ls="--",
                     label=f"Persistence ({PERSIST_NSE})")
@@ -743,19 +827,35 @@ def print_conclusion(global_df: pd.DataFrame,
 
     avail_m = global_df["model"].unique()
     for hz in HORIZONS:
-        gru_nse  = global_df[(global_df.model == "gru")    & (global_df.horizon == hz)]["nse"]
-        gnn_nse  = global_df[(global_df.model == "st_gnn") & (global_df.horizon == hz)]["nse"]
-        lstm_nse = global_df[(global_df.model == "lstm")   & (global_df.horizon == hz)]["nse"]
-        dfc_nse  = global_df[(global_df.model == "dfc_gnn") & (global_df.horizon == hz)]["nse"]
+        # All 8 ablation models in ladder order
+        _m_nse = {m: global_df[(global_df.model == m) &
+                                (global_df.horizon == hz)]["nse"]
+                  for m in MODELS}
+        gru_nse = _m_nse["gru"]
+        gnn_nse = _m_nse["st_gnn"]
         print(f"\nHorizon {HZ_LABEL[hz]} (T_out={hz}):")
-        for m_tag, m_series in [
-            ("gru",    gru_nse), ("lstm", lstm_nse), ("st_gnn", gnn_nse),
-            ("dfc_gnn", dfc_nse),
-        ]:
+        persist_nse = PERSIST_NSE_HZ.get(hz, PERSIST_NSE_FALLBACK)
+        print(f"  {'Persistence':<26} NSE {persist_nse:.4f} (baseline)")
+        for m_tag, m_series in [(m, _m_nse[m]) for m in MODELS]:
             if m_tag not in avail_m or m_series.empty: continue
             lbl = MODEL_LABELS.get(m_tag, m_tag)
             std = m_series.std(ddof=1) if len(m_series) > 1 else 0
             print(f"  {lbl:<26} NSE {m_series.mean():.4f} ± {std:.4f}")
+
+        # DFC-GNN flood head performance (CSI/POD/FAR/F1)
+        if "csi_head" in global_df.columns:
+            for dfc_m in ("dfc_gnn", "dfc_gnn_unified"):
+                dfc_sub = global_df[
+                    (global_df.model == dfc_m) & (global_df.horizon == hz)]
+                if not dfc_sub.empty and not dfc_sub["csi_head"].isna().all():
+                    csi_m = dfc_sub["csi_head"].mean()
+                    pod_m = dfc_sub["pod_head"].mean()
+                    far_m = dfc_sub["far_head"].mean()
+                    f1_m  = dfc_sub["f1_head"].mean()
+                    lbl   = MODEL_LABELS.get(dfc_m, dfc_m)
+                    print(f"  {lbl} flood head: "
+                          f"CSI={csi_m:.4f}  POD={pod_m:.4f}  "
+                          f"FAR={far_m:.4f}  F1={f1_m:.4f}")
 
         # Check if GRU-GNN difference is within variance
         gru_std  = gru_nse.std(ddof=1)
@@ -778,7 +878,7 @@ def print_conclusion(global_df: pd.DataFrame,
             gru_n = node_df[(node_df.model=="gru") &
                             (node_df.horizon==hz) &
                             (node_df["name"].isin(node_set))]["nse"].mean()
-            gnn_n = node_df[(node_df.model=="st_gnn") &
+            gnn_n = node_df[(node_df.model=="dfc_gnn_unified") &
                             (node_df.horizon==hz) &
                             (node_df["name"].isin(node_set))]["nse"].mean()
             sign = ">" if gnn_n > gru_n else "<"
@@ -806,7 +906,7 @@ def plot_dfc_vs_best_baseline(node_df: pd.DataFrame, horizon: int = 4) -> None:
 
     # Best among static graph baselines
     best_nse = None
-    for m in ["st_gnn_hand_edge", "st_gnn_dyn_edge", "st_gnn_sar", "st_gnn"]:
+    for m in ["st_gnn_soil_gate", "st_gnn_hand_edge", "st_gnn_dyn_edge", "st_gnn"]:
         if m not in node_df["model"].unique():
             continue
         mn = (node_df[(node_df.model == m) & (node_df.horizon == horizon)]
@@ -827,11 +927,19 @@ def plot_dfc_vs_best_baseline(node_df: pd.DataFrame, horizon: int = 4) -> None:
     ax.barh(df.index, df["delta"], color=colors, height=0.7,
             edgecolor="white", linewidth=0.4)
     ax.axvline(0, color="#444441", lw=0.8)
-    ax.set_xlabel("ΔNSE (DFC-GNN − best graph baseline)  |  gold = DFC-GNN wins",
-                  fontsize=9)
-    ax.set_title(f"DFC-GNN advantage over best graph baseline\n"
-                 f"Horizon T_out={horizon} ({HZ_LABEL[horizon]})  |  "
-                 f"mean over 3 seeds", fontsize=10)
+    # Neutral xlabel — DFC-GNN may lose to the baseline (actual result)
+    ax.set_xlabel(
+        "ΔNSE (DFC-GNN − best graph baseline)  |  "
+        "gold = DFC-GNN wins, grey = baseline wins",
+        fontsize=9)
+    n_pos = int((df["delta"] > 0).sum())
+    n_neg = int((df["delta"] < 0).sum())
+    ax.set_title(
+        f"DFC-GNN vs best graph baseline — per-node ΔNSE\n"
+        f"Horizon T_out={horizon} ({HZ_LABEL[horizon]})  |  "
+        f"mean over 3 seeds  |  "
+        f"DFC-GNN wins at {n_pos}/{len(df)} nodes, loses at {n_neg}/{len(df)}",
+        fontsize=10)
     ax.tick_params(labelsize=8.5)
     for i, (_, row) in enumerate(df.iterrows()):
         ax.text(row["delta"] + (0.0002 if row["delta"] >= 0 else -0.0002),
@@ -849,44 +957,168 @@ def plot_dfc_vs_best_baseline(node_df: pd.DataFrame, horizon: int = 4) -> None:
     print(f"  Saved: dfc_advantage_hz{horizon}.png")
 
 
+def plot_unified_vs_dfc(node_df: pd.DataFrame, horizon: int = 4) -> None:
+    """
+    Per-node ΔNSE: PC-DFC-GNN (dfc_gnn_unified) minus DFC-GNN.
+
+    This is the KEY ABLATION figure for the paper: it isolates the
+    contribution of unifying Manning conductance, HAND-triggered topology,
+    and elevation-gated attention in a single consistent architecture
+    (PC-DFC-GNN) over the simpler DFC-GNN which has only the elevation
+    gate and flood head.
+    Positive ΔNSE = the unified model wins at that node;
+    negative = the simpler DFC-GNN was sufficient.
+    """
+    for tag in ("dfc_gnn", "dfc_gnn_unified"):
+        if tag not in node_df["model"].unique():
+            print(f"  [skip] plot_unified_vs_dfc: {tag} not in results")
+            return
+
+    unified_nse = (node_df[(node_df.model == "dfc_gnn_unified") &
+                           (node_df.horizon == horizon)]
+                   .groupby("name")["nse"].mean().rename("unified"))
+    dfc_nse     = (node_df[(node_df.model == "dfc_gnn") &
+                           (node_df.horizon == horizon)]
+                   .groupby("name")["nse"].mean().rename("dfc"))
+
+    df = pd.concat([unified_nse, dfc_nse], axis=1).dropna()
+    df["delta"] = df["unified"] - df["dfc"]
+    df = df.sort_values("delta")
+
+    colors = [MODEL_COLORS["dfc_gnn_unified"] if d >= 0
+              else MODEL_COLORS["dfc_gnn"] for d in df["delta"]]
+    fig, ax = plt.subplots(figsize=(10, max(6, len(df) * 0.37)))
+    fig.patch.set_facecolor("white")
+    ax.barh(df.index, df["delta"], color=colors, height=0.7,
+            edgecolor="white", linewidth=0.4)
+    ax.axvline(0, color="#444441", lw=0.8)
+    ax.set_xlabel("ΔNSE (PC-DFC-GNN − DFC-GNN)  |  "
+                  "gold = unified wins, dark gold = DFC-GNN sufficient",
+                  fontsize=9)
+    ax.set_title(
+        f"PC-DFC-GNN vs DFC-GNN — ablation of unified physics mechanisms\n"
+        f"Horizon T_out={horizon} ({HZ_LABEL[horizon]})  |  "
+        f"mean over 3 seeds",
+        fontsize=10,
+    )
+    ax.tick_params(labelsize=8.5)
+    for i, (_, row) in enumerate(df.iterrows()):
+        ax.text(row["delta"] + (0.0002 if row["delta"] >= 0 else -0.0002),
+                i, f"{row['delta']:+.4f}",
+                va="center", ha="left" if row["delta"] >= 0 else "right",
+                fontsize=7)
+    xmax = df["delta"].abs().max() * 1.4 if not df.empty else 0.01
+    if not np.isfinite(xmax) or xmax == 0: xmax = 0.01
+    ax.set_xlim(-xmax, xmax)
+    fig.tight_layout()
+    fig.savefig(OUT_DIR / f"unified_vs_dfc_hz{horizon}.png",
+                dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: unified_vs_dfc_hz{horizon}.png")
+
+
 def plot_flood_acc_comparison(global_df: pd.DataFrame) -> None:
     """
-    Bar chart comparing flood_acc (node-level flood classification accuracy)
-    across all models that report it, at each horizon.
-    Only DFC-GNN reports flood_acc; other models show NaN → grey bar at 0.
-    This plot documents the contribution of the auxiliary flood head.
+    Grouped bar chart of DFC-GNN auxiliary flood head performance metrics:
+    CSI, POD (recall), FAR, and F1 per horizon.
+
+    These metrics are saved by train_dfc_gnn.py to test_metrics.json under
+    keys "csi", "pod", "far", "f1" and loaded here as csi_head, pod_head,
+    far_head, f1_head to distinguish them from the stage-regression
+    threshold metrics in extended_metrics.json.
+
+    flood_acc is NOT used here because it was computed as
+    TP / all_valid_nodes (≈ 3.4%) rather than POD = TP / (TP+FN),
+    making it appear near-zero even when the model detects floods well.
     """
-    if "flood_acc" not in global_df.columns:
-        return
-    dfc = global_df[global_df.model == "dfc_gnn"]
-    if dfc.empty or dfc.flood_acc.isna().all():
-        print("  [skip] flood_acc not yet available")
+    # Use proper flood-head metrics loaded from test_metrics.json
+    flood_cols = ["csi_head", "pod_head", "far_head", "f1_head"]
+    col_labels = ["CSI", "POD (recall)", "FAR", "F1"]
+    col_colors = ["#2C6E49", "#185FA5", "#D85A30", "#9B59B6"]
+
+    # Only DFC-GNN has a trained flood head in Experiment 1
+    dfc_models = [m for m in ("dfc_gnn", "dfc_gnn_unified")
+                  if m in global_df["model"].unique()
+                  and "csi_head" in global_df.columns
+                  and not global_df[
+                      global_df.model == m]["csi_head"].isna().all()]
+    if not dfc_models:
+        # Fall back to flood_acc if new columns absent
+        if "flood_acc" not in global_df.columns:
+            print("  [skip] flood head metrics not available")
+            return
+        fa_models = [(m, MODEL_LABELS.get(m, m), MODEL_COLORS.get(m, "#888888"))
+                     for m in ("dfc_gnn", "dfc_gnn_unified")
+                     if m in global_df["model"].unique()
+                     and not global_df[global_df.model==m].flood_acc.isna().all()]
+        if not fa_models:
+            print("  [skip] flood_acc not available")
+            return
+        print("  [warn] csi_head absent — falling back to flood_acc (misleading metric)")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        fig.patch.set_facecolor("white")
+        x = np.arange(len(HORIZONS))
+        for i, (m, lbl, clr) in enumerate(fa_models):
+            sub = global_df[global_df.model == m]
+            means = [sub[sub.horizon==hz]["flood_acc"].mean() for hz in HORIZONS]
+            ax.bar(x + i*0.3, means, 0.3, color=clr, label=lbl, alpha=0.85)
+        ax.set_xticks(x + 0.15); ax.set_xticklabels([HZ_LABEL[h] for h in HORIZONS])
+        ax.set_ylim(0.0, 1.05)
+        ax.set_ylabel("flood_acc (TP/all_valid — see note)", fontsize=9)
+        ax.set_title("Flood head flood_acc (misleading — use run_inference first)",
+                     fontsize=10)
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        fig.savefig(OUT_DIR / "flood_acc_comparison.png", dpi=180, bbox_inches="tight")
+        plt.close(fig); print("  Saved: flood_acc_comparison.png (fallback)")
         return
 
-    fig, ax = plt.subplots(figsize=(8, 4))
+    # Preferred path: CSI / POD / FAR / F1 from test_metrics.json
+    fig, axes = plt.subplots(1, len(dfc_models),
+                             figsize=(7 * len(dfc_models), 5),
+                             sharey=True)
+    if len(dfc_models) == 1:
+        axes = [axes]
     fig.patch.set_facecolor("white")
-    x   = np.arange(len(HORIZONS))
-    w   = 0.5
-    means = [dfc[dfc.horizon == hz]["flood_acc"].mean() for hz in HORIZONS]
-    stds  = [dfc[dfc.horizon == hz]["flood_acc"].std(ddof=1)
-             if len(dfc[dfc.horizon == hz]) > 1 else 0 for hz in HORIZONS]
-    ax.bar(x, means, width=w, color=MODEL_COLORS["dfc_gnn"],
-           yerr=stds, capsize=5, alpha=0.85,
-           label="DFC-GNN flood_acc", edgecolor="white")
-    ax.set_xticks(x)
-    ax.set_xticklabels([HZ_LABEL[h] for h in HORIZONS])
-    ax.set_ylim(0.95, 1.0)
-    ax.set_ylabel("Node-level flood classification accuracy", fontsize=9)
-    ax.set_title("DFC-GNN auxiliary flood head accuracy\n"
-                 "Mean ± std across 3 seeds  |  "
-                 "1.0 = perfect node-level flood/no-flood classification",
-                 fontsize=10)
-    ax.legend(fontsize=9) 
-    ax.tick_params(labelsize=9)
+
+    for ax, m in zip(axes, dfc_models):
+        lbl = MODEL_LABELS.get(m, m)
+        sub = global_df[global_df.model == m]
+        x   = np.arange(len(HORIZONS))
+        n_c = len(flood_cols)
+        w   = 0.18
+        offsets = np.linspace(-(n_c-1)/2*w, (n_c-1)/2*w, n_c)
+        for col, cl, clr, offset in zip(flood_cols, col_labels, col_colors, offsets):
+            if col not in sub.columns: continue
+            means = [sub[sub.horizon==hz][col].mean(skipna=True)
+                     for hz in HORIZONS]
+            stds  = [sub[sub.horizon==hz][col].std(ddof=1)
+                     if len(sub[sub.horizon==hz]) > 1 else 0
+                     for hz in HORIZONS]
+            ax.bar(x + offset, means, w, color=clr,
+                   yerr=stds, capsize=3, alpha=0.82,
+                   label=cl, edgecolor="white")
+        ax.axhline(1.0, color="#444441", lw=0.7, ls="--", alpha=0.5)
+        ax.axhline(0.0, color="#444441", lw=0.7, ls="--", alpha=0.3)
+        ax.set_xticks(x)
+        ax.set_xticklabels([HZ_LABEL[h] for h in HORIZONS])
+        ax.set_ylim(0.0, 1.08)
+        ax.set_title(f"{lbl}\nFlood head: CSI / POD / FAR / F1", fontsize=9)
+        ax.legend(fontsize=8.5)
+        ax.tick_params(labelsize=8.5)
+
+    axes[0].set_ylabel(
+        "Score  (CSI/POD/F1: higher=better | FAR: lower=better)",
+        fontsize=9)
+    fig.suptitle(
+        "Auxiliary flood head performance — DFC-GNN family\n"
+        "Threshold-based binary detection at bankfull stage anomaly  |  "
+        "Mean ± std over 3 seeds",
+        fontsize=10)
     fig.tight_layout()
-    fig.savefig(OUT_DIR / "flood_acc_dfc_gnn.png", dpi=180, bbox_inches="tight")
+    fig.savefig(OUT_DIR / "flood_acc_comparison.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
-    print("  Saved: flood_acc_dfc_gnn.png")
+    print("  Saved: flood_acc_comparison.png")
 
 
 def plot_all_models_nse_table(global_df: pd.DataFrame) -> None:
@@ -905,7 +1137,9 @@ def plot_all_models_nse_table(global_df: pd.DataFrame) -> None:
 
     fig, ax = plt.subplots(figsize=(7, max(4, len(avail) * 0.6)))
     fig.patch.set_facecolor("white")
-    im = ax.imshow(data, cmap="YlGn", aspect="auto", vmin=0.88, vmax=1.0)
+    # vmin=0.70 accommodates DFC-GNN at T_out=48 (NSE≈0.72);
+    # vmin=0.88 would place those cells outside the colour scale.
+    im = ax.imshow(data, cmap="YlGn", aspect="auto", vmin=0.70, vmax=1.0)
     ax.set_xticks(range(len(HORIZONS)))
     ax.set_xticklabels([HZ_LABEL[h] for h in HORIZONS], fontsize=9)
     ax.set_yticks(range(len(avail)))
@@ -1127,6 +1361,10 @@ def main():
     print(f"  Loaded {len(global_df)} global records, "
           f"{len(node_df)} node records")
 
+    print(f"global_df headers: {global_df.columns.values.tolist()}")
+    print(f"node_df headers: {node_df.columns.values.tolist()}")
+    print(f"step_df headers: {step_df.columns.values.tolist()}")
+
     if global_df.empty:
         print("[ERROR] No data loaded — check CKPT_DIR path:")
         print(f"  {CKPT_DIR}")
@@ -1145,6 +1383,7 @@ def main():
     for hz in HORIZONS:
         plot_node_advantage(node_df, hz)
         plot_dfc_vs_best_baseline(node_df, hz)
+        plot_unified_vs_dfc(node_df, hz)        # key ablation: step 4
     plot_skill_violin(node_df)
     plot_flood_acc_comparison(global_df)
     for hz in HORIZONS:

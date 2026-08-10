@@ -5,7 +5,9 @@ Handles the three-level checkpoint structure:
     checkpoints/{model}/{seed}/{horizon}/best_model.pt
 
 For each leaf checkpoint (one seed × one horizon), saves:
-    test_predictions.npy         [T_test, N]  absolute stage (m)
+    test_predictions.npy         [T_test, N]  stage anomaly (m), rolling
+                                  7-day-baseline-relative (X.npy feature
+                                  index 0) — NOT absolute mAOD stage
     test_predictions_meta.json
 
 After processing all seeds for a model+horizon, saves:
@@ -127,6 +129,7 @@ MODEL_REGISTRY = {
     "st_gnn":           "models.st_gnn_flood.STGNNFloodModel",
     "st_gnn_dyn_edge":  "models.st_gnn_dyn_edge.STGNNDynEdge",
     "st_gnn_hand_edge": "models.st_gnn_hand_edge.STGNNHANDEdge",
+    "st_gnn_soil_gate": "models.st_gnn_soil_gate.STGNNSoilGate",
 
     "dfc_gnn":          "models.dfc_gnn.DFCGNNFlood",
     "dfc_gnn_unified":  "models.dfc_gnn_unified.DFCGNNUnified",
@@ -258,6 +261,38 @@ def load_model(ckpt_dir: Path, device: torch.device):
         hand_dist = sd["hand_dist_norm"].cpu() * 5.0
 
         # hand  = np.load(GRAPH_DIR / "hand_edges.npz")
+        model = cls(**common,
+                    f_edge             = f_edge_raw + 1,
+                    gat_heads          = hp.get("gat_heads", 2),
+                    gru_layers         = hp.get("gru_layers", 2),
+                    sar_emb_dim        = hp.get("sar_emb_dim", 0),
+                    discharge_idx      = hp.get("discharge_idx", 3),
+                    discharge_ref      = hp.get("discharge_ref", 1.0),
+
+                    z_saddle           = z_saddle,
+                    gauge_datum        = gauge_datum,
+                    stage_range        = stage_range,
+
+                    hand_src           = hand_src,
+                    hand_dst           = hand_dst,
+                    hand_threshold     = hand_thr,
+                    hand_overland_dist = hand_dist)
+    elif tag == "st_gnn_soil_gate":
+        # STGNNSoilGate inherits from STGNNHANDEdge and overrides only
+        # _hand_edge_attr() with a catchment-mean saturation gate. It
+        # needs the identical graph-buffer constructor signature as
+        # st_gnn_hand_edge above; the two extra learnable scalars
+        # (sat_threshold, sat_sharpness) are not constructor args —
+        # they load correctly via the state_dict below.
+        gauge_datum = sd["gauge_datum"].cpu()
+        stage_range = sd["stage_range"].cpu()
+        z_saddle = sd["z_saddle"].cpu()
+
+        hand_src = sd["hand_src"].cpu()
+        hand_dst = sd["hand_dst"].cpu()
+        hand_thr = sd["hand_threshold"].cpu()
+        hand_dist = sd["hand_dist_norm"].cpu() * 5.0
+
         model = cls(**common,
                     f_edge             = f_edge_raw + 1,
                     gat_heads          = hp.get("gat_heads", 2),
@@ -415,7 +450,6 @@ def load_graph(device):
 
 # ── Core inference ──────────────────────────────────────────────────────────
 
-@torch.no_grad()
 # ═══════════════════════════════════════════════════════════════════════
 # Extended metric computation
 # KGE (Gupta et al. 2009), POD, FAR (Moriasi et al. 2007),
@@ -439,8 +473,26 @@ def _kge_per_node(
     KGE = 1.0 is perfect; KGE = -0.41 equals mean-flow benchmark
     (Knoben et al. 2019, HESS 23(8):4323-4331).
 
+    CAVEAT — mean-ratio beta is unstable on stage-anomaly targets.
+    `target` here is stage ANOMALY (rolling 7-day-baseline-relative),
+    not absolute mAOD stage, so mean(obs) is frequently close to zero
+    for any node/seed/horizon window that isn't persistently flooded.
+    The textbook beta = mean(pred)/mean(obs) then divides by a near-zero
+    number and explodes (this is the source of the wildly negative
+    kge_mean values, e.g. -15, seen in earlier runs — a metric-validity
+    artifact, not a model-performance signal). The 1e-10 guard below was
+    far too permissive to catch this. Fix: raise the guard to a
+    physically meaningful floor (BETA_MEAN_FLOOR_M, ~5 cm — below the
+    OPW gauge noise floor) so beta silently reports NaN for windows where
+    the ratio isn't meaningful, rather than reporting a numerically huge
+    but meaningless value. kge_mean/kge_beta_mean should be read with this
+    caveat until KGE is instead computed on reconstructed absolute stage
+    (gauge_datum + normalised_stage × stage_range, X.npy feature index 1).
+
     Returns list of dicts with keys: kge, r, alpha, beta
     """
+    BETA_MEAN_FLOOR_M = 0.05   # metres; below this, mean-ratio beta is not meaningful
+
     results = []
     N = pred.shape[1]
     for j in range(N):
@@ -452,7 +504,7 @@ def _kge_per_node(
         p, t = pred[valid, j].astype(float), target[valid, j].astype(float)
         r     = float(np.corrcoef(p, t)[0, 1])
         alpha = float(p.std()  / t.std())  if t.std()       > 1e-10 else np.nan
-        beta  = float(p.mean() / t.mean()) if abs(t.mean()) > 1e-10 else np.nan
+        beta  = float(p.mean() / t.mean()) if abs(t.mean()) > BETA_MEAN_FLOOR_M else np.nan
         if any(np.isnan(v) for v in [r, alpha, beta]):
             kge = np.nan
         else:
@@ -590,14 +642,26 @@ def _peak_timing_error(
 
 
 def compute_extended_metrics(
-    pred:      np.ndarray,   # [T_test, N] absolute stage predictions
+    pred:      np.ndarray,   # [T_test, N] stage anomaly (m) at step T_out-1
     ts:        int,          # test start index in full time series
     T_in:      int,          # input window length
+    T_out:     int,          # forecast horizon (number of steps)
     ckpt_dir:  Path,
 ) -> None:
     """
     Compute KGE, POD, FAR, and peak timing error from saved predictions
     and write results to extended_metrics.json in ckpt_dir.
+
+    Option B evaluation: predictions are assessed at the model's own
+    designed forecast horizon (step T_out-1), not at step 0 (15-min ahead).
+    This ensures that a T_out=48 model is evaluated at 12 hours ahead —
+    the lead time it was trained to optimise — rather than at 15 minutes
+    where its horizon-weighted loss placed only 4% of training weight.
+
+    The target ground truth is aligned accordingly:
+        tgt_start = ts + T_in + T_out - 1
+    so that pred[i] is compared against y[ts + T_in + T_out - 1 + i],
+    which is the observed stage T_out steps ahead of window i's last input.
 
     Saves:
         ckpt_dir/extended_metrics.json
@@ -609,7 +673,12 @@ def compute_extended_metrics(
         y_full   = np.load(PROC_DIR / "y.npy",          mmap_mode="r")
         m_full   = np.load(PROC_DIR / "valid_mask.npy", mmap_mode="r").astype(bool)
 
-        tgt_start = ts + T_in
+        # Align target to step T_out-1 — the model's designed horizon.
+        # pred[i] was collected as delta[:, T_out-1, :] + last_obs for
+        # window i, which corresponds to ground truth at ts + i + T_in + T_out - 1.
+        # The time-series of last-step targets therefore starts at
+        # ts + T_in + T_out - 1 (the first valid last-step target).
+        tgt_start = ts + T_in + T_out - 1
         n         = min(len(pred), len(y_full) - tgt_start)
         target    = y_full[tgt_start : tgt_start + n].astype(np.float32)
         mask      = m_full[tgt_start : tgt_start + n]
@@ -624,17 +693,31 @@ def compute_extended_metrics(
         else:
             with open(bf_path) as f:
                 bf_dict = json.load(f)
-            # Filter out non-numeric entries (description/metadata strings)
-            # that may appear as top-level keys in bankfull_thresholds.json.
-            bf_dict = {k: v for k, v in bf_dict.items()
-                       if isinstance(v, (int, float))}
-            N = target.shape[1]
-            # bankfull_thresholds.json is {node_ref: threshold_m} in mOD.
-            # Convert to stage anomaly: threshold_anom = threshold_mOD - mean_stage_mOD
-            # If the thresholds are already in anomaly space, use directly.
-            bankfull = np.array([list(bf_dict.values())[j]
-                                 if j < len(bf_dict) else np.inf
-                                 for j in range(N)], dtype=np.float32)
+            # bankfull_thresholds.json has a nested structure:
+            #   { "description": "...", "generated": "...",
+            #     "thresholds": { "19056": 0.3559, "19057": 0.9666, ... } }
+            # Values under "thresholds" are in stage ANOMALY space (m above
+            # 7-day rolling mean), matching model predictions directly.
+            # Previous code filtered top-level keys for isinstance(v,(int,float))
+            # which excluded the nested dict → bf_dict empty → bankfull=inf
+            # → POD=0, FAR=0, PeakΔt=NaN for every model in every run.
+            if "thresholds" in bf_dict:
+                bf_dict = bf_dict["thresholds"]   # unwrap nested key
+            else:
+                # Flat structure fallback (backward-compatible)
+                bf_dict = {k: v for k, v in bf_dict.items()
+                           if isinstance(v, (int, float))}
+
+            # Map by ref in node_idx order (nodes.csv is the canonical
+            # node ordering used by all model outputs [T, N]).
+            # Positional indexing on dict values is fragile; ref lookup
+            # is robust to JSON key reordering between regenerations.
+            _nd   = pd.read_csv(GRAPH_DIR / "nodes.csv")
+            _refs = [str(r) for r in _nd["ref"].tolist()]
+            bankfull = np.array(
+                [float(bf_dict.get(ref, 0.5)) for ref in _refs],
+                dtype=np.float32,
+            )   # 0.5 m stage-anomaly fallback for any node absent from JSON
 
         # ── KGE ──────────────────────────────────────────────────────
         kge_results = _kge_per_node(p, target, mask)
@@ -648,6 +731,14 @@ def compute_extended_metrics(
             "kge_r_mean":     round(float(np.mean(r_vals)),     4) if r_vals     else np.nan,
             "kge_alpha_mean": round(float(np.mean(alpha_vals)), 4) if alpha_vals else np.nan,
             "kge_beta_mean":  round(float(np.mean(beta_vals)),  4) if beta_vals  else np.nan,
+            # Fraction of the 27 nodes for which beta (and therefore kge)
+            # was dropped as NaN because |mean(target)| fell below the
+            # BETA_MEAN_FLOOR_M guard — high values here mean kge_mean is
+            # based on very few nodes and should be treated cautiously.
+            "kge_nodes_excluded_frac": round(1.0 - len(beta_vals) / max(1, pred.shape[1]), 4),
+            "kge_caveat": ("kge_beta_mean/kge_mean computed on stage-anomaly "
+                           "targets (near-zero mean); interpret with caution — "
+                           "see _kge_per_node() docstring"),
         }
 
         # ── POD / FAR ─────────────────────────────────────────────────
@@ -685,10 +776,27 @@ def compute_extended_metrics(
 
 
 
+@torch.no_grad()
 def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
     """
-    Run inference for one leaf checkpoint.
-    Returns absolute stage predictions [T_test, N] (1-step ahead, horizon 0).
+    Run inference for one leaf checkpoint (Option B).
+
+    Returns and saves stage-anomaly predictions [T_test, N] (rolling
+    7-day-baseline-relative, feature index 0 — NOT absolute mAOD stage;
+    see note on the KGE beta component below) at the model's designed
+    forecast horizon (step T_out-1), not step 0 (15-min ahead).
+
+    Horizon mapping:
+        T_out=4  → step 3  → 1 hr ahead
+        T_out=12 → step 11 → 3 hr ahead
+        T_out=16 → step 15 → 4 hr ahead
+        T_out=24 → step 23 → 6 hr ahead
+        T_out=48 → step 47 → 12 hr ahead
+
+    Extended metrics (KGE, POD, FAR, PeakΔt) are evaluated against the
+    ground truth at the same horizon, so POD/FAR reflect the model's
+    actual flood-detection skill at its designed warning lead time.
+
     Saves test_predictions.npy and test_predictions_meta.json in ckpt_dir.
     """
     model, hp       = load_model(ckpt_dir, device)
@@ -723,13 +831,20 @@ def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
             # No-graph baselines (gru / lstm / ealstm):
             # forward(x_seq, node_attr, **kwargs) — node_attr required.
             delta = model(x_seq, na)
-        # Absolute stage = predicted delta + last observed stage anomaly.
-        # x_seq[:, -1, :, 0] = stage anomaly at the last input timestep.
+        # Option B: collect predictions at step T_out-1 (the model's
+        # designed forecast horizon) rather than step 0 (15-min ahead).
+        #
+        # For T_out=4 : step 3  = 1 hr ahead  (60-min warning lead)
+        # For T_out=12: step 11 = 3 hr ahead
+        # For T_out=16: step 15 = 4 hr ahead
+        # For T_out=24: step 23 = 6 hr ahead  (Civil Defence threshold)
+        # For T_out=48: step 47 = 12 hr ahead (evacuation planning)
+        #
         # .detach() required: DFC models have requires_grad=True params
-        # (HANDDecoder log_tau) whose gradient propagates through the
-        # output tensor when called outside torch.no_grad().
-        last_obs  = x_seq[:, -1, :, 0]                   # [B, N]
-        abs_pred  = delta[:, 0, :] + last_obs             # [B, N] — 1-step ahead
+        # (HANDDecoder log_tau) that propagate through the output tensor
+        # outside torch.no_grad().
+        last_obs  = x_seq[:, -1, :, 0]                     # [B, N]
+        abs_pred  = delta[:, T_out - 1, :] + last_obs       # [B, N] — T_out-step ahead
         preds.append(abs_pred.detach().cpu().numpy())
 
     pred = np.concatenate(preds, axis=0)   # [T_test, N]
@@ -745,7 +860,10 @@ def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
     try:
         y_full   = np.load(PROC_DIR / "y.npy",          mmap_mode="r")
         m_full   = np.load(PROC_DIR / "valid_mask.npy", mmap_mode="r")
-        _tgt_start = ts + T_in           # first target timestep
+        # Option B: align to the last forecast step (T_out-1), matching
+        # the delta[:, T_out-1, :] collected in the inference loop.
+        # pred[i] corresponds to y[ts + T_in + T_out - 1 + i].
+        _tgt_start = ts + T_in + T_out - 1
         n_s      = min(len(pred), len(y_full) - _tgt_start)
         y_s      = y_full[_tgt_start : _tgt_start + n_s].astype(np.float32)
         m_s      = m_full[_tgt_start : _tgt_start + n_s].astype(bool)
@@ -756,29 +874,45 @@ def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
             ss_res = float(np.sum((t_v - p_v) ** 2))
             ss_tot = float(np.sum((t_v - t_v.mean()) ** 2))
             _sanity_nse = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-        # Load expected NSE from training evaluation (ground truth)
+        # Compare against per-step NSE at step T_out-1 (exact match for
+        # Option B), falling back to the overall test_metrics.json NSE.
+        # Using the per-step value avoids false WARNING flags caused by
+        # comparing a single-step NSE against the horizon-weighted mean.
         _expected_nse = None
-        _tm_path = ckpt_dir / "test_metrics.json"
-        if _tm_path.exists():
-            with open(_tm_path) as _f:
-                _expected_nse = json.load(_f).get("nse")
-        print(f"  NSE sanity check: {_sanity_nse:.4f}", end="")
+        _ref_label    = ""
+        _ps_path = ckpt_dir / "per_step_metrics.json"
+        if _ps_path.exists():
+            with open(_ps_path) as _f:
+                _steps = json.load(_f)
+            # per_step_metrics is a list of {step, lead_min, nse, ...}
+            # sorted step 1 → T_out; last entry is step T_out.
+            if _steps:
+                _expected_nse = _steps[-1].get("nse")   # NSE at step T_out
+                _ref_label    = f"step {T_out} (per_step_metrics)"
+        if _expected_nse is None:
+            _tm_path = ckpt_dir / "test_metrics.json"
+            if _tm_path.exists():
+                with open(_tm_path) as _f:
+                    _expected_nse = json.load(_f).get("nse")
+                _ref_label = "mean-over-steps (test_metrics)"
+        print(f"  NSE sanity check (step {T_out}): {_sanity_nse:.4f}", end="")
         if _expected_nse is not None:
-            gap = abs(_sanity_nse - _expected_nse)
-            status = "OK" if gap < 0.05 else "WARNING: scale mismatch"
-            print(f"  (training reported {_expected_nse:.4f},  gap={gap:.4f}  {status})")
+            gap = _sanity_nse - _expected_nse   # signed: positive = inference > training
+            status = "OK" if abs(gap) < 0.05 else "WARNING: check alignment"
+            print(f"  (ref {_ref_label}: {_expected_nse:.4f},  "
+                  f"gap={gap:+.4f}  {status})")
         else:
             print()
     except Exception as _e:
         print(f"  NSE sanity check skipped: {_e}")
 
     # ── Extended metrics (KGE, POD, FAR, peak timing) ────────────────────
-    compute_extended_metrics(pred, ts, T_in, ckpt_dir)
+    compute_extended_metrics(pred, ts, T_in, T_out, ckpt_dir)
 
     all_ts = pd.to_datetime(pd.read_csv(PROC_DIR/"timestamps.csv")["timestamp"])
     meta   = {"ckpt": str(ckpt_dir), "model": tag,
               "shape": list(pred.shape),
-              "T_out_trained": T_out, "horizon_saved": 1,
+              "T_out_trained": T_out, "horizon_saved": T_out,   # step index saved (Option B: last step)
               "test_start": str(all_ts.iloc[ts]),
               "test_end":   str(all_ts.iloc[te-1])}
     with open(ckpt_dir / "test_predictions_meta.json", "w") as f:
