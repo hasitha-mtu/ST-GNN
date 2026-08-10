@@ -55,7 +55,7 @@ STEP_MIN    = 15
 
 # ── Colour / label conventions (must match analyse_experiments.py) ────────────
 MODEL_ORDER = ["gru", "lstm", "ealstm", "st_gnn",
-               "st_gnn_dyn_edge", "st_gnn_hand_edge",
+               "st_gnn_dyn_edge", "st_gnn_hand_edge", "st_gnn_soil_gate",
                "dfc_gnn", "dfc_gnn_unified"]
 MODEL_LABELS = {
     "gru":              "GRU",
@@ -64,6 +64,7 @@ MODEL_LABELS = {
     "st_gnn":           "ST-GNN (static)",
     "st_gnn_dyn_edge":  "ST-GNN DynEdge",
     "st_gnn_hand_edge": "ST-GNN HAND",
+    "st_gnn_soil_gate": "ST-GNN Soil Gate",
     "dfc_gnn":          "DFC-GNN",
     "dfc_gnn_unified":  "PC-DFC-GNN",
 }
@@ -74,14 +75,15 @@ MODEL_COLORS = {
     "st_gnn":           "#185FA5",
     "st_gnn_dyn_edge":  "#7B68EE",
     "st_gnn_hand_edge": "#9B59B6",
+    "st_gnn_soil_gate": "#5B2C6F",
     "dfc_gnn":          "#B8860B",
     "dfc_gnn_unified":  "#D4A017",
 }
 MODEL_MARKERS = {
     "gru": "o", "lstm": "s", "ealstm": "d",
     "st_gnn": "^", "st_gnn_dyn_edge": "P",
-    "st_gnn_hand_edge": "X", "dfc_gnn": "h",
-    "dfc_gnn_unified": "*",
+    "st_gnn_hand_edge": "X", "st_gnn_soil_gate": "v",
+    "dfc_gnn": "h", "dfc_gnn_unified": "*",
 }
 
 HZ_LABEL = {4: "1hr", 12: "3hr", 16: "4hr", 24: "6hr", 48: "12hr"}
@@ -456,8 +458,6 @@ def main() -> None:
         description="Analyse synthetic scenario results and produce paper figures")
     parser.add_argument("--no-show", action="store_true",
                         help="Do not display figures (save only)")
-    args = parser.parse_args()
-
     print("=" * 60)
     print("Scenario results analysis")
     print("=" * 60)

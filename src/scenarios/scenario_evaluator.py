@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -54,7 +53,6 @@ from run_inference import (  # type: ignore
     load_model,
     load_graph,
     resolve_model_tag,
-    find_leaf_checkpoints,
     CKPT_ROOT as _RI_CKPT_ROOT,
 )
 
@@ -107,6 +105,13 @@ def _pod_far(pred: np.ndarray, target: np.ndarray,
     far = FP / max(TP + FP, 1)
     return pod, far
 
+def find_leaf_checkpoints(root_dir):
+    checkpoint_root = Path(root_dir)
+    checkpoint_dirs = [
+        p.parent
+        for p in checkpoint_root.rglob("best_model.pt")
+    ]
+    return checkpoint_dirs
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Scenario-specific metrics
