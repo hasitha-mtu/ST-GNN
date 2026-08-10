@@ -18,3 +18,10 @@ foreach ($m in $models) {
         }
     }
 }
+
+
+# Step 1 — regenerate extended metrics with fixed bankfull parser
+python src\run_inference.py --all-models --force
+
+# Step 2 — regenerate analysis with full results
+python src\analyse_experiments.py
