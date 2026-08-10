@@ -25,3 +25,9 @@ python src\run_inference.py --all-models --force
 
 # Step 2 — regenerate analysis with full results
 python src\analyse_experiments.py
+
+
+
+python .\src\scenarios\unit_hydrograph.py
+python .\src\scenarios\scenario_generator.py --all
+python .\src\scenarios\scenario_evaluator.py --all-scenarios --all-models
