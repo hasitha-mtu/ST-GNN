@@ -117,22 +117,70 @@ def find_leaf_checkpoints(root_dir):
 # Scenario-specific metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
-def s1_metrics(pred: np.ndarray, y_syn: np.ndarray,
-               meta: dict) -> dict:
+def _window_local_step(n_rows: int, T_in: int, T_out: int,
+                        T_window: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    ConvectiveCell: compute RMSE at downstream (Cork city) nodes specifically
-    during the 12 steps following the expected flood arrival.
+    Shared helper for every scenario-specific metric below.
+
+    scenario_generator.py concatenates many independent T_window-length
+    windows back-to-back (see e.g. meta["T_per_window"], usually 104).
+    Row i of `pred`/`y_syn` (after the target_arr alignment in
+    evaluate_checkpoint) corresponds to absolute target time
+    (i + T_in + T_out - 1) in that concatenated series — NOT row i of a
+    single window. Any per-window-relative quantity (an event step, a
+    failure onset, a breakthrough midpoint) must be computed against
+    each row's position WITHIN its own window, not against a single
+    global cutoff/midpoint over the whole array. Using a global cutoff
+    is exactly the bug that made s3_false_alarm_rate come out as exactly
+    0.0 for all 135 checkpoints (see s3_metrics docstring) — the same
+    class of bug was independently present in s1_metrics, s2_metrics,
+    and s4_metrics, just producing plausible-looking-but-wrong numbers
+    instead of an obvious zero, which is why it went unnoticed longer.
+
+    Returns (local_step, window_idx), both shape [n_rows].
+    """
+    abs_t = np.arange(n_rows) + T_in + T_out - 1
+    local_step = abs_t % T_window
+    window_idx = abs_t // T_window
+    return local_step, window_idx
+
+
+def s1_metrics(pred: np.ndarray, y_syn: np.ndarray,
+               meta: dict, T_in: int, T_out: int) -> dict:
+    """
+    ConvectiveCell: RMSE at downstream (Cork city) nodes specifically
+    during the ~12 steps following the expected flood arrival.
+
+    FIXED: previously sliced pred[arrival:T_eval] as a single global
+    cutoff over the whole concatenated array, which only ever evaluated
+    the FIRST of the ~21 generation windows' flood arrivals (rows
+    ~42-54) and silently discarded the other 20 windows' arrival periods
+    entirely — understating both the sample size and, if arrival timing
+    or model behaviour varies across windows/seeds, potentially biasing
+    the result toward whatever happened to be in that one window. This
+    version evaluates the arrival window WITHIN EVERY generation window
+    and aggregates across all of them, using the same per-window local
+    step recovery as s3_metrics.
     """
     downstream = meta.get("downstream_nodes", [])
     pulse_at   = meta.get("pulse_at_step", 34)
     arrival    = pulse_at + 8    # approximate flood wave arrival at downstream
-    T_eval     = min(arrival + 12, pred.shape[0])
+    T_window   = meta.get("T_per_window", 104)
 
-    if not downstream or T_eval <= arrival:
+    if not downstream or pred.shape[0] == 0:
         return {"s1_downstream_rmse": float("nan")}
 
-    p_down = pred[arrival:T_eval, downstream]
-    t_down = y_syn[arrival:T_eval, downstream]
+    n_rows = pred.shape[0]
+    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
+    # 12-step arrival window, evaluated within EVERY generation window,
+    # not just the first.
+    in_arrival_window = (local_step >= arrival) & (local_step < arrival + 12)
+
+    if in_arrival_window.sum() < 5:
+        return {"s1_downstream_rmse": float("nan")}
+
+    p_down = pred[in_arrival_window][:, downstream]
+    t_down = y_syn[in_arrival_window][:, downstream]
     m_down = np.ones_like(p_down, dtype=bool)
     return {
         "s1_downstream_rmse": _rmse(p_down, t_down, m_down),
@@ -140,19 +188,37 @@ def s1_metrics(pred: np.ndarray, y_syn: np.ndarray,
 
 
 def s2_metrics(pred: np.ndarray, y_syn: np.ndarray,
-               meta: dict, real_rmse: float) -> dict:
+               meta: dict, real_rmse: float,
+               T_in: int, T_out: int) -> dict:
     """
     GaugeFailure: RMSE at downstream nodes after failure onset vs baseline.
+
+    FIXED: previously sliced pred[t_fail:] as a single global cutoff,
+    which only excludes the first ~36 rows of the ENTIRE concatenated
+    array (spanning 40 flood-windows x 3 failure_levels = 120 segments)
+    rather than isolating genuinely post-failure rows WITHIN each of the
+    120 segments — diluting true post-failure steps with pre-failure
+    calm steps from every other segment. This version isolates
+    post-failure rows per-window using the same local-step recovery as
+    s3_metrics/s1_metrics.
     """
-    downstream  = meta.get("downstream_nodes",
-                            meta.get("headwater_nodes", []))
-    t_fail      = meta.get("t_failure_step", 36)
-    T           = pred.shape[0]
-    if T <= t_fail:
+    t_fail    = meta.get("t_failure_step", 36)
+    T_window  = meta.get("T_per_window", 104)
+    n_rows    = pred.shape[0]
+
+    if n_rows == 0:
         return {"s2_post_failure_rmse": float("nan"),
                 "s2_degradation_ratio": float("nan")}
-    p_post = pred[t_fail:]
-    t_post = y_syn[t_fail:]
+
+    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
+    is_post = local_step >= t_fail
+
+    if is_post.sum() < 5:
+        return {"s2_post_failure_rmse": float("nan"),
+                "s2_degradation_ratio": float("nan")}
+
+    p_post = pred[is_post]
+    t_post = y_syn[is_post]
     m_post = np.ones_like(p_post, dtype=bool)
     rmse_post = _rmse(p_post, t_post, m_post)
     return {
@@ -163,41 +229,163 @@ def s2_metrics(pred: np.ndarray, y_syn: np.ndarray,
 
 
 def s3_metrics(pred: np.ndarray, y_syn: np.ndarray,
-               meta: dict, bankfull: np.ndarray) -> dict:
+               meta: dict, bankfull: np.ndarray,
+               T_in: int, T_out: int) -> dict:
     """
-    ChannelBlockage: false alarm rate at downstream gauge post-blockage.
-    A false alarm is a predicted flood at the downstream gauge when the
-    synthetic y shows suppressed (below bankfull) stage.
+    ChannelBlockage: does the model correctly resist propagating the
+    upstream backwater anomaly to the (truly suppressed) downstream gauge?
+
+    FIXED — two bugs, both of which independently drove the previous
+    s3_false_alarm_rate to exactly 0.0 across all 135 checkpoints:
+
+    Bug 1 (alignment): scenario_generator.py concatenates many
+    independent T_WINDOW-length windows back-to-back, each with its OWN
+    local blockage onset at local step t_blockage_step (e.g. 36 within
+    each 104-step window — see meta["t_blockage_step"]). The previous
+    code treated t_blockage_step as a SINGLE GLOBAL cutoff over the
+    entire concatenated `pred`/`y_syn` arrays: `pred[t_blk:, dst]`. Since
+    `pred` here spans dozens of windows back-to-back, that only excluded
+    the first ~36 rows of the ENTIRE array and then labelled everything
+    else "post-blockage" — including the calm, PRE-blockage segments of
+    every later window. The true post-blockage segments were diluted
+    into a mostly-calm pool, so FP was ~always 0 relative to the
+    (mostly calm) TN pool regardless of what any model actually
+    predicted. This version recovers each row's position WITHIN its own
+    generation window (`local_step = absolute_target_time % T_WINDOW`)
+    and only evaluates rows that are genuinely past that window's own
+    blockage onset.
+
+    Bug 2 (threshold insensitivity): comparing against the FULL bankfull
+    threshold is not a sensitive test in this scenario by design —
+    select_base_windows() deliberately picks calm, moderate-flow windows
+    (max_stage_frac ~0.30-0.40 of bankfull) as the baseline, so neither
+    predictions nor (deliberately suppressed) observations get anywhere
+    near full bankfull regardless of model behaviour. A "false alarm" in
+    the sense this scenario is meant to test — does the model
+    erroneously route the upstream anomaly downstream — is better
+    captured as a RISE relative to the node's own pre-blockage baseline,
+    not an absolute bankfull crossing. Both are reported below:
+      - s3_downstream_bias_post: mean(pred - obs) at the downstream node
+        during genuinely post-blockage steps. Positive = model predicts
+        higher stage than the (correctly suppressed) truth, i.e. it is
+        partially "fooled" into propagating the anomaly downstream.
+        This is the most direct, continuous measure of the scenario's
+        stated intent and should be the primary metric going forward.
+      - s3_false_alarm_rate: FP/(FP+TN) using a RISE threshold
+        (far_rise_frac x bankfull[dst], above the node's own
+        pre-blockage baseline) instead of an absolute bankfull crossing,
+        so it can actually discriminate between models on these
+        deliberately-calm baseline windows.
     """
     block = meta.get("blockage_edge", {})
     dst   = block.get("dst", -1)
     t_blk = meta.get("t_blockage_step", 36)
-    if dst < 0 or pred.shape[0] <= t_blk:
-        return {"s3_false_alarm_rate": float("nan")}
+    # T_per_window isn't currently saved in S3's own scenario_meta.json
+    # (S1/S2/S4 do save it) — fall back to the shared T_WINDOW constant
+    # used across all scenario_generator.py scenarios (104, confirmed
+    # from S1/S2/S4's own T_per_window/T_total ratios) if absent. Worth
+    # adding "T_per_window" to S3's meta dict in scenario_generator.py
+    # too, so this fallback isn't needed going forward.
+    T_window = meta.get("T_per_window", 104)
+    far_rise_frac = 0.15   # "false alarm" = rise > 15% of bankfull above
+                            # the node's own pre-blockage baseline
+
+    if dst < 0 or pred.shape[0] == 0:
+        return {"s3_downstream_bias_post": float("nan"),
+                "s3_false_alarm_rate": float("nan")}
+
+    n_rows = pred.shape[0]
+    # Row i of pred/y_syn corresponds to absolute target time
+    # (i + T_in + T_out - 1) in the concatenated scenario series (see
+    # the target_arr construction in evaluate_checkpoint) — recover each
+    # row's position within its OWN T_window-length generation window.
+    abs_t = np.arange(n_rows) + T_in + T_out - 1
+    local_step = abs_t % T_window
+    window_idx = abs_t // T_window
+    is_post = local_step >= t_blk
+
+    if is_post.sum() < 5:
+        return {"s3_downstream_bias_post": float("nan"),
+                "s3_false_alarm_rate": float("nan")}
+
+    pred_dst = pred[:, dst]
+    obs_dst  = y_syn[:, dst]
+
+    # Per-window pre-blockage baseline (mean observed stage at dst
+    # before that window's own blockage onset), used as the reference
+    # level for the rise-based false-alarm test.
+    baseline_per_window = {}
+    for w in np.unique(window_idx):
+        pre_mask = (window_idx == w) & (~is_post)
+        if pre_mask.sum() > 0:
+            baseline_per_window[w] = float(obs_dst[pre_mask].mean())
+    baseline = np.array([baseline_per_window.get(w, np.nan) for w in window_idx])
+
+    valid = is_post & np.isfinite(baseline) & np.isfinite(pred_dst) & np.isfinite(obs_dst)
+    if valid.sum() < 5:
+        return {"s3_downstream_bias_post": float("nan"),
+                "s3_false_alarm_rate": float("nan")}
+
+    bias_post = float(np.mean(pred_dst[valid] - obs_dst[valid]))
+
     thr        = float(bankfull[dst])
-    pred_post  = pred[t_blk:, dst]
-    obs_post   = y_syn[t_blk:, dst]
-    pred_flood = pred_post >= thr
-    obs_flood  = obs_post  >= thr
+    rise_thr   = far_rise_frac * thr
+    pred_rise  = pred_dst[valid] - baseline[valid]
+    obs_rise   = obs_dst[valid]  - baseline[valid]
+    pred_flood = pred_rise >= rise_thr
+    obs_flood  = obs_rise  >= rise_thr   # should be ~always False by
+                                          # construction (suppression
+                                          # keeps obs below baseline)
     FP = int(( pred_flood & ~obs_flood).sum())
     TN = int((~pred_flood & ~obs_flood).sum())
     far = FP / max(FP + TN, 1)
-    return {"s3_false_alarm_rate": far}
+
+    return {"s3_downstream_bias_post": round(bias_post, 5),
+            "s3_false_alarm_rate": round(far, 4)}
 
 
 def s4_metrics(pred: np.ndarray, y_syn: np.ndarray,
-               X_syn: np.ndarray) -> dict:
+               X_syn: np.ndarray, meta: dict,
+               T_in: int, T_out: int) -> dict:
     """
     SatBreakthrough: RMSE before and after breakthrough, plus ratio.
     Models that correctly anticipate the breakthrough should have
     lower post-breakthrough RMSE relative to their pre-breakthrough RMSE.
+
+    FIXED: previously used t_bt = T // 2 — the midpoint of the ENTIRE
+    concatenated array (30 generation windows x 104 steps = 3120 rows).
+    That midpoint (row 1560) falls exactly on a window boundary, so
+    rmse_pre was actually computed over windows 0-14 IN THEIR ENTIRETY
+    (mixing each window's true pre- AND post-breakthrough segments
+    together) and rmse_post over windows 15-29 entirely — this has
+    nothing to do with sat_breakthrough_step (meta["sat_breakthrough_step"],
+    typically 40 steps into each window), despite producing
+    plausible-looking, non-zero numbers. This version isolates
+    pre/post-breakthrough rows WITHIN every window using the same
+    local-step recovery as s1/s2/s3_metrics.
     """
-    T      = pred.shape[0]
-    t_bt   = T // 2   # approximate breakthrough midpoint
-    mask_a = np.ones((t_bt,     pred.shape[1]), dtype=bool)
-    mask_b = np.ones((T - t_bt, pred.shape[1]), dtype=bool)
-    rmse_pre  = _rmse(pred[:t_bt], y_syn[:t_bt], mask_a)
-    rmse_post = _rmse(pred[t_bt:], y_syn[t_bt:], mask_b)
+    t_bt      = meta.get("sat_breakthrough_step", 40)
+    T_window  = meta.get("T_per_window", 104)
+    n_rows    = pred.shape[0]
+
+    if n_rows == 0:
+        return {"s4_rmse_pre_breakthrough":  float("nan"),
+                "s4_rmse_post_breakthrough": float("nan"),
+                "s4_post_pre_ratio":         float("nan")}
+
+    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
+    is_pre  = local_step <  t_bt
+    is_post = local_step >= t_bt
+
+    if is_pre.sum() < 5 or is_post.sum() < 5:
+        return {"s4_rmse_pre_breakthrough":  float("nan"),
+                "s4_rmse_post_breakthrough": float("nan"),
+                "s4_post_pre_ratio":         float("nan")}
+
+    mask_a = np.ones((is_pre.sum(),  pred.shape[1]), dtype=bool)
+    mask_b = np.ones((is_post.sum(), pred.shape[1]), dtype=bool)
+    rmse_pre  = _rmse(pred[is_pre],  y_syn[is_pre],  mask_a)
+    rmse_post = _rmse(pred[is_post], y_syn[is_post], mask_b)
     return {
         "s4_rmse_pre_breakthrough":  rmse_pre,
         "s4_rmse_post_breakthrough": rmse_post,
@@ -401,13 +589,13 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
     # Scenario-specific extras
     scen_id = meta["name"][:2]
     if scen_id == "S1":
-        result.update(s1_metrics(pred, target_arr, meta))
+        result.update(s1_metrics(pred, target_arr, meta, T_in, T_out))
     elif scen_id == "S2":
-        result.update(s2_metrics(pred, target_arr, meta, real_rmse))
+        result.update(s2_metrics(pred, target_arr, meta, real_rmse, T_in, T_out))
     elif scen_id == "S3":
-        result.update(s3_metrics(pred, target_arr, meta, bankfull))
+        result.update(s3_metrics(pred, target_arr, meta, bankfull, T_in, T_out))
     elif scen_id == "S4":
-        result.update(s4_metrics(pred, target_arr, X_syn))
+        result.update(s4_metrics(pred, target_arr, X_syn, meta, T_in, T_out))
     elif scen_id == "S5":
         result.update(s5_metrics(pred, target_arr, meta))
 

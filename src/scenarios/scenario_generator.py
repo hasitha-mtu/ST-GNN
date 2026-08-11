@@ -622,6 +622,7 @@ def generate_s3_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
             "Debris blockage decouples upstream (backwater) and downstream "
             "(suppressed) stage. Tests elevation gate prevents false alerts."),
         "n_windows":   len(window_starts),
+        "T_per_window": T_WINDOW,
         "T_total":     T_s,
         "blockage_edge": {"src": block_src, "dst": block_dst},
         "t_blockage_step": t_block,
@@ -835,6 +836,15 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S5")
 
+    # downstream_nodes was previously missing from this meta dict entirely
+    # (S1 saves it via the same identify_downstream_nodes() helper; S5
+    # never did), which made s5_metrics() in scenario_evaluator.py always
+    # fall back to meta.get("downstream_nodes", []) -> [] -> NaN for
+    # every single checkpoint. Using the same helper as S1 keeps the
+    # "downstream" definition consistent across scenarios rather than
+    # introducing a second, gradient-based definition here.
+    downstream_idx = identify_downstream_nodes(nd, n=5)
+
     meta = {
         "name": "S5_SpatialGradient",
         "description": (
@@ -842,8 +852,10 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
             "headwaters than eastern Cork city gauges. Tests whether "
             "graph models correctly route the gradient."),
         "n_windows":    len(window_starts),
+        "T_per_window": T_WINDOW,
         "T_total":      T_s,
         "gradient_range": [float(gradient.min()), float(gradient.max())],
+        "downstream_nodes": downstream_idx,
     }
     save_scenario("S5_SpatialGradient", out_dir, X_syn, y_syn, m_syn, meta)
 
