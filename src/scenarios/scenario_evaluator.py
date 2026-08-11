@@ -330,8 +330,22 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
         print(f"    [skip] inference failed: {e}")
         return None
 
-    # Align predictions to targets
+    # Guard against scenarios shorter than this checkpoint's T_in+T_out
+    # requirement. run_on_scenario() already returns an empty (0, N) array
+    # in that case rather than raising — but without this check, the
+    # np.stack() calls below crash with "need at least one array to
+    # stack", and since this whole function is called from main() with no
+    # surrounding try/except, that crash kills the ENTIRE sweep instead of
+    # skipping just this one (model, seed, horizon) combination.
     n_windows = pred.shape[0]
+    if n_windows == 0:
+        min_len_needed = T_in + T_out
+        print(f"    [skip] scenario series too short for this checkpoint: "
+              f"needs >= {min_len_needed} steps (T_in={T_in} + T_out={T_out}), "
+              f"got {len(y_syn)} steps in {scen_dir.name}")
+        return None
+
+    # Align predictions to targets
     # Target: y at T_out-1 steps ahead of each window start
     target_arr = np.stack([
         y_syn[t + T_in + T_out - 1]
@@ -343,6 +357,18 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
         for t in range(n_windows)
         if t + T_in + T_out - 1 < len(y_syn)
     ], axis=0)
+
+    # Second guard: n_windows > 0 doesn't guarantee the filtered list above
+    # is non-empty — e.g. if T_in/T_out reported by run_on_scenario ever
+    # drifted out of sync with the T_in/T_out used inside this function
+    # (they shouldn't, since both come from the same hp/T_out, but this
+    # keeps the two np.stack() calls from being the only thing standing
+    # between a subtle inconsistency and a full-sweep crash).
+    if target_arr.shape[0] == 0:
+        print(f"    [skip] no valid (window, target) pairs after alignment "
+              f"for {scen_dir.name}")
+        return None
+
     pred = pred[:len(target_arr)]
 
     # Global metrics on synthetic data
@@ -476,7 +502,16 @@ def main() -> None:
                 continue
 
             print(f"  [{i+1:3d}/{len(all_ckpts)}] {label} … ", end="", flush=True)
-            row = evaluate_checkpoint(ckpt_dir, scen_dir, device, bankfull)
+            try:
+                row = evaluate_checkpoint(ckpt_dir, scen_dir, device, bankfull)
+            except Exception as e:
+                # Belt-and-braces: evaluate_checkpoint() already catches
+                # the failure modes we know about (model load, inference,
+                # empty-window alignment) and returns None for those. This
+                # catches anything else so one bad checkpoint can't take
+                # down the remaining ~130 in the sweep.
+                print(f"FAILED (unhandled: {type(e).__name__}: {e})")
+                row = None
             if row:
                 rows.append(row)
                 all_rows.append(row)
