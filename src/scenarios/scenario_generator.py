@@ -542,6 +542,31 @@ def generate_s3_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
         max_stage_frac=0.30, n_windows=n_windows,
         search_from_frac=0.70)
 
+    if not window_starts:
+        # max_stage_frac=0.30 is stricter than S1/S5's 0.40 default —
+        # requiring EVERY node under 30% of its own bankfull threshold
+        # while catchment saturation sits at 60-92% is a tight joint
+        # constraint that can have zero matches in the validation-period
+        # search window. Retry once with the same saturation range but a
+        # looser calm-baseline requirement (matching S1/S5's default)
+        # before giving up, so a single tight threshold choice doesn't
+        # silently produce a zero-window (and hence zero-length,
+        # unflagged) scenario — see S1's guard / S2's and S4's fallback
+        # pattern above for the same defensive structure.
+        print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
+              "0.40 (matches S1/S5 default)")
+        window_starts = select_base_windows(
+            X, y, bankfull, sat_min=0.60, sat_max=0.92,
+            max_stage_frac=0.40, n_windows=n_windows,
+            search_from_frac=0.70)
+
+    if not window_starts:
+        print("  [skip] No valid base windows found for S3 even after "
+              "loosening max_stage_frac — check sat_min/sat_max against "
+              "the actual swvl2_sat_ratio distribution in the "
+              "search_from_frac=0.70 region")
+        return
+
     # Pick the most upstream non-trivial edge as the blockage location
     # Sort edges by src catchment area (smallest src = most upstream)
     nd_area = nd.set_index('node_idx')['log_catchment_area_km2'].to_dict()
@@ -744,6 +769,14 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.55, sat_max=0.92, n_windows=n_windows,
         search_from_frac=0.70)
+
+    if not window_starts:
+        # Same defensive guard as S1/S3 — without this, an empty result
+        # here would silently produce a zero-length scenario exactly like
+        # the S3 bug (T_s = T_WINDOW * len(window_starts) = 0), just with
+        # no warning until scenario_evaluator.py reports "got 0 steps".
+        print("  [skip] No valid base windows found for S5")
+        return
 
     # Compute west-to-east gradient weight per node using easting_itm
     easting = nd["easting_itm"].values.astype(np.float64)
