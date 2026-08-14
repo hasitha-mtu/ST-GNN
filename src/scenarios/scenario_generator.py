@@ -14,8 +14,8 @@ S1  ConvectiveCell       Isolated convective storm over headwater tributaries.
                          Tests cross-tributary HAND topology advantage.
 S2  GaugeFailure         Progressive sensor loss during an active flood event.
                          Tests graph redundancy under missing upstream data.
-S3  ChannelBlockage      Debris blockage decouples upstream/downstream stage.
-                         Tests whether physical constraints prevent false alerts.
+S3  InniscarraRelease    Controlled reservoir release decoupled from rainfall.
+                         Tests whether the model respects reservoir topology.
 S4  SatBreakthrough      Dry catchment → saturation breakthrough mid-event.
                          Tests antecedent soil moisture gate (Idea 1).
 S5  SpatialGradient      West-to-east rainfall gradient across catchment.
@@ -31,7 +31,7 @@ Output structure
             scenario_meta.json
         S2_GaugeFailure/
             ...
-        S3_ChannelBlockage/
+        S3_InniscarraRelease/
             ...
         S4_SatBreakthrough/
             ...
@@ -148,6 +148,57 @@ def apply_routing(stage_delta: np.ndarray,
         routed[lag:] = stage_delta[:-lag] * attenuation if lag > 0 \
                        else stage_delta * attenuation
     return routed
+
+
+def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
+                               source_idx: int, ed: pd.DataFrame,
+                               lags: dict, baseline: float,
+                               max_hops: int = 8) -> list[int]:
+    """
+    Multi-hop downstream propagation of a stage delta injected at
+    source_idx, walking the directed river network in `ed` outward
+    hop-by-hop (BFS) rather than a single edge pass.
+
+    S1/S5's routing loops apply `apply_routing` once per perturbed node
+    because the nodes they perturb (headwaters) sit directly adjacent to
+    the segment being tested. S3's injection point (Inniscarra Tailrace)
+    is five edges upstream of the last Cork city gauge, so a single pass
+    would only ever reach Waterworks Weir and leave the rest of the
+    chain — Fitzgerald's Park, Pope's Quay, St. Patrick's Quay, Currach
+    Club — completely untouched. This walks the chain until it runs out
+    of downstream edges (or max_hops), applying the existing per-edge
+    lag + attenuation from `apply_routing` at each hop, so the signal
+    weakens naturally as it travels rather than being re-injected at
+    full strength at every node.
+
+    Returns the list of node indices reached, in hop order — used as the
+    scenario's `downstream_nodes` meta field.
+    """
+    visited = {source_idx}
+    frontier = [source_idx]
+    signal = {source_idx: y_w[:, source_idx] - baseline}
+    reached: list[int] = []
+
+    for _ in range(max_hops):
+        if not frontier:
+            break
+        next_frontier = []
+        for node in frontier:
+            out_edges = ed[ed["src_idx"] == node]
+            for _, edge in out_edges.iterrows():
+                dst = int(edge["dst_idx"])
+                if dst in visited:
+                    continue
+                dst_delta = apply_routing(signal[node], node, dst, lags)
+                y_w[:, dst] += dst_delta
+                X_w[:, dst, F_STAGE] += dst_delta
+                signal[dst] = dst_delta
+                visited.add(dst)
+                reached.append(dst)
+                next_frontier.append(dst)
+        frontier = next_frontier
+
+    return reached
 
 
 def physical_consistency_check(X_syn: np.ndarray, y_syn: np.ndarray,
@@ -517,42 +568,55 @@ def generate_s2_gauge_failure(X, y, mask, nd, ed, uh, lags, bankfull,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# S3 — Channel blockage: backwater upstream, suppressed flow downstream
+# S3 — Inniscarra reservoir release: outlet-driven signal decoupled from
+#      upstream inflow / rainfall
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_s3_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
-                                  n_windows: int = 30) -> None:
+def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
+                                    n_windows: int = 30) -> None:
     """
-    A channel obstruction (debris, bridge blockage) decouples upstream
-    and downstream stage. Upstream stage rises faster than expected;
-    downstream stage rises more slowly or suppresses.
+    ESB operates a controlled release from Inniscarra dam, ramping stage
+    at the Inniscarra Tailrace gauge (ref 19109) independently of
+    catchment rainfall or the natural inflow recorded at the two
+    upstream reservoir gauges — Carrigadrohid Headrace (19095) and
+    Inniscarra Headrace (19094). This is a real, publicly documented
+    operational pattern for the Lee catchment (OPW Lee Catchment Flood
+    Risk Assessment and Management Study, 2011), and it directly
+    exercises the paper's reservoir node handling: the release signal
+    must propagate downstream through the river network toward Cork
+    city, while the two upstream inflow gauges — which the release
+    cannot physically affect, since water cannot flow back through a
+    dam — should show no response at all.
 
-    Tests whether the elevation gate (DFC-GNN) correctly resists routing
-    the anomalous upstream signal downward, avoiding false alarms.
+    Tests whether the model:
+      (a) correctly anticipates the downstream stage rise from the
+          release-node signal alone (a genuine, learnable pattern, not
+          rainfall-driven), and
+      (b) respects the one-directional hydraulic gradient by NOT leaking
+          the release signal backward onto the inflow gauges — the
+          reservoir-topology analogue of the original blockage test's
+          "does the physics gate resist an implausible propagation"
+          question, now framed around a real operational event rather
+          than a hypothetical debris blockage.
     """
-    print("\nS3: ChannelBlockage")
-    out_dir = SCEN_DIR / "S3_ChannelBlockage"
+    print("\nS3: InniscarraRelease")
+    out_dir = SCEN_DIR / "S3_InniscarraRelease"
 
     T = X.shape[0]; N = X.shape[1]
-    test_start = int(T * 0.85)
 
-    # Select moderate-flow windows (not flooded — blockage has effect)
+    # Select calm-to-moderate windows so the release signal is clearly
+    # attributable rather than swamped by a concurrent flood event. Same
+    # retry structure as the scenario's earlier form (and S5): the joint
+    # saturation + calm-baseline constraint can return zero windows in
+    # the validation-period search region, so loosen max_stage_frac once
+    # before giving up rather than silently producing a zero-length
+    # scenario.
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.60, sat_max=0.92,
         max_stage_frac=0.30, n_windows=n_windows,
         search_from_frac=0.70)
 
     if not window_starts:
-        # max_stage_frac=0.30 is stricter than S1/S5's 0.40 default —
-        # requiring EVERY node under 30% of its own bankfull threshold
-        # while catchment saturation sits at 60-92% is a tight joint
-        # constraint that can have zero matches in the validation-period
-        # search window. Retry once with the same saturation range but a
-        # looser calm-baseline requirement (matching S1/S5's default)
-        # before giving up, so a single tight threshold choice doesn't
-        # silently produce a zero-window (and hence zero-length,
-        # unflagged) scenario — see S1's guard / S2's and S4's fallback
-        # pattern above for the same defensive structure.
         print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
               "0.40 (matches S1/S5 default)")
         window_starts = select_base_windows(
@@ -567,26 +631,42 @@ def generate_s3_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
               "search_from_frac=0.70 region")
         return
 
-    # Pick the most upstream non-trivial edge as the blockage location
-    # Sort edges by src catchment area (smallest src = most upstream)
-    nd_area = nd.set_index('node_idx')['log_catchment_area_km2'].to_dict()
-    interior_edges = ed[(ed.elev_drop_m > 2.0) &
-                        (ed.river_dist_km > 1.0)].copy()
-    interior_edges['src_area'] = interior_edges['src_idx'].map(nd_area)
-    interior_edges = interior_edges.sort_values('src_area')
-    if interior_edges.empty:
-        print("  [skip] No suitable interior edges for S3")
+    # Identify the release node (Inniscarra Tailrace) and the two
+    # upstream inflow nodes that must stay decoupled, by ref rather than
+    # a hardcoded node_idx — stays correct even if nodes.csv row order
+    # ever changes.
+    def _idx_for_ref(ref: str) -> Optional[int]:
+        row = nd[nd["ref"].astype(str) == ref]
+        return int(row["node_idx"].values[0]) if not row.empty else None
+
+    tailrace_idx       = _idx_for_ref("19109")   # Inniscarra Tailrace
+    headrace_idx        = _idx_for_ref("19094")   # Inniscarra Headrace
+    carrigadrohid_idx   = _idx_for_ref("19095")   # Carrigadrohid Headrace
+
+    if tailrace_idx is None:
+        print("  [skip] Inniscarra Tailrace (ref 19109) not found in nodes.csv")
         return
-    blockage_edge = interior_edges.iloc[len(interior_edges) // 3]  # mid-network
-    block_src = int(blockage_edge.src_idx)
-    block_dst = int(blockage_edge.dst_idx)
+    if headrace_idx is None or carrigadrohid_idx is None:
+        print("  [warn] One or both reservoir inflow nodes (19094/19095) "
+              "missing from nodes.csv — decoupled_nodes meta will be partial")
 
     T_s   = T_WINDOW * len(window_starts)
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    t_block = T_IN + 4    # blockage occurs 1 hr into forecast
+    t_release      = T_IN + 4     # release begins 1 hr into the forecast
+    ramp_rate      = 0.04         # m per timestep during ramp-up/down —
+                                   # gradual, per ESB operational
+                                   # convention of staged releases rather
+                                   # than an instantaneous step change
+    plateau_rise   = 0.90         # m held at the tailrace during release
+    ramp_steps     = int(round(plateau_rise / ramp_rate))   # ≈23 steps
+    plateau_steps  = 20           # ≈5 hr sustained release
+    # Full ramp-up + plateau + ramp-down = 36 + 23 + 20 + 23 = 102 steps,
+    # fits inside T_WINDOW (104) with margin.
+
+    downstream_idx: list[int] = []
 
     for i, t0 in enumerate(window_starts):
         sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
@@ -594,21 +674,33 @@ def generate_s3_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
         y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
         m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
 
-        # Backwater rise at upstream (blocked) gauge
-        # Stage rises at 2× normal rate from blockage point
-        base_src  = float(np.mean(y_w[:T_IN, block_src]))
-        rise_rate = 0.05   # m per timestep above baseline
-        for t in range(t_block, T_WINDOW):
-            backwater = rise_rate * (t - t_block)
-            backwater = min(backwater, 1.5)   # cap at 1.5m backwater rise
-            y_w[t, block_src] = base_src + backwater
-            X_w[t, block_src, F_STAGE] = base_src + backwater
+        base_tail = float(np.mean(y_w[:T_IN, tailrace_idx]))
 
-        # Downstream gauge: suppress stage (reduced inflow due to blockage)
-        suppression = 0.6   # 40% flow reduction downstream of blockage
-        for t in range(t_block, T_WINDOW):
-            y_w[t, block_dst] *= suppression
-            X_w[t, block_dst, F_STAGE] *= suppression
+        # Trapezoidal release profile at the tailrace: ramp up, hold,
+        # ramp down. Nothing else in the window is touched at this
+        # point — the upstream inflow gauges keep their copied baseline
+        # untouched, which is the whole point of the scenario.
+        for t in range(t_release, T_WINDOW):
+            dt = t - t_release
+            if dt < ramp_steps:
+                delta = ramp_rate * dt
+            elif dt < ramp_steps + plateau_steps:
+                delta = plateau_rise
+            else:
+                dt_down = dt - ramp_steps - plateau_steps
+                delta = max(0.0, plateau_rise - ramp_rate * dt_down)
+            y_w[t, tailrace_idx] = base_tail + delta
+            X_w[t, tailrace_idx, F_STAGE] = base_tail + delta
+
+        # Route the release signal downstream through the river network,
+        # multiple hops out from the tailrace (Waterworks Weir ->
+        # Fitzgerald's Park -> Pope's Quay -> St. Patrick's Quay ->
+        # Currach Club), attenuating per edge via the same routing lags
+        # used elsewhere in this module.
+        reached = propagate_downstream_chain(
+            y_w, X_w, tailrace_idx, ed, lags, baseline=base_tail)
+        if i == 0:
+            downstream_idx = reached
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
@@ -617,19 +709,30 @@ def generate_s3_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S3")
 
     meta = {
-        "name": "S3_ChannelBlockage",
+        "name": "S3_InniscarraRelease",
         "description": (
-            "Debris blockage decouples upstream (backwater) and downstream "
-            "(suppressed) stage. Tests elevation gate prevents false alerts."),
-        "n_windows":   len(window_starts),
-        "T_per_window": T_WINDOW,
-        "T_total":     T_s,
-        "blockage_edge": {"src": block_src, "dst": block_dst},
-        "t_blockage_step": t_block,
-        "backwater_rate_m_per_step": 0.05,
-        "downstream_suppression": 0.6,
+            "Controlled ESB release from Inniscarra dam ramps stage at "
+            "the tailrace gauge independently of rainfall. Tests whether "
+            "the model anticipates the downstream propagation while "
+            "correctly leaving the two upstream reservoir inflow gauges "
+            "(which the release cannot physically affect) undisturbed."),
+        "n_windows":       len(window_starts),
+        "T_per_window":    T_WINDOW,
+        "T_total":         T_s,
+        "release_node":    {"idx": tailrace_idx, "ref": "19109",
+                            "name": "Inniscarra Tailrace"},
+        "decoupled_nodes": {
+            "inniscarra_headrace":    {"idx": headrace_idx,      "ref": "19094"},
+            "carrigadrohid_headrace": {"idx": carrigadrohid_idx, "ref": "19095"},
+        },
+        "downstream_nodes":      downstream_idx,
+        "t_release_step":        t_release,
+        "ramp_rate_m_per_step":  ramp_rate,
+        "plateau_rise_m":        plateau_rise,
+        "ramp_steps":            ramp_steps,
+        "plateau_steps":         plateau_steps,
     }
-    save_scenario("S3_ChannelBlockage", out_dir, X_syn, y_syn, m_syn, meta)
+    save_scenario("S3_InniscarraRelease", out_dir, X_syn, y_syn, m_syn, meta)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -867,7 +970,7 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
 SCENARIO_MAP = {
     "S1": generate_s1_convective_cell,
     "S2": generate_s2_gauge_failure,
-    "S3": generate_s3_channel_blockage,
+    "S3": generate_s3_inniscarra_release,
     "S4": generate_s4_sat_breakthrough,
     "S5": generate_s5_spatial_gradient,
 }

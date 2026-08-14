@@ -22,6 +22,13 @@ F4  scenario_difficulty.png
     Real-data RMSE vs scenario RMSE per model (scatter, all scenarios).
     Contextualises how much harder the synthetic dataset is.
 
+F5  inniscarra_release_leakage.png
+    S3 InniscarraRelease: downstream RMSE (does the model anticipate the
+    legitimate release signal) vs upstream leakage bias (does it wrongly
+    route that signal backward onto the decoupled reservoir inflow
+    gauges) per model. Key result: a physics-informed model should keep
+    leakage bias near zero while still tracking the downstream signal.
+
 Usage
 -----
     python src/scenarios/analyse_scenarios.py
@@ -91,7 +98,7 @@ HZ_LABEL = {4: "1hr", 12: "3hr", 16: "4hr", 24: "6hr", 48: "12hr"}
 SCEN_LABELS = {
     "S1_ConvectiveCell":   "S1\nConvective\nCell",
     "S2_GaugeFailure":     "S2\nGauge\nFailure",
-    "S3_ChannelBlockage":  "S3\nChannel\nBlockage",
+    "S3_InniscarraRelease": "S3\nInniscarra\nRelease",
     "S4_SatBreakthrough":  "S4\nSat.\nBreakthrough",
     "S5_SpatialGradient":  "S5\nSpatial\nGradient",
 }
@@ -248,6 +255,100 @@ def plot_gauge_failure_degradation(df_scen: pd.DataFrame) -> None:
     ax.set_ylim(bottom=0)
     fig.tight_layout()
     out = FIGS_DIR / "gauge_failure_degradation.png"
+    fig.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# F5 — Inniscarra release: downstream tracking vs upstream leakage
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_inniscarra_release_leakage(df_scen: pd.DataFrame) -> None:
+    """
+    S3 InniscarraRelease: two-panel figure per model x horizon.
+
+    Left panel  — s3_downstream_rmse_post: RMSE on the genuine,
+        release-driven downstream signal. Lower is better (the model
+        should learn to anticipate this from the tailrace node alone).
+    Right panel — s3_upstream_leakage_bias: mean(pred - obs) at the two
+        reservoir INFLOW gauges, which carry no synthetic perturbation
+        at all. A physics-informed model should keep this at ~0 (the
+        release cannot physically propagate upstream through a dam); a
+        model that isn't respecting reservoir topology will show a
+        systematic positive bias here, in direct analogy to the false
+        alarms the scenario's earlier ChannelBlockage form was designed
+        to catch.
+    """
+    df_s3 = df_scen[df_scen.scenario == "S3_InniscarraRelease"].copy()
+    if df_s3.empty or "s3_upstream_leakage_bias" not in df_s3.columns:
+        print("[skip] F5: S3_InniscarraRelease data not available")
+        return
+
+    models  = [m for m in MODEL_ORDER if m in df_s3.model.unique()]
+    hz_list = sorted(df_s3.horizon.unique())
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+    fig.patch.set_facecolor("white")
+
+    x = np.arange(len(hz_list))
+    w = 0.8 / max(len(models), 1)
+    offsets = np.linspace(-(len(models)-1)/2*w, (len(models)-1)/2*w, len(models))
+
+    for m, offset in zip(models, offsets):
+        sub = df_s3[df_s3.model == m]
+        rmse_means = [sub[sub.horizon == hz]["s3_downstream_rmse_post"].mean()
+                     for hz in hz_list]
+        rmse_stds  = [sub[sub.horizon == hz]["s3_downstream_rmse_post"].std(ddof=1)
+                     if len(sub[sub.horizon == hz]) > 1 else 0
+                     for hz in hz_list]
+        ax1.bar(x + offset, rmse_means, w,
+               color=MODEL_COLORS.get(m, "#888888"),
+               yerr=rmse_stds, capsize=3, alpha=0.85,
+               label=MODEL_LABELS.get(m, m), edgecolor="white")
+
+        bias_means = [sub[sub.horizon == hz]["s3_upstream_leakage_bias"].mean()
+                     for hz in hz_list]
+        bias_stds  = [sub[sub.horizon == hz]["s3_upstream_leakage_bias"].std(ddof=1)
+                     if len(sub[sub.horizon == hz]) > 1 else 0
+                     for hz in hz_list]
+        ax2.bar(x + offset, bias_means, w,
+               color=MODEL_COLORS.get(m, "#888888"),
+               yerr=bias_stds, capsize=3, alpha=0.85,
+               label=MODEL_LABELS.get(m, m), edgecolor="white")
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([HZ_LABEL.get(h, str(h)) for h in hz_list])
+    ax1.set_xlabel("Forecast horizon")
+    ax1.set_ylabel("RMSE (m), post-release, downstream nodes")
+    ax1.set_title(
+        "Downstream tracking\nLower = better anticipates the release",
+        fontsize=10)
+    ax1.set_ylim(bottom=0)
+    ax1.grid(True, alpha=0.3, axis="y")
+
+    ax2.axhline(0.0, color="#444441", lw=1.0, ls="--",
+               label="No leakage (bias=0)")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([HZ_LABEL.get(h, str(h)) for h in hz_list])
+    ax2.set_xlabel("Forecast horizon")
+    ax2.set_ylabel("Bias (m), post-release, reservoir inflow nodes")
+    ax2.set_title(
+        "Upstream leakage\nCloser to 0 = respects reservoir topology",
+        fontsize=10)
+    ax2.grid(True, alpha=0.3, axis="y")
+
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center",
+              ncol=min(8, len(handles)), fontsize=8,
+              bbox_to_anchor=(0.5, -0.05))
+
+    fig.suptitle(
+        "S3 InniscarraRelease: does the model track a legitimate outlet-"
+        "driven signal without leaking it backward through the reservoir?",
+        fontsize=11)
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    out = FIGS_DIR / "inniscarra_release_leakage.png"
     fig.savefig(out, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out.name}")
@@ -467,6 +568,7 @@ def main() -> None:
     write_summary_table(df_scen, df_real)
     plot_scenario_advantage_table(df_scen, df_real)
     plot_gauge_failure_degradation(df_scen)
+    plot_inniscarra_release_leakage(df_scen)
     plot_convective_cell_horizon(df_scen, df_real)
     plot_scenario_difficulty(df_scen)
 

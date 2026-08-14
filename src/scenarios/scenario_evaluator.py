@@ -61,7 +61,7 @@ F_STAGE   = 0
 F_SW2_SAT = 9
 
 SCENARIOS = ["S1_ConvectiveCell", "S2_GaugeFailure",
-             "S3_ChannelBlockage", "S4_SatBreakthrough",
+             "S3_InniscarraRelease", "S4_SatBreakthrough",
              "S5_SpatialGradient"]
 
 HORIZONS  = [4, 12, 16, 24, 48]
@@ -232,116 +232,78 @@ def s3_metrics(pred: np.ndarray, y_syn: np.ndarray,
                meta: dict, bankfull: np.ndarray,
                T_in: int, T_out: int) -> dict:
     """
-    ChannelBlockage: does the model correctly resist propagating the
-    upstream backwater anomaly to the (truly suppressed) downstream gauge?
+    InniscarraRelease: does the model correctly react to a legitimate,
+    operationally-driven signal that starts at the reservoir outlet and
+    is deliberately decoupled from rainfall — while NOT leaking that
+    same signal backward onto the reservoir INFLOW gauges, where it has
+    no physical influence (water cannot flow upstream through a dam)?
 
-    FIXED — two bugs, both of which independently drove the previous
-    s3_false_alarm_rate to exactly 0.0 across all 135 checkpoints:
+    scenario_generator.py's S3 changed from a hypothetical debris
+    blockage (upstream/downstream stage decoupling on an ordinary river
+    edge) to a real, documented ESB reservoir release event. The old
+    meta fields ("blockage_edge", "t_blockage_step") no longer exist —
+    this version reads the new ones ("release_node", "t_release_step",
+    "decoupled_nodes", "downstream_nodes") and reports two
+    complementary metrics, both restricted to rows genuinely past each
+    window's own release onset (per-window local step via
+    _window_local_step — a global cutoff over the concatenated array
+    would suffer the same aliasing bug documented in s1/s2_metrics'
+    predecessors):
 
-    Bug 1 (alignment): scenario_generator.py concatenates many
-    independent T_WINDOW-length windows back-to-back, each with its OWN
-    local blockage onset at local step t_blockage_step (e.g. 36 within
-    each 104-step window — see meta["t_blockage_step"]). The previous
-    code treated t_blockage_step as a SINGLE GLOBAL cutoff over the
-    entire concatenated `pred`/`y_syn` arrays: `pred[t_blk:, dst]`. Since
-    `pred` here spans dozens of windows back-to-back, that only excluded
-    the first ~36 rows of the ENTIRE array and then labelled everything
-    else "post-blockage" — including the calm, PRE-blockage segments of
-    every later window. The true post-blockage segments were diluted
-    into a mostly-calm pool, so FP was ~always 0 relative to the
-    (mostly calm) TN pool regardless of what any model actually
-    predicted. This version recovers each row's position WITHIN its own
-    generation window (`local_step = absolute_target_time % T_WINDOW`)
-    and only evaluates rows that are genuinely past that window's own
-    blockage onset.
-
-    Bug 2 (threshold insensitivity): comparing against the FULL bankfull
-    threshold is not a sensitive test in this scenario by design —
-    select_base_windows() deliberately picks calm, moderate-flow windows
-    (max_stage_frac ~0.30-0.40 of bankfull) as the baseline, so neither
-    predictions nor (deliberately suppressed) observations get anywhere
-    near full bankfull regardless of model behaviour. A "false alarm" in
-    the sense this scenario is meant to test — does the model
-    erroneously route the upstream anomaly downstream — is better
-    captured as a RISE relative to the node's own pre-blockage baseline,
-    not an absolute bankfull crossing. Both are reported below:
-      - s3_downstream_bias_post: mean(pred - obs) at the downstream node
-        during genuinely post-blockage steps. Positive = model predicts
-        higher stage than the (correctly suppressed) truth, i.e. it is
-        partially "fooled" into propagating the anomaly downstream.
-        This is the most direct, continuous measure of the scenario's
-        stated intent and should be the primary metric going forward.
-      - s3_false_alarm_rate: FP/(FP+TN) using a RISE threshold
-        (far_rise_frac x bankfull[dst], above the node's own
-        pre-blockage baseline) instead of an absolute bankfull crossing,
-        so it can actually discriminate between models on these
-        deliberately-calm baseline windows.
+      - s3_downstream_rmse_post: RMSE at the propagation-chain nodes
+        downstream of the tailrace during genuinely post-release rows.
+        This IS a real, physically-driven signal the model should learn
+        to anticipate from the release node's own trajectory, not from
+        rainfall. Lower is better.
+      - s3_upstream_leakage_bias: mean(pred - obs) at the two reservoir
+        INFLOW nodes (Inniscarra Headrace, Carrigadrohid Headrace)
+        during the same rows. These nodes carry no synthetic
+        perturbation at all — obs stays at its natural pre-release
+        level — so any systematic rise here is the model spuriously
+        routing an outlet-driven signal backward against the hydraulic
+        gradient. Should be ~0 for any model that respects reservoir
+        topology; a large positive value is the direct analogue of the
+        old scenario's "false alarm".
     """
-    block = meta.get("blockage_edge", {})
-    dst   = block.get("dst", -1)
-    t_blk = meta.get("t_blockage_step", 36)
-    # T_per_window isn't currently saved in S3's own scenario_meta.json
-    # (S1/S2/S4 do save it) — fall back to the shared T_WINDOW constant
-    # used across all scenario_generator.py scenarios (104, confirmed
-    # from S1/S2/S4's own T_per_window/T_total ratios) if absent. Worth
-    # adding "T_per_window" to S3's meta dict in scenario_generator.py
-    # too, so this fallback isn't needed going forward.
-    T_window = meta.get("T_per_window", 104)
-    far_rise_frac = 0.15   # "false alarm" = rise > 15% of bankfull above
-                            # the node's own pre-blockage baseline
+    release    = meta.get("release_node", {})
+    t_rel      = meta.get("t_release_step", 36)
+    T_window   = meta.get("T_per_window", 104)
+    downstream = meta.get("downstream_nodes", [])
+    decoupled  = meta.get("decoupled_nodes", {})
+    decoupled_idx = [v["idx"] for v in decoupled.values()] if decoupled else []
 
-    if dst < 0 or pred.shape[0] == 0:
-        return {"s3_downstream_bias_post": float("nan"),
-                "s3_false_alarm_rate": float("nan")}
+    if not downstream or pred.shape[0] == 0:
+        return {"s3_downstream_rmse_post": float("nan"),
+                "s3_upstream_leakage_bias": float("nan")}
 
     n_rows = pred.shape[0]
-    # Row i of pred/y_syn corresponds to absolute target time
-    # (i + T_in + T_out - 1) in the concatenated scenario series (see
-    # the target_arr construction in evaluate_checkpoint) — recover each
-    # row's position within its OWN T_window-length generation window.
-    abs_t = np.arange(n_rows) + T_in + T_out - 1
-    local_step = abs_t % T_window
-    window_idx = abs_t // T_window
-    is_post = local_step >= t_blk
+    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
+    is_post = local_step >= t_rel
 
     if is_post.sum() < 5:
-        return {"s3_downstream_bias_post": float("nan"),
-                "s3_false_alarm_rate": float("nan")}
+        return {"s3_downstream_rmse_post": float("nan"),
+                "s3_upstream_leakage_bias": float("nan")}
 
-    pred_dst = pred[:, dst]
-    obs_dst  = y_syn[:, dst]
+    p_down = pred[is_post][:, downstream]
+    t_down = y_syn[is_post][:, downstream]
+    m_down = np.ones_like(p_down, dtype=bool)
+    downstream_rmse = _rmse(p_down, t_down, m_down)
 
-    # Per-window pre-blockage baseline (mean observed stage at dst
-    # before that window's own blockage onset), used as the reference
-    # level for the rise-based false-alarm test.
-    baseline_per_window = {}
-    for w in np.unique(window_idx):
-        pre_mask = (window_idx == w) & (~is_post)
-        if pre_mask.sum() > 0:
-            baseline_per_window[w] = float(obs_dst[pre_mask].mean())
-    baseline = np.array([baseline_per_window.get(w, np.nan) for w in window_idx])
+    if decoupled_idx:
+        p_up = pred[is_post][:, decoupled_idx]
+        t_up = y_syn[is_post][:, decoupled_idx]
+        finite = np.isfinite(p_up) & np.isfinite(t_up)
+        leakage_bias = (float(np.mean((p_up - t_up)[finite]))
+                        if finite.sum() > 0 else float("nan"))
+    else:
+        leakage_bias = float("nan")
 
-    valid = is_post & np.isfinite(baseline) & np.isfinite(pred_dst) & np.isfinite(obs_dst)
-    if valid.sum() < 5:
-        return {"s3_downstream_bias_post": float("nan"),
-                "s3_false_alarm_rate": float("nan")}
-
-    bias_post = float(np.mean(pred_dst[valid] - obs_dst[valid]))
-
-    thr        = float(bankfull[dst])
-    rise_thr   = far_rise_frac * thr
-    pred_rise  = pred_dst[valid] - baseline[valid]
-    obs_rise   = obs_dst[valid]  - baseline[valid]
-    pred_flood = pred_rise >= rise_thr
-    obs_flood  = obs_rise  >= rise_thr   # should be ~always False by
-                                          # construction (suppression
-                                          # keeps obs below baseline)
-    FP = int(( pred_flood & ~obs_flood).sum())
-    TN = int((~pred_flood & ~obs_flood).sum())
-    far = FP / max(FP + TN, 1)
-
-    return {"s3_downstream_bias_post": round(bias_post, 5),
-            "s3_false_alarm_rate": round(far, 4)}
+    return {
+        "s3_downstream_rmse_post": (round(downstream_rmse, 5)
+                                    if np.isfinite(downstream_rmse) else float("nan")),
+        "s3_upstream_leakage_bias": (round(leakage_bias, 5)
+                                     if np.isfinite(leakage_bias) else float("nan")),
+    }
 
 
 def s4_metrics(pred: np.ndarray, y_syn: np.ndarray,
