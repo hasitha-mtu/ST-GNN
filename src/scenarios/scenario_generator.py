@@ -150,34 +150,22 @@ def apply_routing(stage_delta: np.ndarray,
     return routed
 
 
-def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
-                               source_idx: int, ed: pd.DataFrame,
-                               lags: dict, baseline: float,
-                               max_hops: int = 8) -> list[int]:
+def downstream_bfs_edges(source_idx: int, ed: pd.DataFrame,
+                         max_hops: int = 8) -> list[tuple[int, int]]:
     """
-    Multi-hop downstream propagation of a stage delta injected at
-    source_idx, walking the directed river network in `ed` outward
-    hop-by-hop (BFS) rather than a single edge pass.
+    Pure-topology BFS from source_idx outward through the directed river
+    network in `ed`, returning the (src, dst) edges reached in hop order.
 
-    S1/S5's routing loops apply `apply_routing` once per perturbed node
-    because the nodes they perturb (headwaters) sit directly adjacent to
-    the segment being tested. S3's injection point (Inniscarra Tailrace)
-    is five edges upstream of the last Cork city gauge, so a single pass
-    would only ever reach Waterworks Weir and leave the rest of the
-    chain — Fitzgerald's Park, Pope's Quay, St. Patrick's Quay, Currach
-    Club — completely untouched. This walks the chain until it runs out
-    of downstream edges (or max_hops), applying the existing per-edge
-    lag + attenuation from `apply_routing` at each hop, so the signal
-    weakens naturally as it travels rather than being re-injected at
-    full strength at every node.
-
-    Returns the list of node indices reached, in hop order — used as the
-    scenario's `downstream_nodes` meta field.
+    Split out from the signal-propagation step below so the downstream
+    node set can be determined once, before any window data is touched —
+    needed both to scope select_base_windows' calm-baseline check to the
+    scenario's relevant nodes, and to avoid re-querying `ed` on every one
+    of the ~30 windows generated per scenario (topology doesn't depend on
+    window content).
     """
     visited = {source_idx}
     frontier = [source_idx]
-    signal = {source_idx: y_w[:, source_idx] - baseline}
-    reached: list[int] = []
+    edges_order: list[tuple[int, int]] = []
 
     for _ in range(max_hops):
         if not frontier:
@@ -189,14 +177,44 @@ def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
                 dst = int(edge["dst_idx"])
                 if dst in visited:
                     continue
-                dst_delta = apply_routing(signal[node], node, dst, lags)
-                y_w[:, dst] += dst_delta
-                X_w[:, dst, F_STAGE] += dst_delta
-                signal[dst] = dst_delta
                 visited.add(dst)
-                reached.append(dst)
+                edges_order.append((node, dst))
                 next_frontier.append(dst)
         frontier = next_frontier
+
+    return edges_order
+
+
+def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
+                               source_idx: int, edges_order: list[tuple[int, int]],
+                               lags: dict, baseline: float) -> list[int]:
+    """
+    Multi-hop downstream propagation of a stage delta injected at
+    source_idx, walking the precomputed BFS edge order from
+    `downstream_bfs_edges` and applying `apply_routing`'s per-edge lag +
+    attenuation at each hop, so the signal weakens naturally as it
+    travels rather than being re-injected at full strength at every
+    node.
+
+    S1/S5's routing loops apply `apply_routing` once per perturbed node
+    because the nodes they perturb (headwaters) sit directly adjacent to
+    the segment being tested. S3's injection point (Inniscarra Tailrace)
+    is five edges upstream of the last Cork city gauge, so a single pass
+    would only ever reach Waterworks Weir and leave the rest of the
+    chain — Fitzgerald's Park, Pope's Quay, St. Patrick's Quay, Currach
+    Club — completely untouched. This walks the full precomputed chain.
+
+    Returns the list of node indices reached, in hop order.
+    """
+    signal = {source_idx: y_w[:, source_idx] - baseline}
+    reached: list[int] = []
+
+    for src, dst in edges_order:
+        dst_delta = apply_routing(signal[src], src, dst, lags)
+        y_w[:, dst] += dst_delta
+        X_w[:, dst, F_STAGE] += dst_delta
+        signal[dst] = dst_delta
+        reached.append(dst)
 
     return reached
 
@@ -251,7 +269,8 @@ def select_base_windows(X: np.ndarray, y: np.ndarray,
                         max_stage_frac: float = 0.40,
                         n_windows: int = 50,
                         search_from_frac: float = 0.70,
-                        t_stride: int = 48) -> list[int]:
+                        t_stride: int = 48,
+                        node_subset: Optional[list[int]] = None) -> list[int]:
     """
     Select T_WINDOW-length base windows from the validation + test period.
 
@@ -267,10 +286,23 @@ def select_base_windows(X: np.ndarray, y: np.ndarray,
         - swvl2_sat_ratio (mean across nodes) within [sat_min, sat_max]
         - No gauge exceeds max_stage_frac × bankfull threshold (calm)
         - Windows separated by at least T_IN steps to limit overlap
+
+    node_subset: restrict the calm-baseline check (condition 2) to these
+        node indices instead of all N gauges. Requiring every one of the
+        27 Lee gauges to be simultaneously calm is the right test for a
+        scenario whose injected anomaly could plausibly interact with
+        any node (e.g. the original channel-blockage form), but it's an
+        unnecessarily strict — and yield-limiting — constraint for a
+        scenario that only perturbs a fixed, known subset of nodes (e.g.
+        S3's tailrace + downstream chain): whether some unrelated
+        headwater gauge happens to be flooded has no bearing on whether
+        the release event being injected is physically valid. Default
+        None preserves the original all-nodes behaviour for S1/S2/S4/S5.
     """
     T = X.shape[0]
     search_start = int(T * search_from_frac)
     candidates = []
+    check_nodes = node_subset if node_subset is not None else range(y.shape[1])
 
     t = search_start
     while t < T - T_WINDOW and len(candidates) < n_windows:
@@ -304,12 +336,14 @@ def select_base_windows(X: np.ndarray, y: np.ndarray,
             if not (sat_min <= proxy_sat <= sat_max):
                 t += t_stride; continue
 
-        # Condition 2: calm baseline — per-node bankfull comparison
+        # Condition 2: calm baseline — per-node bankfull comparison,
+        # scoped to `check_nodes` (all N gauges unless a scenario
+        # narrows it via node_subset — see docstring above).
         # BUG FIX: original used np.nanmin(bankfull)=0.05m giving
         # threshold=0.02m which rejected every window. Now compares
         # each node against its own bankfull with a 0.30m floor.
         calm = True
-        for _n in range(window_y.shape[1]):
+        for _n in check_nodes:
             bf_n = max(float(bankfull[_n]), 0.30)
             if float(np.nanmax(np.abs(window_y[:T_IN, _n]))) > max_stage_frac * bf_n:
                 calm = False
@@ -604,33 +638,6 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
 
     T = X.shape[0]; N = X.shape[1]
 
-    # Select calm-to-moderate windows so the release signal is clearly
-    # attributable rather than swamped by a concurrent flood event. Same
-    # retry structure as the scenario's earlier form (and S5): the joint
-    # saturation + calm-baseline constraint can return zero windows in
-    # the validation-period search region, so loosen max_stage_frac once
-    # before giving up rather than silently producing a zero-length
-    # scenario.
-    window_starts = select_base_windows(
-        X, y, bankfull, sat_min=0.60, sat_max=0.92,
-        max_stage_frac=0.30, n_windows=n_windows,
-        search_from_frac=0.70)
-
-    if not window_starts:
-        print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
-              "0.40 (matches S1/S5 default)")
-        window_starts = select_base_windows(
-            X, y, bankfull, sat_min=0.60, sat_max=0.92,
-            max_stage_frac=0.40, n_windows=n_windows,
-            search_from_frac=0.70)
-
-    if not window_starts:
-        print("  [skip] No valid base windows found for S3 even after "
-              "loosening max_stage_frac — check sat_min/sat_max against "
-              "the actual swvl2_sat_ratio distribution in the "
-              "search_from_frac=0.70 region")
-        return
-
     # Identify the release node (Inniscarra Tailrace) and the two
     # upstream inflow nodes that must stay decoupled, by ref rather than
     # a hardcoded node_idx — stays correct even if nodes.csv row order
@@ -650,6 +657,54 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
         print("  [warn] One or both reservoir inflow nodes (19094/19095) "
               "missing from nodes.csv — decoupled_nodes meta will be partial")
 
+    # Downstream chain topology (Waterworks Weir -> Fitzgerald's Park ->
+    # Pope's Quay -> St. Patrick's Quay -> Currach Club) is fixed by the
+    # graph, not by window content — compute it once, before window
+    # selection, so it can both scope the calm-baseline check below and
+    # be reused for every window's routing pass without re-querying `ed`.
+    edges_order = downstream_bfs_edges(tailrace_idx, ed)
+    downstream_idx = [dst for _src, dst in edges_order]
+
+    # Select calm-to-moderate windows so the release signal is clearly
+    # attributable rather than swamped by a concurrent flood event.
+    #
+    # node_subset restricts the calm-baseline check to only the nodes
+    # this scenario actually perturbs (tailrace + downstream chain).
+    # The original blockage version of S3 required all 27 Lee gauges
+    # calm simultaneously — appropriate when an injected anomaly could
+    # plausibly interact anywhere, but an unnecessarily strict (and
+    # yield-limiting) constraint here: whether some unrelated headwater
+    # gauge is mid-flood has no bearing on whether an Inniscarra release
+    # is physically valid to inject. Narrowing this recovered most of
+    # the window shortfall reported after the first --all run (11/30
+    # windows found under the old all-27-gauges check).
+    release_relevant_nodes = [tailrace_idx] + downstream_idx
+
+    # Same retry structure as before (and S5): the joint saturation +
+    # calm-baseline constraint can still return zero windows in the
+    # validation-period search region even scoped down, so loosen
+    # max_stage_frac once before giving up rather than silently
+    # producing a zero-length scenario.
+    window_starts = select_base_windows(
+        X, y, bankfull, sat_min=0.60, sat_max=0.92,
+        max_stage_frac=0.30, n_windows=n_windows,
+        search_from_frac=0.70, node_subset=release_relevant_nodes)
+
+    if not window_starts:
+        print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
+              "0.40 (matches S1/S5 default)")
+        window_starts = select_base_windows(
+            X, y, bankfull, sat_min=0.60, sat_max=0.92,
+            max_stage_frac=0.40, n_windows=n_windows,
+            search_from_frac=0.70, node_subset=release_relevant_nodes)
+
+    if not window_starts:
+        print("  [skip] No valid base windows found for S3 even after "
+              "loosening max_stage_frac — check sat_min/sat_max against "
+              "the actual swvl2_sat_ratio distribution in the "
+              "search_from_frac=0.70 region")
+        return
+
     T_s   = T_WINDOW * len(window_starts)
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
@@ -665,8 +720,6 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
     plateau_steps  = 20           # ≈5 hr sustained release
     # Full ramp-up + plateau + ramp-down = 36 + 23 + 20 + 23 = 102 steps,
     # fits inside T_WINDOW (104) with margin.
-
-    downstream_idx: list[int] = []
 
     for i, t0 in enumerate(window_starts):
         sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
@@ -696,11 +749,10 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
         # multiple hops out from the tailrace (Waterworks Weir ->
         # Fitzgerald's Park -> Pope's Quay -> St. Patrick's Quay ->
         # Currach Club), attenuating per edge via the same routing lags
-        # used elsewhere in this module.
-        reached = propagate_downstream_chain(
-            y_w, X_w, tailrace_idx, ed, lags, baseline=base_tail)
-        if i == 0:
-            downstream_idx = reached
+        # used elsewhere in this module. Topology precomputed above —
+        # same chain for every window.
+        propagate_downstream_chain(
+            y_w, X_w, tailrace_idx, edges_order, lags, baseline=base_tail)
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
