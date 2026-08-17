@@ -63,6 +63,7 @@ STEP_MIN    = 15
 # ── Colour / label conventions (must match analyse_experiments.py) ────────────
 MODEL_ORDER = ["gru", "lstm", "ealstm", "st_gnn",
                "st_gnn_dyn_edge", "st_gnn_hand_edge", "st_gnn_soil_gate",
+               "st_gnn_backwater_edge",
                "dfc_gnn", "dfc_gnn_unified"]
 MODEL_LABELS = {
     "gru":              "GRU",
@@ -72,6 +73,7 @@ MODEL_LABELS = {
     "st_gnn_dyn_edge":  "ST-GNN DynEdge",
     "st_gnn_hand_edge": "ST-GNN HAND",
     "st_gnn_soil_gate": "ST-GNN Soil Gate",
+    "st_gnn_backwater_edge": "ST-GNN Backwater",
     "dfc_gnn":          "DFC-GNN",
     "dfc_gnn_unified":  "PC-DFC-GNN",
 }
@@ -83,6 +85,7 @@ MODEL_COLORS = {
     "st_gnn_dyn_edge":  "#7B68EE",
     "st_gnn_hand_edge": "#9B59B6",
     "st_gnn_soil_gate": "#5B2C6F",
+    "st_gnn_backwater_edge": "#2E86AB",
     "dfc_gnn":          "#B8860B",
     "dfc_gnn_unified":  "#D4A017",
 }
@@ -90,6 +93,7 @@ MODEL_MARKERS = {
     "gru": "o", "lstm": "s", "ealstm": "d",
     "st_gnn": "^", "st_gnn_dyn_edge": "P",
     "st_gnn_hand_edge": "X", "st_gnn_soil_gate": "v",
+    "st_gnn_backwater_edge": "<",
     "dfc_gnn": "h", "dfc_gnn_unified": "*",
 }
 
@@ -101,6 +105,7 @@ SCEN_LABELS = {
     "S3_InniscarraRelease": "S3\nInniscarra\nRelease",
     "S4_SatBreakthrough":  "S4\nSat.\nBreakthrough",
     "S5_SpatialGradient":  "S5\nSpatial\nGradient",
+    "S6_ChannelBlockage":  "S6\nChannel\nBlockage",
 }
 
 
@@ -355,6 +360,95 @@ def plot_inniscarra_release_leakage(df_scen: pd.DataFrame) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# F6 — ChannelBlockage: known architectural-limitation diagnostic
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_channel_blockage_diagnostic(df_scen: pd.DataFrame) -> None:
+    """
+    S6 ChannelBlockage: NOT a leaderboard — see
+    generate_s6_channel_blockage's docstring in scenario_generator.py.
+    Large positive s6_upstream_backwater_bias is the EXPECTED result for
+    every directed-topology model; this figure exists to show whether
+    ST-GNN Backwater — the one model with an actual (gated) reverse
+    pathway at the diagnostic's bridge location — narrows that gap
+    relative to everything else, not to rank models against each other
+    in the usual sense.
+
+    Left panel  — s6_upstream_backwater_bias per model. Everything
+        except ST-GNN Backwater is expected to show a large, similar
+        bias (governed by directed topology, not architecture quality).
+    Right panel — s6_downstream_suppression_rmse per model. This side
+        IS a normal, meaningful comparison (no reverse edge needed).
+    """
+    df_s6 = df_scen[df_scen.scenario == "S6_ChannelBlockage"].copy()
+    if df_s6.empty or "s6_upstream_backwater_bias" not in df_s6.columns:
+        print("[skip] F6: S6_ChannelBlockage data not available")
+        return
+
+    models  = [m for m in MODEL_ORDER if m in df_s6.model.unique()]
+    hz_list = sorted(df_s6.horizon.unique())
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+    fig.patch.set_facecolor("white")
+
+    x = np.arange(len(hz_list))
+    w = 0.8 / max(len(models), 1)
+    offsets = np.linspace(-(len(models)-1)/2*w, (len(models)-1)/2*w, len(models))
+
+    for m, offset in zip(models, offsets):
+        sub = df_s6[df_s6.model == m]
+        edgecolor = "black" if m == "st_gnn_backwater_edge" else "white"
+        lw = 1.8 if m == "st_gnn_backwater_edge" else 0.6
+
+        bias_means = [sub[sub.horizon == hz]["s6_upstream_backwater_bias"].mean()
+                     for hz in hz_list]
+        bias_stds  = [sub[sub.horizon == hz]["s6_upstream_backwater_bias"].std(ddof=1)
+                     if len(sub[sub.horizon == hz]) > 1 else 0 for hz in hz_list]
+        ax1.bar(x + offset, bias_means, w, color=MODEL_COLORS.get(m, "#888888"),
+               yerr=bias_stds, capsize=3, alpha=0.85,
+               label=MODEL_LABELS.get(m, m), edgecolor=edgecolor, linewidth=lw)
+
+        rmse_means = [sub[sub.horizon == hz]["s6_downstream_suppression_rmse"].mean()
+                     for hz in hz_list]
+        rmse_stds  = [sub[sub.horizon == hz]["s6_downstream_suppression_rmse"].std(ddof=1)
+                     if len(sub[sub.horizon == hz]) > 1 else 0 for hz in hz_list]
+        ax2.bar(x + offset, rmse_means, w, color=MODEL_COLORS.get(m, "#888888"),
+               yerr=rmse_stds, capsize=3, alpha=0.85,
+               label=MODEL_LABELS.get(m, m), edgecolor=edgecolor, linewidth=lw)
+
+    ax1.set_xticks(x); ax1.set_xticklabels([HZ_LABEL.get(h, str(h)) for h in hz_list])
+    ax1.set_xlabel("Forecast horizon")
+    ax1.set_ylabel("Bias (m), post-blockage, backwater nodes")
+    ax1.set_title(
+        "Upstream backwater blind spot\n"
+        "Large positive bias EXPECTED for all directed-topology models",
+        fontsize=10)
+    ax1.grid(True, alpha=0.3, axis="y")
+
+    ax2.set_xticks(x); ax2.set_xticklabels([HZ_LABEL.get(h, str(h)) for h in hz_list])
+    ax2.set_xlabel("Forecast horizon")
+    ax2.set_ylabel("RMSE (m), post-blockage, downstream node")
+    ax2.set_title(
+        "Downstream suppression\nA normal, meaningful comparison (no reverse edge needed)",
+        fontsize=10)
+    ax2.grid(True, alpha=0.3, axis="y")
+
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center",
+              ncol=min(8, len(handles)), fontsize=8, bbox_to_anchor=(0.5, -0.05))
+
+    fig.suptitle(
+        "S6 ChannelBlockage: architectural-limitation diagnostic, not a leaderboard "
+        "(ST-GNN Backwater outlined — the only model with a gated reverse pathway)",
+        fontsize=11)
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    out = FIGS_DIR / "channel_blockage_diagnostic.png"
+    fig.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # F3 — ConvectiveCell horizon curves
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -569,6 +663,7 @@ def main() -> None:
     plot_scenario_advantage_table(df_scen, df_real)
     plot_gauge_failure_degradation(df_scen)
     plot_inniscarra_release_leakage(df_scen)
+    plot_channel_blockage_diagnostic(df_scen)
     plot_convective_cell_horizon(df_scen, df_real)
     plot_scenario_difficulty(df_scen)
 

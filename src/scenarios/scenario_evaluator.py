@@ -62,7 +62,7 @@ F_SW2_SAT = 9
 
 SCENARIOS = ["S1_ConvectiveCell", "S2_GaugeFailure",
              "S3_InniscarraRelease", "S4_SatBreakthrough",
-             "S5_SpatialGradient"]
+             "S5_SpatialGradient", "S6_ChannelBlockage"]
 
 HORIZONS  = [4, 12, 16, 24, 48]
 
@@ -321,12 +321,15 @@ def s4_metrics(pred: np.ndarray, y_syn: np.ndarray,
     (mixing each window's true pre- AND post-breakthrough segments
     together) and rmse_post over windows 15-29 entirely — this has
     nothing to do with sat_breakthrough_step (meta["sat_breakthrough_step"],
-    typically 40 steps into each window), despite producing
-    plausible-looking, non-zero numbers. This version isolates
-    pre/post-breakthrough rows WITHIN every window using the same
-    local-step recovery as s1/s2/s3_metrics.
+    typically 46 steps into each window — see scenario_generator.py's
+    derivation of sat_breakthrough_step from the saturation ramp
+    parameters, fixed from an earlier hardcoded T_IN+8 that didn't
+    actually coincide with the ramp crossing its own excess_factor
+    threshold), despite producing plausible-looking, non-zero numbers.
+    This version isolates pre/post-breakthrough rows WITHIN every window
+    using the same local-step recovery as s1/s2/s3_metrics.
     """
-    t_bt      = meta.get("sat_breakthrough_step", 40)
+    t_bt      = meta.get("sat_breakthrough_step", 46)
     T_window  = meta.get("T_per_window", 104)
     n_rows    = pred.shape[0]
 
@@ -352,6 +355,71 @@ def s4_metrics(pred: np.ndarray, y_syn: np.ndarray,
         "s4_rmse_pre_breakthrough":  rmse_pre,
         "s4_rmse_post_breakthrough": rmse_post,
         "s4_post_pre_ratio":         (rmse_post / max(rmse_pre, 1e-6)),
+    }
+
+
+def s6_metrics(pred: np.ndarray, y_syn: np.ndarray,
+               meta: dict, T_in: int, T_out: int) -> dict:
+    """
+    ChannelBlockage: quantifies the architectural blind spot at the
+    bridge/culvert backwater location, rather than testing whether a
+    model "passes." A large positive s6_upstream_backwater_bias is the
+    EXPECTED result for every model — see generate_s6_channel_blockage's
+    docstring in scenario_generator.py for why no model in this suite
+    has a message-passing pathway to anticipate it.
+
+      - s6_upstream_backwater_bias: mean(obs - pred) at the
+        blockage+upstream nodes during genuinely post-blockage rows.
+        Positive = model under-predicts the backwater rise it can't see
+        coming (the expected failure mode). Near zero would mean the
+        model somehow anticipated it, worth investigating why.
+      - s6_downstream_suppression_rmse: RMSE at the immediate downstream
+        node during the same rows — this one IS potentially learnable
+        from the node's own upstream-of-it inputs (rainfall, its own
+        recent stage trend) without needing reverse graph edges, so
+        unlike the backwater metric, better performance here is a
+        real, meaningful comparison across models.
+
+    Uses the same per-window local-step recovery as s1-s4_metrics (see
+    _window_local_step) — a global cutoff over the concatenated array
+    would misattribute rows across window boundaries.
+    """
+    blockage = meta.get("blockage_node", {})
+    upstream = meta.get("upstream_node", {})
+    downstream = meta.get("downstream_node", {})
+    t_blk    = meta.get("t_blockage_step", 36)
+    T_window = meta.get("T_per_window", 104)
+
+    backwater_idx = [i for i in (blockage.get("idx"), upstream.get("idx"))
+                     if i is not None]
+    downstream_idx = downstream.get("idx")
+
+    if not backwater_idx or downstream_idx is None or pred.shape[0] == 0:
+        return {"s6_upstream_backwater_bias": float("nan"),
+                "s6_downstream_suppression_rmse": float("nan")}
+
+    n_rows = pred.shape[0]
+    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
+    is_post = local_step >= t_blk
+
+    if is_post.sum() < 5:
+        return {"s6_upstream_backwater_bias": float("nan"),
+                "s6_downstream_suppression_rmse": float("nan")}
+
+    p_bw = pred[is_post][:, backwater_idx]
+    t_bw = y_syn[is_post][:, backwater_idx]
+    finite = np.isfinite(p_bw) & np.isfinite(t_bw)
+    bias = float(np.mean((t_bw - p_bw)[finite])) if finite.sum() > 0 else float("nan")
+
+    p_down = pred[is_post][:, [downstream_idx]]
+    t_down = y_syn[is_post][:, [downstream_idx]]
+    m_down = np.ones_like(p_down, dtype=bool)
+    down_rmse = _rmse(p_down, t_down, m_down)
+
+    return {
+        "s6_upstream_backwater_bias": round(bias, 5) if np.isfinite(bias) else float("nan"),
+        "s6_downstream_suppression_rmse": (round(down_rmse, 5)
+                                           if np.isfinite(down_rmse) else float("nan")),
     }
 
 
@@ -560,6 +628,8 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
         result.update(s4_metrics(pred, target_arr, X_syn, meta, T_in, T_out))
     elif scen_id == "S5":
         result.update(s5_metrics(pred, target_arr, meta))
+    elif scen_id == "S6":
+        result.update(s6_metrics(pred, target_arr, meta, T_in, T_out))
 
     return result
 

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Optional
@@ -827,8 +828,29 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    sat_breakthrough_step = T_IN + 8    # breakthrough 2hr into forecast horizon
     rain_peak_mm = 20.0                 # heavy but realistic frontal rainfall
+
+    # Saturation ramp parameters — kept as named constants (not inlined
+    # below) because sat_breakthrough_step is DERIVED from them. Previously
+    # sat_breakthrough_step was hardcoded to T_IN+8 independently of these,
+    # under the assumption that reached "2hr into the forecast" — but with
+    # sat_start=0.55, sat_rate=0.015/step, the ramp doesn't actually cross
+    # excess_threshold=0.75 until T_IN+14 (0.75-0.55=0.20; 0.20/0.015=13.3,
+    # rounds up to 14 steps). At the old T_IN+8, saturation was only 0.67 —
+    # excess_factor = max(0, 0.67-0.75)*4 = 0 EVERY window, EVERY node, so
+    # the "abrupt post-breakthrough acceleration" this scenario exists to
+    # test never actually fired. y_syn was silently just the calm baseline
+    # plus a tiny 8-step ramp, which is also why NSE was catastrophic for
+    # every model uniformly (implied target std ≈ 0.11m regardless of
+    # architecture — an artifact of the near-flat target, not model
+    # quality). Deriving sat_breakthrough_step here instead of hardcoding
+    # it separately makes this class of drift impossible to reintroduce.
+    sat_start        = 0.55
+    sat_rate         = 0.015   # per-step saturation increase
+    sat_cap          = 0.40    # matches the np.clip below
+    excess_threshold = 0.75
+    steps_to_threshold = math.ceil((excess_threshold - sat_start) / sat_rate)
+    sat_breakthrough_step = T_IN + steps_to_threshold   # = T_IN + 14
 
     for i, t0 in enumerate(window_starts):
         sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
@@ -843,15 +865,15 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
         # Set soil moisture synthetically — do not rely on X.npy sat values
         # which may be 0.0. S4 starts dry (0.55) and ramps to saturated.
         # Set baseline sat for entire input window (pre-event dry state)
-        X_w[:T_IN, :, F_SW2_SAT] = 0.55
+        X_w[:T_IN, :, F_SW2_SAT] = sat_start
         X_w[:T_IN, :, F_SW1_SAT] = 0.50
-        X_w[:T_IN, :, F_SW2_RAW] = 0.55 * 0.472
+        X_w[:T_IN, :, F_SW2_RAW] = sat_start * 0.472
         X_w[:T_IN, :, F_SW1_RAW] = 0.50 * 0.472
         # Progressive soil saturation build-up from rainfall
         for t in range(T_IN, T_WINDOW):
             steps_of_rain = t - T_IN
-            sat_increase  = min(0.40, steps_of_rain * 0.015)
-            X_w[t, :, F_SW2_SAT] = np.clip(0.55 + sat_increase, 0.0, 1.0)
+            sat_increase  = min(sat_cap, steps_of_rain * sat_rate)
+            X_w[t, :, F_SW2_SAT] = np.clip(sat_start + sat_increase, 0.0, 1.0)
             X_w[t, :, F_SW1_SAT] = np.clip(0.50 + sat_increase * 0.8, 0.0, 1.0)
             X_w[t, :, F_SW2_RAW] = X_w[t, :, F_SW2_SAT] * 0.472
             X_w[t, :, F_SW1_RAW] = X_w[t, :, F_SW1_SAT] * 0.472
@@ -869,7 +891,7 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
             p   = uh[ref]
             sat_at_breakthrough = float(
                 X_w[sat_breakthrough_step, n_idx, F_SW2_SAT])
-            excess_factor = max(0.0, sat_at_breakthrough - 0.75) * 4.0
+            excess_factor = max(0.0, sat_at_breakthrough - excess_threshold) * 4.0
             if excess_factor <= 0: continue
             uh_arr = triangular_uh(
                 p["peak_rate_m_per_mm"] * 2.0,  # 2× amplification post-breakthrough
@@ -899,6 +921,9 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
         "sat_breakthrough_step":  sat_breakthrough_step,
         "rain_peak_mm":           rain_peak_mm,
         "initial_sat_range":      [0.50, 0.68],
+        "sat_start":              sat_start,
+        "sat_rate_per_step":      sat_rate,
+        "excess_threshold":       excess_threshold,
     }
     save_scenario("S4_SatBreakthrough", out_dir, X_syn, y_syn, m_syn, meta)
 
@@ -1016,6 +1041,225 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# S6 — Bridge/culvert channel blockage: backwater upstream, suppressed flow
+#      downstream. Explicit architectural-limitation diagnostic.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
+                                  n_windows: int = 30) -> None:
+    """
+    Debris/ice blockage at a real bridge or culvert location decouples
+    upstream and downstream stage: backwater raises stage AT and
+    immediately UPSTREAM of the constriction (gradually-varied-flow M1
+    backwater profile — Chow, "Open-Channel Hydraulics", 1959), while
+    flow immediately DOWNSTREAM is suppressed by the restricted opening.
+
+    Every river edge in graph_builder.py points strictly downstream
+    (confirmed directly against edges.csv), with two known exceptions:
+    node pairs (0,1) and (2,3) — Ballincolly<->Glen Park and Blackpool
+    Retail Park<->Glennamought Bridge — carry genuine bidirectional
+    edges with independently-calibrated, non-symmetric routing lags
+    (routing_lags.json), most likely representing a real braided or
+    distributary reach rather than a data-entry duplicate. The blockage
+    node selection below explicitly avoids collapsing onto one of these
+    pairs when picking its downstream neighbour (see the exclusion
+    logic), so the scenario's backwater/suppression triad stays three
+    genuinely distinct nodes. Outside these 2 of 28 edges, no reverse
+    edges exist anywhere in this project's graph construction or model
+    code, so no GNN variant here has a message-passing pathway by which
+    a downstream constriction can inform an upstream node's prediction.
+    The backwater rise this scenario injects is, by construction,
+    invisible to graph message passing for every model at the chosen
+    blockage location — the only way a model could anticipate it is if
+    the upstream node's OWN feature history happened to carry an
+    independent precursor, which for a sudden debris blockage generally
+    does not exist.
+
+    Several Lee catchment gauges are literally named for their bridge
+    locations (Glennamought Bridge, Ovens Bridge, Morris's Bridge,
+    Dripsey Bridge, Bawnafinny Bridge, Cooleen Bridge, Carrigrohane
+    Bridge, Coolmuckey Br), and debris/culvert blockage at undersized
+    bridge openings during flash floods is a well-documented, common
+    failure mode in Irish/UK flash flood events — not a hypothetical
+    edge case. The blockage location is picked from these actual
+    bridge-named nodes rather than an arbitrary upstream edge, so the
+    scenario is anchored to a real, nameable physical location in the
+    catchment rather than an abstract graph position.
+
+    Expected outcome, stated up front: ALL models should show large
+    positive bias (under-prediction) at the upstream/blockage node
+    during the backwater period, regardless of architecture — this is
+    the point. A model architecture that does NOT show this failure
+    would itself be the interesting/suspicious result, worth
+    investigating for how it's getting the signal.
+    """
+    print("\nS6: ChannelBlockage (architectural-limitation diagnostic)")
+    out_dir = SCEN_DIR / "S6_ChannelBlockage"
+
+    T = X.shape[0]; N = X.shape[1]
+
+    # Select moderate-flow windows (not already flooded) so the injected
+    # backwater signal is clearly attributable. Same retry structure used
+    # everywhere else in this module — a tight joint saturation +
+    # calm-baseline constraint can return zero windows in the
+    # validation-period search region.
+    window_starts = select_base_windows(
+        X, y, bankfull, sat_min=0.60, sat_max=0.92,
+        max_stage_frac=0.30, n_windows=n_windows,
+        search_from_frac=0.70)
+
+    if not window_starts:
+        print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
+              "0.40 (matches S1/S5 default)")
+        window_starts = select_base_windows(
+            X, y, bankfull, sat_min=0.60, sat_max=0.92,
+            max_stage_frac=0.40, n_windows=n_windows,
+            search_from_frac=0.70)
+
+    if not window_starts:
+        print("  [skip] No valid base windows found for S6 even after "
+              "loosening max_stage_frac.")
+        return
+
+    # Pick the blockage location from an ACTUAL bridge-named node — a
+    # real, nameable constriction point rather than an arbitrary graph
+    # position. Uses a name-substring heuristic against nodes.csv, since
+    # there's no explicit "is_bridge" flag in the current node schema
+    # (only is_reservoir/is_tidal). Falls back to the old area-percentile
+    # heuristic if no bridge-named node with a usable upstream edge exists.
+    bridge_mask = nd["name"].str.contains(
+        "Bridge|Br$|Br ", case=False, regex=True, na=False)
+    bridge_candidates = nd.loc[bridge_mask, "node_idx"].tolist()
+
+    block_dst = None   # the bridge/constriction node itself
+    block_src = None   # its immediate upstream neighbour (backwater rises here too)
+    block_next = None  # its immediate downstream neighbour (suppression applies here)
+
+    for cand_dst in bridge_candidates:
+        upstream_edges = ed[ed["dst_idx"] == cand_dst]
+        # Exclude any "downstream" edge that loops straight back to the
+        # chosen upstream node. Two of this graph's 28 edges form genuine
+        # bidirectional pairs (0<->1, 2<->3 — confirmed against
+        # routing_lags.json, which has independently different, non-
+        # symmetric lags for each direction, e.g. 2_3=7 vs 3_2=2,
+        # suggesting an intentionally-represented braided/distributary
+        # reach rather than a duplicate data-entry error). Without this
+        # exclusion, a candidate bridge sitting on one of those pairs
+        # (e.g. Glennamought Bridge, node 3) would have its "downstream"
+        # edge selected as the very node the backwater is already being
+        # applied to as the upstream neighbour — collapsing block_src,
+        # block_dst, block_next into effectively two nodes instead of
+        # three and corrupting the suppression-side metric.
+        downstream_edges = ed[ed["src_idx"] == cand_dst]
+        if not upstream_edges.empty:
+            candidate_src = int(upstream_edges.iloc[0]["src_idx"])
+            downstream_edges = downstream_edges[downstream_edges["dst_idx"] != candidate_src]
+        if upstream_edges.empty or downstream_edges.empty:
+            continue   # need both an upstream and a genuinely distinct downstream neighbour
+        block_dst  = int(cand_dst)
+        block_src  = int(upstream_edges.iloc[0]["src_idx"])
+        block_next = int(downstream_edges.iloc[0]["dst_idx"])
+        break
+
+    if block_dst is None:
+        print("  [skip] No bridge-named node with both an upstream and "
+              "downstream river edge found — check nodes.csv naming or "
+              "extend the bridge_mask pattern.")
+        return
+
+    bridge_name = nd.loc[nd.node_idx == block_dst, "name"].values[0]
+    print(f"  Blockage location: {bridge_name} (node {block_dst})")
+
+    T_s   = T_WINDOW * len(window_starts)
+    X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
+    y_syn = np.zeros((T_s, N),             dtype=np.float32)
+    m_syn = np.zeros((T_s, N),             dtype=np.float32)
+
+    t_block        = T_IN + 4     # blockage occurs 1 hr into the forecast
+    rise_rate      = 0.05         # m per timestep backwater build-up
+    backwater_cap  = 1.5          # m, cap on backwater rise
+    suppression    = 0.6          # fraction of normal flow reaching block_next
+
+    # Per-node stage_range for converting the backwater rise (in metres)
+    # into an equivalent normalised_stage delta. Every elevation-
+    # reconstructing gate in this project (STGNNHANDEdge, STGNNSoilGate,
+    # STGNNBackwaterEdge) computes H = gauge_datum + normalised_stage *
+    # stage_range from F_NORM specifically — NOT from F_STAGE
+    # (stage_anomaly). Only writing F_STAGE, as the original version of
+    # this function did, leaves the injected backwater event completely
+    # invisible to any gate mechanism (the GRU/embedding pathway would
+    # still see it, since all 11 features feed into input_proj — but the
+    # gate itself, the exact thing STGNNBackwaterEdge exists to test,
+    # would never open). Same recurring bug class as the earlier HAND
+    # gate fix (stage_anomaly vs. absolute-elevation frame mismatch) —
+    # see this project's own prior notes on that pattern.
+    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
+                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
+
+    for i, t0 in enumerate(window_starts):
+        sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
+        X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+        y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+        m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+
+        # Backwater rise AT the bridge and its immediate upstream
+        # neighbour — a simplified two-node stand-in for the true M1
+        # backwater profile (which in reality extends further upstream
+        # proportional to channel slope and blockage severity; modelling
+        # the full profile length is out of scope here, since two nodes
+        # is already sufficient to demonstrate the architectural blind
+        # spot this scenario exists to show).
+        for affected in (block_dst, block_src):
+            base = float(np.mean(y_w[:T_IN, affected]))
+            sr = float(stage_range.loc[affected])
+            base_norm = float(np.mean(X_w[:T_IN, affected, F_NORM])) if sr > 0 else 0.0
+            for t in range(t_block, T_WINDOW):
+                backwater = min(rise_rate * (t - t_block), backwater_cap)
+                y_w[t, affected] = base + backwater
+                X_w[t, affected, F_STAGE] = base + backwater
+                if sr > 0:
+                    X_w[t, affected, F_NORM] = base_norm + backwater / sr
+
+        # Suppressed flow immediately downstream of the blockage. Not
+        # synced to F_NORM: s6_downstream_suppression_rmse is designed
+        # to be learnable from the node's own ordinary feature history
+        # (rainfall, its own recent trend) without needing any gate to
+        # fire — see s6_metrics' docstring in scenario_evaluator.py.
+        for t in range(t_block, T_WINDOW):
+            y_w[t, block_next] *= suppression
+            X_w[t, block_next, F_STAGE] *= suppression
+
+        X_syn[sl] = X_w
+        y_syn[sl] = y_w
+        m_syn[sl] = m_w
+
+    physical_consistency_check(X_syn, y_syn, nd, bankfull, "S6")
+
+    meta = {
+        "name": "S6_ChannelBlockage",
+        "description": (
+            "Debris blockage at a real bridge/culvert location causes "
+            "backwater rise upstream and suppressed flow downstream. "
+            "Explicit diagnostic for the directed-topology architectural "
+            "limitation: no model in this suite has a message-passing "
+            "pathway for downstream-to-upstream backwater causality, so "
+            "large upstream under-prediction is the EXPECTED result for "
+            "every model, not a failure to be optimised away."),
+        "n_windows":      len(window_starts),
+        "T_per_window":   T_WINDOW,
+        "T_total":        T_s,
+        "blockage_node":  {"idx": block_dst,  "name": bridge_name},
+        "upstream_node":  {"idx": block_src,  "name": nd.loc[nd.node_idx==block_src,  "name"].values[0]},
+        "downstream_node":{"idx": block_next, "name": nd.loc[nd.node_idx==block_next, "name"].values[0]},
+        "t_blockage_step": t_block,
+        "backwater_rate_m_per_step": rise_rate,
+        "backwater_cap_m": backwater_cap,
+        "downstream_suppression": suppression,
+    }
+    save_scenario("S6_ChannelBlockage", out_dir, X_syn, y_syn, m_syn, meta)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1025,6 +1269,7 @@ SCENARIO_MAP = {
     "S3": generate_s3_inniscarra_release,
     "S4": generate_s4_sat_breakthrough,
     "S5": generate_s5_spatial_gradient,
+    "S6": generate_s6_channel_blockage,
 }
 
 
@@ -1032,7 +1277,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate synthetic flash flood scenarios")
     parser.add_argument("--all",      action="store_true",
-                        help="Generate all 5 scenarios")
+                        help="Generate all 6 scenarios")
     parser.add_argument("--scenario", type=str, choices=list(SCENARIO_MAP),
                         help="Generate one specific scenario")
     parser.add_argument("--n-windows", type=int, default=None,
@@ -1040,7 +1285,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.all and args.scenario is None:
-        parser.error("Specify --all or --scenario {S1,S2,S3,S4,S5}")
+        parser.error("Specify --all or --scenario {S1,S2,S3,S4,S5,S6}")
 
     print("=" * 62)
     print("Synthetic scenario generation — Lee catchment")
