@@ -81,6 +81,29 @@ Brocca, L., Melone, F., Moramarco, T. (2008). On the estimation of antecedent
 Muñoz-Sabater, J. et al. (2021). ERA5-Land: A state-of-the-art global reanalysis
     dataset for land applications. ESSD 13, 4349-4383.
 Nobre, A.D. et al. (2011). Height Above the Nearest Drainage. J. Hydrol. 404.
+
+Gate collapse — diagnosed issue and fix
+------------------------------------------
+sat_threshold was found to collapse toward the low end of its range
+across every checkpoint, regardless of seed or horizon — the gate ends
+up essentially always-open rather than learning a meaningful saturation
+threshold. Mechanism: plain MSE gives a sigmoid gate a ONE-DIRECTIONAL
+incentive — opening it further (more cross-tributary HAND context)
+rarely increases loss and often decreases it, while closing it risks
+losing genuinely useful information and increasing loss. Nothing in an
+unregularised MSE objective pushes the other way, so gradient descent
+walks the threshold toward "always open" and stays there. The model
+then degenerates toward STGNNHANDEdge behaviour with a permanently-open
+gate, and sat_threshold/sat_sharpness stop meaning anything physically.
+
+Fix: self.last_gate_mean (set in _hand_edge_attr below) is read by
+train_st_gnn_soil_gate.py's train_epoch and added to the TRAINING loss
+only (not validation/test) as an explicit sparsity penalty —
+LAMBDA_GATE_SPARSITY * last_gate_mean — giving the gate a real cost for
+staying open, counterbalancing MSE's implicit "stay open" pull.
+gate_mean_activation is logged every epoch in training_history.csv so
+this can be checked directly rather than assumed; if it still saturates
+toward an extreme, LAMBDA_GATE_SPARSITY needs tuning.
 """
 
 import torch
@@ -142,6 +165,7 @@ class STGNNSoilGate(STGNNHANDEdge):
         # of the two gate types in ablation studies.
         self.sat_threshold = nn.Parameter(torch.tensor(float(sat_threshold)))
         self.sat_sharpness  = nn.Parameter(torch.tensor(float(sat_sharpness)))
+        self.last_gate_mean = torch.tensor(0.0)   # updated every forward() call
 
     # ──────────────────────────────────────────────────────────────────
     def _hand_edge_attr(
@@ -178,6 +202,19 @@ class STGNNSoilGate(STGNNHANDEdge):
         # Broadcast to all HAND edges: same gate value for every edge
         # because catchment saturation is a whole-catchment property.
         activation = gate_scalar.expand(B, E_hand)        # [B, E_hand]
+
+        # Stored for the training loop's sparsity penalty (see
+        # train_st_gnn_soil_gate.py's LAMBDA_GATE_SPARSITY / module
+        # docstring "Gate collapse" section) — this is the diagnosed
+        # mechanism behind sat_threshold collapsing toward the low end of
+        # its range across every prior checkpoint: plain MSE gives a
+        # sigmoid gate a one-directional incentive to stay open (more
+        # cross-tributary context rarely increases loss, closing risks
+        # losing real signal), with nothing pushing the other way. A
+        # plain attribute, not a second forward() return value, so every
+        # existing call site (model(x_seq, node_attr, edge_index,
+        # edge_attr)) keeps working unchanged.
+        self.last_gate_mean = activation.mean()
 
         # ── Static edge attributes (identical to STGNNHANDEdge) ────────
         dist_t   = self.hand_dist_norm.unsqueeze(0).expand(B, -1)   # [B, E]
