@@ -8,6 +8,11 @@ Checkpoint structure
   checkpoints/ealstm/{seed}/{t_out}/
   checkpoints/st_gnn/{seed}/{t_out}/
   checkpoints/st_gnn_dyn_edge/{seed}/{t_out}/
+  checkpoints/st_gnn_hand_edge/{seed}/{t_out}/
+  checkpoints/st_gnn_soil_gate/{seed}/{t_out}/
+  checkpoints/st_gnn_backwater_edge/{seed}/{t_out}/
+  checkpoints/dfc_gnn/{seed}/{t_out}/
+  checkpoints/dfc_gnn_unified/{seed}/{t_out}/
 
 Horizons
 ────────
@@ -45,6 +50,11 @@ import train_st_gnn_hand_edge as _mod_hand
 import train_st_gnn_soil_gate as _mod_soil
 import train_dfc_gnn          as _mod_dfc
 
+# Backwater edge model — new, no SAR path (same "Experiment 1 scope
+# only" precedent as dfc_gnn_unified; not patched in the USE_SAR block
+# below for the same reason).
+import train_st_gnn_backwater_edge as _mod_backwater
+
 # DFC-GNN Unified: no SAR path to patch (Experiment 1 scope only — see
 # train_dfc_gnn_unified.py docstring). Import the train() function directly,
 # same pattern as gru/lstm/st_gnn.
@@ -72,7 +82,7 @@ MAX_EPOCHS = 300
 # SEEDS     = [43]
 # T_IN      = 32                          # 8-hour input window
 # T_OUTS    = [4]         # 1hr, 3hr, 4hr, 6hr, 12hr
-# MAX_EPOCHS = 1
+# MAX_EPOCHS = 4
 
 # Model registry in narrative order (baselines first, then graph models,
 # then the proposed unified model last — completes the ablation ladder3
@@ -80,15 +90,18 @@ MAX_EPOCHS = 300
 # weight → +dynamic topology → +hard gate (dfc_gnn) → all three combined
 # (dfc_gnn_unified)).
 MODEL_REGISTRY = [
-    ("gru",              _train_gru),
-    ("lstm",             _train_lstm),
-    ("ealstm",           _train_ealstm),
-    ("st_gnn",           _train_st_gnn),
-    ("st_gnn_dyn_edge",  _mod_dyn.train),
-    ("st_gnn_hand_edge", _mod_hand.train),
+    # ("gru",              _train_gru),
+    # ("lstm",             _train_lstm),
+    # ("ealstm",           _train_ealstm),
+    # ("st_gnn",           _train_st_gnn),
+    # ("st_gnn_dyn_edge",  _mod_dyn.train),
+    # ("st_gnn_hand_edge", _mod_hand.train),
     ("st_gnn_soil_gate", _mod_soil.train),  # anticipatory SM gate
-    ("dfc_gnn",          _mod_dfc.train),
-    ("dfc_gnn_unified",  _train_dfc_unified),
+    ("st_gnn_backwater_edge", _mod_backwater.train),  # gated bridge/
+                                             # culvert backwater edges —
+                                             # S6 diagnostic companion
+    # ("dfc_gnn",          _mod_dfc.train),
+    # ("dfc_gnn_unified",  _train_dfc_unified),
 ]
 
 
@@ -192,7 +205,7 @@ def run(seeds: list[int], t_outs: list[int], max_epochs: int,
 
     print("\n" + "═"*60)
     print("  EXPERIMENT 1 ")
-    print("  Eight architectures, no SAR, all horizons")
+    print(f"  {len(MODEL_REGISTRY)} architectures, no SAR, all horizons")
     print("═"*60)
     print(f"\n  SAR flags patched:")
     print(f"    train_st_gnn_dyn_edge  .USE_SAR      = {_mod_dyn.USE_SAR}")
