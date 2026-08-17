@@ -67,6 +67,15 @@ SAT_THRESHOLD_INIT  = 0.75
 SAT_SHARPNESS_INIT  = 10.0
 SWVL2_SAT_IDX       = 9     # feature index in X.npy
 
+# Sparsity penalty weight — see st_gnn_soil_gate.py's "Gate collapse"
+# docstring section. Without this, plain MSE gives sat_threshold a
+# one-directional incentive to collapse toward always-open. Watch
+# gate_mean_activation in training_history.csv once trained — if it
+# still saturates toward an extreme (near 0.0 or near 1.0 across
+# epochs), this needs tuning before the learned sat_threshold/
+# sat_sharpness are trustworthy.
+LAMBDA_GATE_SPARSITY = 0.01
+
 # Horizon weighting: later forecast steps receive proportionally higher loss
 # weight, matching the pattern used in all other training scripts.
 def horizon_weights(T_out: int, device: torch.device) -> torch.Tensor:
@@ -91,9 +100,11 @@ def train_epoch(
     loader,
     optimiser: torch.optim.Optimizer,
     w_hz:      torch.Tensor,         # [T_out] horizon weights
+    lambda_gate_sparsity: float = 0.0,
 ) -> dict:
     model.train()
     total_loss = 0.0
+    total_gate_mean = 0.0
     n_batches  = 0
 
     for x_seq, y_seq, mask in loader:
@@ -110,16 +121,27 @@ def train_epoch(
         # Horizon-weighted masked MSE
         err2 = (abs_pred - y_seq) ** 2             # [B, T_out, N]
         wt   = w_hz.unsqueeze(0).unsqueeze(-1)     # [1, T_out, 1]
-        loss = (err2 * mask * wt).sum() / (mask * wt).sum().clamp(min=1.0)
+        mse_loss = (err2 * mask * wt).sum() / (mask * wt).sum().clamp(min=1.0)
+
+        # Sparsity penalty on the gate — see module docstring. Set during
+        # the forward() call above (inside _hand_edge_attr). Applied to
+        # the TRAINING loss only, kept out of the returned/reported
+        # "loss" so training_history.csv's train_loss stays comparable
+        # to val_loss (which intentionally excludes the penalty) and
+        # across different LAMBDA_GATE_SPARSITY settings.
+        gate_mean = model.last_gate_mean
+        loss = mse_loss + lambda_gate_sparsity * gate_mean
 
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimiser.step()
 
-        total_loss += loss.item()
+        total_loss += mse_loss.item()
+        total_gate_mean += gate_mean.item()
         n_batches  += 1
 
-    return {"loss": total_loss / max(n_batches, 1)}
+    return {"loss": total_loss / max(n_batches, 1),
+            "gate_mean": total_gate_mean / max(n_batches, 1)}
 
 
 @torch.no_grad()
@@ -323,7 +345,8 @@ def train(
     logger.info("Starting training …")
     for epoch in range(1, max_epochs + 1):
 
-        train_m = train_epoch(model, train_loader, optimiser, w_hz)
+        train_m = train_epoch(model, train_loader, optimiser, w_hz,
+                              lambda_gate_sparsity=LAMBDA_GATE_SPARSITY)
         val_loss, val_m, persist_m = eval_epoch(model, val_loader, w_hz)
         scheduler.step(val_loss)
 
@@ -341,24 +364,26 @@ def train(
             "val_rmse":   round(val_m.get("rmse", float("nan")), 4),
             "sat_threshold_learned": round(sat_thr, 4),
             "sat_sharpness_learned": round(sat_shp, 4),
+            "gate_mean_activation":  round(train_m["gate_mean"], 4),
+            "lambda_gate_sparsity":  LAMBDA_GATE_SPARSITY,
             "lr":         current_lr,
         })
 
         if epoch % 25 == 0 or epoch == 1:
             logger.info(
                 "Epoch %3d  train=%.6e  val=%.6e  NSE=%.4f  RMSE=%.4f  "
-                "ES=%d/%d  sat_thr=%.3f  sat_shp=%.2f  LR=%.1e",
+                "ES=%d/%d  sat_thr=%.3f  sat_shp=%.2f  gate_mean=%.3f  LR=%.1e",
                 epoch, train_m["loss"], val_loss,
                 val_m.get("nse", float("nan")),
                 val_m.get("rmse", float("nan")),
                 patience_ctr, PATIENCE,
-                sat_thr, sat_shp, current_lr,
+                sat_thr, sat_shp, train_m["gate_mean"], current_lr,
             )
         else:
             logger.debug(
-                "Epoch %3d  train=%.6e  val=%.6e  NSE=%.4f  LR=%.1e",
+                "Epoch %3d  train=%.6e  val=%.6e  NSE=%.4f  gate_mean=%.3f  LR=%.1e",
                 epoch, train_m["loss"], val_loss,
-                val_m.get("nse", float("nan")), current_lr,
+                val_m.get("nse", float("nan")), train_m["gate_mean"], current_lr,
             )
 
         if val_loss < best_val_loss:
@@ -389,6 +414,8 @@ def train(
                     "sat_sharpness_init": SAT_SHARPNESS_INIT,
                     "sat_threshold_learned": round(sat_thr, 4),
                     "sat_sharpness_learned": round(sat_shp, 4),
+                    "lambda_gate_sparsity": LAMBDA_GATE_SPARSITY,
+                    "gate_mean_activation": round(train_m["gate_mean"], 4),
                     "n_hand_edges":     int(hand["src"].shape[0]),
                 },
             }, ckpt_dir / "best_model.pt")
@@ -470,6 +497,7 @@ def train(
             "mbe":                   round(mbe_global, 6),
             "sat_threshold_learned": round(sat_thr_final, 4),
             "sat_sharpness_learned": round(sat_shp_final, 4),
+            "lambda_gate_sparsity":  LAMBDA_GATE_SPARSITY,
             "model":                 "st_gnn_soil_gate",
         }, f, indent=2)
 
