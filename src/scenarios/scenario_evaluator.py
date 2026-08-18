@@ -191,40 +191,88 @@ def s2_metrics(pred: np.ndarray, y_syn: np.ndarray,
                meta: dict, real_rmse: float,
                T_in: int, T_out: int) -> dict:
     """
-    GaugeFailure: RMSE at downstream nodes after failure onset vs baseline.
+    GaugeFailure: RMSE after failure onset, both pooled across all nodes
+    and restricted specifically to the failed nodes themselves.
 
-    FIXED: previously sliced pred[t_fail:] as a single global cutoff,
-    which only excludes the first ~36 rows of the ENTIRE concatenated
-    array (spanning 40 flood-windows x 3 failure_levels = 120 segments)
-    rather than isolating genuinely post-failure rows WITHIN each of the
-    120 segments — diluting true post-failure steps with pre-failure
-    calm steps from every other segment. This version isolates
-    post-failure rows per-window using the same local-step recovery as
-    s3_metrics/s1_metrics.
+    FIXED (time alignment): previously sliced pred[t_fail:] as a single
+    global cutoff, which only excludes the first ~36 rows of the ENTIRE
+    concatenated array (spanning 40 flood-windows x 3 failure_levels =
+    120 segments) rather than isolating genuinely post-failure rows
+    WITHIN each of the 120 segments — diluting true post-failure steps
+    with pre-failure calm steps from every other segment. This version
+    isolates post-failure rows per-window using the same local-step
+    recovery as s1/s3_metrics.
+
+    FIXED (node scope): the docstring here previously claimed "RMSE at
+    downstream nodes", but the implementation never filtered by node at
+    all — it pooled ALL 27 nodes together, meaning the 1-5 nodes whose
+    sensor actually failed were diluted among the 22-26 completely
+    unaffected nodes in every single evaluation. Even total failure to
+    predict the corrupted nodes correctly would barely move a pooled
+    27-node RMSE. scenario_generator.py's generate_s2_gauge_failure
+    computes failed_node_sets during generation but never saves it to
+    meta — this version reconstructs which nodes were failed for any
+    given row from the deterministic block ordering
+    (row = flood_window_idx * len(failure_levels) + failure_level_idx,
+    fail_nodes = headwater_idx[:failure_levels[failure_level_idx]]),
+    using headwater_idx and failure_levels, both of which ARE saved.
+
+    Both metrics are reported: s2_post_failure_rmse_all (the original,
+    pooled — kept for continuity with prior results) and
+    s2_post_failure_rmse_failed_nodes (new, the metric this scenario's
+    own docstring already claimed to be computing).
     """
     t_fail    = meta.get("t_failure_step", 36)
     T_window  = meta.get("T_per_window", 104)
+    headwater_idx = meta.get("headwater_nodes", [])
+    failure_levels = meta.get("failure_levels", [])
     n_rows    = pred.shape[0]
 
-    if n_rows == 0:
-        return {"s2_post_failure_rmse": float("nan"),
-                "s2_degradation_ratio": float("nan")}
+    nan_result = {
+        "s2_post_failure_rmse_all": float("nan"),
+        "s2_post_failure_rmse_failed_nodes": float("nan"),
+        "s2_degradation_ratio": float("nan"),
+        "s2_degradation_ratio_failed_nodes": float("nan"),
+    }
+    if n_rows == 0 or not headwater_idx or not failure_levels:
+        return nan_result
 
-    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
+    local_step, window_idx = _window_local_step(n_rows, T_in, T_out, T_window)
     is_post = local_step >= t_fail
 
     if is_post.sum() < 5:
-        return {"s2_post_failure_rmse": float("nan"),
-                "s2_degradation_ratio": float("nan")}
+        return nan_result
 
+    # Pooled (original) metric, kept for continuity with prior results.
     p_post = pred[is_post]
     t_post = y_syn[is_post]
     m_post = np.ones_like(p_post, dtype=bool)
-    rmse_post = _rmse(p_post, t_post, m_post)
+    rmse_all = _rmse(p_post, t_post, m_post)
+
+    # Node-restricted metric: build a per-row mask selecting only the
+    # nodes actually failed in that row's block.
+    n_levels = len(failure_levels)
+    node_mask = np.zeros_like(pred, dtype=bool)   # [n_rows, N]
+    for w in np.unique(window_idx):
+        level_idx = int(w) % n_levels
+        n_fail = failure_levels[level_idx]
+        fail_nodes = headwater_idx[:n_fail]
+        rows_in_window = (window_idx == w)
+        node_mask[np.ix_(rows_in_window, fail_nodes)] = True
+
+    combined_mask = node_mask & is_post[:, None]
+    if combined_mask.sum() < 5:
+        rmse_failed = float("nan")
+    else:
+        rmse_failed = _rmse(pred, y_syn, combined_mask)
+
     return {
-        "s2_post_failure_rmse": rmse_post,
-        "s2_degradation_ratio": (rmse_post / real_rmse
-                                  if real_rmse > 0 else float("nan")),
+        "s2_post_failure_rmse_all": rmse_all,
+        "s2_post_failure_rmse_failed_nodes": rmse_failed,
+        "s2_degradation_ratio": (rmse_all / real_rmse
+                                 if real_rmse > 0 and np.isfinite(rmse_all) else float("nan")),
+        "s2_degradation_ratio_failed_nodes": (rmse_failed / real_rmse
+                                              if real_rmse > 0 and np.isfinite(rmse_failed) else float("nan")),
     }
 
 

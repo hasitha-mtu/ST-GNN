@@ -188,7 +188,8 @@ def downstream_bfs_edges(source_idx: int, ed: pd.DataFrame,
 
 def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
                                source_idx: int, edges_order: list[tuple[int, int]],
-                               lags: dict, baseline: float) -> list[int]:
+                               lags: dict, baseline: float,
+                               stage_range: Optional[pd.Series] = None) -> list[int]:
     """
     Multi-hop downstream propagation of a stage delta injected at
     source_idx, walking the precomputed BFS edge order from
@@ -205,6 +206,16 @@ def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
     chain — Fitzgerald's Park, Pope's Quay, St. Patrick's Quay, Currach
     Club — completely untouched. This walks the full precomputed chain.
 
+    stage_range: if given, also syncs F_NORM at each hop using the SAME
+    incremental dst_delta just computed for F_STAGE — this must happen
+    HERE, incrementally, rather than as a post-hoc "current minus
+    original baseline" calculation by the caller. When multiple source
+    chains (e.g. S1's several headwaters) converge on the same
+    downstream node across separate calls, a post-hoc recomputation
+    would double-count whatever an earlier call already added; doing it
+    incrementally inside the one place dst_delta is actually computed
+    avoids that entirely.
+
     Returns the list of node indices reached, in hop order.
     """
     signal = {source_idx: y_w[:, source_idx] - baseline}
@@ -214,6 +225,10 @@ def propagate_downstream_chain(y_w: np.ndarray, X_w: np.ndarray,
         dst_delta = apply_routing(signal[src], src, dst, lags)
         y_w[:, dst] += dst_delta
         X_w[:, dst, F_STAGE] += dst_delta
+        if stage_range is not None:
+            sr = float(stage_range.loc[dst])
+            if sr > 0:
+                X_w[:, dst, F_NORM] += dst_delta / sr
         signal[dst] = dst_delta
         reached.append(dst)
 
@@ -393,7 +408,41 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
     out_dir = SCEN_DIR / "S1_ConvectiveCell"
 
     headwater_idx = identify_headwater_nodes(nd, n=6)
-    downstream_idx = identify_downstream_nodes(nd, n=5)
+
+    # BUG FIX: identify_downstream_nodes previously picked the 5 largest
+    # catchments independent of whether they're actually reachable from
+    # any headwater via the directed river graph. Direct BFS check found
+    # ZERO 1-hop edges from headwater_idx to that node set, and 4 of the
+    # 6 headwaters were entirely unreachable to it at ANY hop count —
+    # meaning the "downstream (routed)" signal this scenario's own
+    # stated purpose depends on ("tests whether cross-tributary HAND
+    # edges carry the lateral flood signal before it reaches the Cork
+    # city gauges via the river-network alone") has been exactly zero in
+    # every S1 window ever generated, for every checkpoint evaluated
+    # against it. Fixed by restricting downstream_idx to nodes that are
+    # actually reachable from at least one headwater, ranked by
+    # catchment size among that reachable set (same spirit as
+    # identify_downstream_nodes, now topology-aware).
+    reachable = set()
+    headwater_chains: dict[int, list[tuple[int, int]]] = {}
+    for hw in headwater_idx:
+        edges_order = downstream_bfs_edges(hw, ed)
+        headwater_chains[hw] = edges_order
+        reachable.update(dst for _src, dst in edges_order)
+
+    downstream_candidates = nd[(nd.is_reservoir == 0)
+                               & (nd.node_idx.isin(reachable))
+                               & (~nd.node_idx.isin(headwater_idx))].copy()
+    downstream_candidates = downstream_candidates.sort_values("log_catchment_area_km2", ascending=False)
+    downstream_idx = downstream_candidates.head(5)["node_idx"].tolist()
+
+    if not downstream_idx:
+        print("  [skip] No downstream nodes reachable from any headwater — "
+              "check headwater_idx/graph topology before proceeding.")
+        return
+    if len(downstream_idx) < 5:
+        print(f"  [warn] Only {len(downstream_idx)} downstream nodes reachable "
+              f"from headwater_idx (wanted 5): {downstream_idx}")
 
     # Select windows: moderate pre-event saturation (0.65–0.90)
     # S1 requires soil not too dry (enough moisture for rapid runoff)
@@ -422,6 +471,18 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
     m_syn = np.zeros((T_s, mask.shape[1]),           dtype=np.float32)
 
     pulse_at = T_IN + 2    # storm begins 2 steps into prediction horizon
+
+    # Per-node stage_range for converting injected stage deltas (in
+    # metres) into equivalent normalised_stage deltas. S1's own stated
+    # purpose is "tests whether cross-tributary HAND edges carry the
+    # lateral flood signal" — but HAND/SoilGate/BackwaterEdge's gates all
+    # reconstruct H = gauge_datum + normalised_stage * stage_range from
+    # F_NORM specifically, not F_STAGE (stage_anomaly). Without also
+    # writing F_NORM here, the injected convective pulse is invisible to
+    # every gate mechanism this scenario exists to test — same bug
+    # class, same fix, as generate_s6_channel_blockage.
+    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
+                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
 
     for i, t0 in enumerate(window_starts):
         sl = slice(i * T_WINDOW, (i+1) * T_WINDOW)
@@ -474,19 +535,29 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
             uh_len  = min(len(stage_delta), T_WINDOW - t_start)
             y_w[t_start : t_start + uh_len, n_idx] += stage_delta[:uh_len]
             X_w[t_start : t_start + uh_len, n_idx, F_STAGE] += stage_delta[:uh_len]
+            sr = float(stage_range.loc[n_idx])
+            if sr > 0:
+                X_w[t_start : t_start + uh_len, n_idx, F_NORM] += stage_delta[:uh_len] / sr
 
-        # Route headwater signal downstream through river network
-        for _, edge in ed.iterrows():
-            src = int(edge.src_idx)
-            dst = int(edge.dst_idx)
-            if src not in headwater_idx:
-                continue
-            if y_w[:, src].max() <= y_w[:T_IN, src].max():
-                continue   # no signal to route
-            src_delta = y_w[:, src] - float(np.mean(y_w[:T_IN, src]))
-            dst_delta = apply_routing(src_delta, src, dst, lags)
-            y_w[:, dst] += dst_delta
-            X_w[:, dst, F_STAGE] += dst_delta
+        # Route headwater signal downstream through the river network,
+        # multiple hops out from each headwater — a single-pass edge loop
+        # (the previous implementation) only reaches nodes one edge away
+        # from a headwater, which the BFS check above confirmed never
+        # includes any of this scenario's own downstream evaluation
+        # nodes. Reuses the same per-headwater topology precomputed
+        # before the window loop (static, doesn't depend on window
+        # content) and the same propagate_downstream_chain mechanism S3
+        # uses, called once per headwater that actually received a pulse
+        # this window — += accumulation in propagate_downstream_chain
+        # correctly sums contributions where multiple headwaters' chains
+        # converge on the same downstream node.
+        for n_idx in headwater_idx:
+            if y_w[:, n_idx].max() <= y_w[:T_IN, n_idx].max():
+                continue   # no signal to route from this headwater
+            base = float(np.mean(y_w[:T_IN, n_idx]))
+            propagate_downstream_chain(
+                y_w, X_w, n_idx, headwater_chains[n_idx], lags,
+                baseline=base, stage_range=stage_range)
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
@@ -830,6 +901,19 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
 
     rain_peak_mm = 20.0                 # heavy but realistic frontal rainfall
 
+    # Per-node stage_range for F_NORM sync. Needed here specifically
+    # because this scenario's own docstring frames it as a reactive-vs-
+    # anticipatory comparison ("tests whether STGNNSoilGate detects the
+    # approaching breakthrough... before stage rises"), which implicitly
+    # requires STGNNHANDEdge's REACTIVE gate to be able to eventually
+    # fire once stage does rise, for that comparison to be meaningful.
+    # STGNNSoilGate's own gate already correctly reads F_SW2_SAT (set
+    # directly below) and needs no fix; this is specifically about
+    # giving HANDEdge's H = datum + normalised_stage*stage_range gate a
+    # fair chance to react at all.
+    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
+                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
+
     # Saturation ramp parameters — kept as named constants (not inlined
     # below) because sat_breakthrough_step is DERIVED from them. Previously
     # sat_breakthrough_step was hardcoded to T_IN+8 independently of these,
@@ -879,10 +963,13 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
             X_w[t, :, F_SW1_RAW] = X_w[t, :, F_SW1_SAT] * 0.472
 
         # Before breakthrough: slow, infiltration-limited stage response
+        stage_range_arr = stage_range.reindex(range(N)).values.astype(np.float32)
+        stage_range_safe = np.where(stage_range_arr > 0, stage_range_arr, np.inf)
         for t in range(T_IN, sat_breakthrough_step):
             slow_rise = 0.01 * (t - T_IN)
             y_w[t, :] += slow_rise
             X_w[t, :, F_STAGE] += slow_rise
+            X_w[t, :, F_NORM] += slow_rise / stage_range_safe
 
         # After breakthrough: abrupt acceleration in stage rise
         for n_idx in range(N):
@@ -903,6 +990,10 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
             y_w[sat_breakthrough_step:t_end, n_idx] += delta[:t_end-sat_breakthrough_step]
             X_w[sat_breakthrough_step:t_end, n_idx, F_STAGE] += \
                 delta[:t_end-sat_breakthrough_step]
+            sr = float(stage_range.loc[n_idx])
+            if sr > 0:
+                X_w[sat_breakthrough_step:t_end, n_idx, F_NORM] += \
+                    delta[:t_end-sat_breakthrough_step] / sr
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
@@ -967,6 +1058,45 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
     # gradient: western nodes ≈ 2.5×, eastern nodes ≈ 1.0×
     gradient = gradient.astype(np.float32)
 
+    # BUG FIX (same class as S1): downstream_idx was selected by catchment
+    # size alone via identify_downstream_nodes(), independent of whether
+    # those nodes are actually reachable from the western/high-gradient
+    # source nodes this scenario injects at, and the routing loop below
+    # only propagated one hop. Unlike S1, this scenario's source set
+    # (any node with gradient>=1.3, not just 6 tiny headwaters) is broad
+    # enough that SOME downstream signal often got through by chance —
+    # but that's luck, not a guarantee, and multiple overlapping direct
+    # injections from many qualifying source nodes could also be
+    # inflating the apparent magnitude beyond what genuine multi-hop
+    # attenuation would produce. Fixed the same way as S1: BFS
+    # reachability from the actual source set, multi-hop propagation.
+    source_idx = [n for n in range(N) if gradient[n] >= 1.3]
+    source_chains: dict[int, list[tuple[int, int]]] = {}
+    reachable = set()
+    for src in source_idx:
+        edges_order = downstream_bfs_edges(src, ed)
+        source_chains[src] = edges_order
+        reachable.update(dst for _s, dst in edges_order)
+
+    downstream_candidates = nd[(nd.is_reservoir == 0)
+                               & (nd.node_idx.isin(reachable))
+                               & (~nd.node_idx.isin(source_idx))].copy()
+    downstream_candidates = downstream_candidates.sort_values("log_catchment_area_km2", ascending=False)
+    downstream_idx = downstream_candidates.head(5)["node_idx"].tolist()
+    if not downstream_idx:
+        print("  [skip] No downstream nodes reachable from any high-gradient "
+              "source node — check the gradient threshold or graph topology.")
+        return
+    if len(downstream_idx) < 5:
+        print(f"  [warn] Only {len(downstream_idx)} downstream nodes reachable "
+              f"from source_idx (wanted 5): {downstream_idx}")
+
+    # Per-node stage_range for F_NORM sync -- same rationale as S1/S4/S6:
+    # elevation-reconstructing gates (HAND/SoilGate/BackwaterEdge) read
+    # F_NORM, not F_STAGE.
+    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
+                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
+
     T_s   = T_WINDOW * len(window_starts)
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
@@ -1000,30 +1130,23 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
             y_w[t_off : t_off + uh_len, n_idx] += uh_arr[:uh_len] * excess
             X_w[t_off : t_off + uh_len, n_idx, F_STAGE] += uh_arr[:uh_len] * excess
 
-        # Route western headwater signal to downstream eastern nodes
-        for _, edge in ed.iterrows():
-            src = int(edge.src_idx)
-            dst = int(edge.dst_idx)
-            if gradient[src] < 1.3: continue   # only western sources
-            src_delta = y_w[:, src] - float(np.mean(y_w[:T_IN, src]))
-            dst_delta = apply_routing(src_delta, src, dst, lags)
-            y_w[:, dst] += dst_delta * 0.5   # attenuate routed signal
-            X_w[:, dst, F_STAGE] += dst_delta * 0.5
+        # Route western/high-gradient signal downstream through the
+        # river network, multiple hops out from each qualifying source
+        # node -- a single-pass edge loop (the previous implementation)
+        # only reaches nodes one edge away from a source.
+        for src in source_idx:
+            if y_w[:, src].max() <= y_w[:T_IN, src].max():
+                continue   # no signal to route from this source
+            base = float(np.mean(y_w[:T_IN, src]))
+            propagate_downstream_chain(
+                y_w, X_w, src, source_chains[src], lags,
+                baseline=base, stage_range=stage_range)
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
         m_syn[sl] = m_w
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S5")
-
-    # downstream_nodes was previously missing from this meta dict entirely
-    # (S1 saves it via the same identify_downstream_nodes() helper; S5
-    # never did), which made s5_metrics() in scenario_evaluator.py always
-    # fall back to meta.get("downstream_nodes", []) -> [] -> NaN for
-    # every single checkpoint. Using the same helper as S1 keeps the
-    # "downstream" definition consistent across scenarios rather than
-    # introducing a second, gradient-based definition here.
-    downstream_idx = identify_downstream_nodes(nd, n=5)
 
     meta = {
         "name": "S5_SpatialGradient",
@@ -1175,10 +1298,11 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    t_block        = T_IN + 4     # blockage occurs 1 hr into the forecast
-    rise_rate      = 0.05         # m per timestep backwater build-up
-    backwater_cap  = 1.5          # m, cap on backwater rise
-    suppression    = 0.6          # fraction of normal flow reaching block_next
+    t_block          = T_IN + 4     # blockage occurs 1 hr into the forecast
+    rise_rate        = 0.05         # m per timestep backwater build-up
+    backwater_cap    = 1.5          # m, cap on backwater rise
+    suppression_rate = 0.02         # m per timestep downstream flow reduction
+    suppression_cap  = 0.3          # m, cap on downstream reduction
 
     # Per-node stage_range for converting the backwater rise (in metres)
     # into an equivalent normalised_stage delta. Every elevation-
@@ -1220,14 +1344,25 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
                 if sr > 0:
                     X_w[t, affected, F_NORM] = base_norm + backwater / sr
 
-        # Suppressed flow immediately downstream of the blockage. Not
-        # synced to F_NORM: s6_downstream_suppression_rmse is designed
-        # to be learnable from the node's own ordinary feature history
-        # (rainfall, its own recent trend) without needing any gate to
-        # fire — see s6_metrics' docstring in scenario_evaluator.py.
+        # Suppressed flow immediately downstream of the blockage.
+        # BUG FIX: was `y_w[t, block_next] *= suppression` (0.6) --
+        # a straight multiplicative scaling of stage_anomaly, which can
+        # be positive OR negative relative to its own rolling baseline.
+        # Confirmed against real generated output: when the pre-blockage
+        # baseline at this node was negative, multiplying by 0.6 made it
+        # LESS negative (closer to zero) -- visually a RISE at the
+        # blockage marker, the opposite of "suppression". Fixed to an
+        # absolute, always-downward, capped reduction -- same additive-
+        # and-capped style as the upstream backwater rise above, and
+        # unambiguous in direction regardless of the current anomaly
+        # sign. Not synced to F_NORM: s6_downstream_suppression_rmse is
+        # designed to be learnable from the node's own ordinary feature
+        # history (rainfall, its own recent trend) without needing any
+        # gate to fire — see s6_metrics' docstring in scenario_evaluator.py.
         for t in range(t_block, T_WINDOW):
-            y_w[t, block_next] *= suppression
-            X_w[t, block_next, F_STAGE] *= suppression
+            reduction = min(suppression_rate * (t - t_block), suppression_cap)
+            y_w[t, block_next] -= reduction
+            X_w[t, block_next, F_STAGE] -= reduction
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
@@ -1254,7 +1389,8 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
         "t_blockage_step": t_block,
         "backwater_rate_m_per_step": rise_rate,
         "backwater_cap_m": backwater_cap,
-        "downstream_suppression": suppression,
+        "suppression_rate_m_per_step": suppression_rate,
+        "suppression_cap_m": suppression_cap,
     }
     save_scenario("S6_ChannelBlockage", out_dir, X_syn, y_syn, m_syn, meta)
 
