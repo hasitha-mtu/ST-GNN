@@ -54,6 +54,7 @@ MODELS   = [
     "st_gnn_dyn_edge",  # STGNNDynEdge          — Manning conductance edges
     "st_gnn_hand_edge", # STGNNHANDEdge         — HAND-triggered topology
     "st_gnn_soil_gate", # STGNNSoilGate         — HAND + catchment soil-saturation gate
+    "st_gnn_backwater_edge", # STGNNBackwaterEdge — gated bridge/culvert backwater edges
     "dfc_gnn",          # DFCGNNFlood           — elevation gate + flood head
     "dfc_gnn_unified",  # PC-DFC-GNN (proposed) — all three mechanisms unified
 ]
@@ -72,6 +73,7 @@ MODEL_COLORS = {
     "st_gnn_dyn_edge":  "#7B68EE",   # slate blue
     "st_gnn_hand_edge": "#9B59B6",   # purple
     "st_gnn_soil_gate": "#5B2C6F",   # deep violet — HAND + soil saturation gate
+    "st_gnn_backwater_edge": "#2E86AB",  # teal-blue — bridge/culvert backwater gate
     "dfc_gnn":          "#B8860B",   # dark gold — stepping-stone DFC
     "dfc_gnn_unified":  "#D4A017",   # bright gold — proposed model (headline)
 }
@@ -83,6 +85,7 @@ MODEL_LABELS = {
     "st_gnn_dyn_edge":  "ST-GNN DynEdge",
     "st_gnn_hand_edge": "ST-GNN HAND",
     "st_gnn_soil_gate": "ST-GNN Soil Gate",
+    "st_gnn_backwater_edge": "ST-GNN Backwater",
     "dfc_gnn":          "DFC-GNN",
     "dfc_gnn_unified":  "PC-DFC-GNN (proposed)",
 }
@@ -94,6 +97,7 @@ MODEL_MARKERS = {
     "st_gnn_dyn_edge":  "P",
     "st_gnn_hand_edge": "X",
     "st_gnn_soil_gate": "v",   # downward triangle
+    "st_gnn_backwater_edge": "<",  # left triangle
     "dfc_gnn":          "h",   # hexagon
     "dfc_gnn_unified":  "*",   # star — proposed model
 }

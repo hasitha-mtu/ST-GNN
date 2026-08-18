@@ -130,6 +130,7 @@ MODEL_REGISTRY = {
     "st_gnn_dyn_edge":  "models.st_gnn_dyn_edge.STGNNDynEdge",
     "st_gnn_hand_edge": "models.st_gnn_hand_edge.STGNNHANDEdge",
     "st_gnn_soil_gate": "models.st_gnn_soil_gate.STGNNSoilGate",
+    "st_gnn_backwater_edge": "models.st_gnn_backwater_edge.STGNNBackwaterEdge",
 
     "dfc_gnn":          "models.dfc_gnn.DFCGNNFlood",
     "dfc_gnn_unified":  "models.dfc_gnn_unified.DFCGNNUnified",
@@ -140,13 +141,24 @@ def resolve_model_tag(ckpt_dir: Path) -> str:
     rel   = ckpt_dir.relative_to(CKPT_ROOT)
     first = rel.parts[0]
     # Exact match first — prevents "dfc_gnn_unified" being matched
-    # as "dfc_gnn" by the startswith prefix rule below.
+    # as "dfc_gnn" by the startswith prefix rule below (and previously
+    # caused "st_gnn_backwater_edge" to silently resolve to "st_gnn"
+    # before it was added to MODEL_REGISTRY — see run_inference error
+    # log: STGNNFloodModel loaded with unexpected keys gate_sharpness/
+    # edge_index/static_edge_attr/bw_gate_reference/gauge_datum/
+    # stage_range/bw_gate_node, and a 4-vs-5 edge-dim size mismatch).
     if first in MODEL_REGISTRY:
         return first
-    # Prefix fallback for legacy or variant checkpoint names
-    for key in MODEL_REGISTRY:
-        if first.startswith(key) or key.startswith(first):
-            return key
+    # Prefix fallback for legacy or variant checkpoint names — prefer the
+    # LONGEST (most specific) matching key, not the first one found in
+    # dict insertion order. A first-match fallback is exactly the bug
+    # class above: any new model name sharing a prefix with an existing
+    # one (e.g. "st_gnn_X" vs "st_gnn") would silently resolve to the
+    # shorter/wrong key whenever it wasn't yet an exact match.
+    candidates = [key for key in MODEL_REGISTRY
+                 if first.startswith(key) or key.startswith(first)]
+    if candidates:
+        return max(candidates, key=len)
     return first
 
 
@@ -309,6 +321,56 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     hand_dst           = hand_dst,
                     hand_threshold     = hand_thr,
                     hand_overland_dist = hand_dist)
+    elif tag == "st_gnn_backwater_edge":
+        # STGNNBackwaterEdge combines river + backwater edges into single
+        # 'edge_index'/'static_edge_attr' buffers internally (see
+        # models/st_gnn_backwater_edge.py __init__ — combined_src =
+        # torch.cat([edge_index[0], bw_src]) etc.). Same principle as
+        # dfc_gnn_unified above: read buffer SHAPES from the checkpoint
+        # state dict, not from the on-disk backwater_edges.npz, since
+        # that file may have been regenerated (different bridge/edge
+        # count) since training — using sd guarantees construction
+        # produces the exact shapes load_state_dict needs, regardless of
+        # what's currently on disk. The constructor's edge_index/
+        # edge_attr/bw_* arguments only need to produce buffers of the
+        # right SHAPE; their values get overwritten by load_state_dict()
+        # below either way.
+        from models.st_gnn_backwater_edge import STGNNBackwaterEdge
+
+        combined_edge_index = sd["edge_index"].cpu()        # [2, n_river+n_bw]
+        combined_edge_attr  = sd["static_edge_attr"].cpu()  # [n_river+n_bw, 4]
+        bw_gate_reference    = sd["bw_gate_reference"].cpu()  # [n_bw]
+        gauge_datum          = sd["gauge_datum"].cpu()
+        stage_range          = sd["stage_range"].cpu()
+
+        n_bw    = bw_gate_reference.shape[0]
+        n_total = combined_edge_index.shape[1]
+        n_river = n_total - n_bw
+
+        river_edge_index = combined_edge_index[:, :n_river]
+        river_edge_attr  = combined_edge_attr[:n_river]
+        bw_edge_index    = combined_edge_index[:, n_river:]
+        bw_edge_attr     = combined_edge_attr[n_river:]
+
+        model = STGNNBackwaterEdge(
+            f_dyn             = f_dyn,
+            f_static          = f_static,
+            edge_index        = river_edge_index,
+            edge_attr         = river_edge_attr,
+            bw_src            = bw_edge_index[0],
+            bw_dst            = bw_edge_index[1],
+            bw_edge_attr      = bw_edge_attr,
+            bw_gate_reference = bw_gate_reference,
+            gauge_datum       = gauge_datum,
+            stage_range       = stage_range,
+            stage_idx         = hp.get("stage_idx", 1),
+            hidden            = hp.get("hidden", 64),
+            gat_heads         = hp.get("gat_heads", 2),
+            gru_layers        = hp.get("gru_layers", 2),
+            t_out             = t_out,
+            dropout           = hp.get("dropout", 0.1),
+            gate_sharpness    = hp.get("gate_sharpness_init", 5.0),
+        )
     elif tag == "dfc_gnn":
         # DFC-GNN: edge features are buffers inside the model;
         # use build_dfc_gnn() factory so they are loaded correctly.
