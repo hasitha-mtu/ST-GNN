@@ -117,6 +117,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
         sys.exit(1)
 
     df_scen = pd.read_csv(SCEN_CSV)
+    print(f'REAL_CSV.exists(): {REAL_CSV.exists()}')
     df_real = pd.read_csv(REAL_CSV) if REAL_CSV.exists() else pd.DataFrame()
 
     # Normalise model tag column name
