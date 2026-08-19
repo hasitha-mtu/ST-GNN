@@ -163,9 +163,36 @@ class STGNNSoilGate(STGNNHANDEdge):
         # belongs to the stage gate in STGNNHANDEdge) to allow both to
         # coexist in the state dict without conflict, enabling comparison
         # of the two gate types in ablation studies.
-        self.sat_threshold = nn.Parameter(torch.tensor(float(sat_threshold)))
+        #
+        # sat_threshold is reparameterized as sigmoid(sat_threshold_raw)
+        # rather than stored directly. Diagnosed failure mode (checkpoint
+        # audit, horizon=24/seed=42): the sparsity penalty added to fix
+        # collapse-toward-always-open (see class docstring) overshot at
+        # this horizon and pushed the RAW threshold to 1.3357 -- outside
+        # [0,1], the only range S_bar (a ratio, clipped to [0,1] by
+        # construction in both the real feature and every synthetic
+        # scenario injection) can ever reach. A threshold above 1.0 is
+        # not "very conservative", it is mathematically unreachable: the
+        # gate activation stayed at 0.006-0.022 across the entire real S4
+        # breakthrough event, never crossing 0.5, confirmed directly
+        # against a trained checkpoint. sigmoid(raw) makes this failure
+        # mode structurally impossible regardless of how the sparsity
+        # penalty is tuned -- the raw parameter can still be pushed
+        # arbitrarily by gradient descent, but the EFFECTIVE threshold
+        # used in the gate formula below is always in (0,1).
+        sat_threshold = min(max(float(sat_threshold), 1e-4), 1 - 1e-4)
+        self.sat_threshold_raw = nn.Parameter(
+            torch.logit(torch.tensor(sat_threshold)))
         self.sat_sharpness  = nn.Parameter(torch.tensor(float(sat_sharpness)))
         self.last_gate_mean = torch.tensor(0.0)   # updated every forward() call
+
+    @property
+    def sat_threshold(self) -> torch.Tensor:
+        """Effective threshold, always in (0,1) regardless of sat_threshold_raw.
+        Read-only property -- every existing caller (the gate formula
+        below, train_st_gnn_soil_gate.py's model.sat_threshold.item()
+        logging, checkpoint hparams) continues to work unchanged."""
+        return torch.sigmoid(self.sat_threshold_raw)
 
     # ──────────────────────────────────────────────────────────────────
     def _hand_edge_attr(
@@ -194,7 +221,8 @@ class STGNNSoilGate(STGNNHANDEdge):
 
         # Sigmoid gate: opens as S̄ approaches and exceeds sat_threshold.
         # S_bar - sat_threshold is positive when catchment is wetter than
-        # the learned threshold → gate approaches 1.
+        # the learned threshold → gate approaches 1. self.sat_threshold
+        # is the sigmoid(raw) property above -- always in (0,1).
         gate_scalar = torch.sigmoid(
             self.sat_sharpness * (S_bar - self.sat_threshold)
         )                                                  # [B, 1]
@@ -273,7 +301,7 @@ if __name__ == "__main__":
     print(f"Output shape: {tuple(out.shape)}  ✓")
 
     out.sum().backward()
-    assert model.sat_threshold.grad is not None, "sat_threshold has no grad"
+    assert model.sat_threshold_raw.grad is not None, "sat_threshold_raw has no grad"
     assert model.sat_sharpness.grad  is not None, "sat_sharpness has no grad"
     print("Gradients flow through sat_threshold and sat_sharpness  ✓")
 
