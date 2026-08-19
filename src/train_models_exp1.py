@@ -97,7 +97,7 @@ MODEL_REGISTRY = [
     # ("st_gnn_dyn_edge",  _mod_dyn.train),
     # ("st_gnn_hand_edge", _mod_hand.train),
     ("st_gnn_soil_gate", _mod_soil.train),  # anticipatory SM gate
-    ("st_gnn_backwater_edge", _mod_backwater.train),  # gated bridge/
+    # ("st_gnn_backwater_edge", _mod_backwater.train),  # gated bridge/
                                              # culvert backwater edges —
                                              # S6 diagnostic companion
     # ("dfc_gnn",          _mod_dfc.train),
