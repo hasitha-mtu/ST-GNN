@@ -41,6 +41,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -109,6 +110,45 @@ SCEN_LABELS = {
 }
 
 
+def _normalize_model_name(name) -> str:
+    """
+    Strip parenthetical qualifiers and normalise case/whitespace so model
+    labels from a DIFFERENT generating script compare equal to this
+    file's own MODEL_LABELS. Concretely: global_metrics_summary.csv (from
+    analyse_experiments.py) uses "GRU (no graph)" / "PC-DFC-GNN
+    (proposed)", while this file's own MODEL_LABELS has the shorter
+    "GRU" / "PC-DFC-GNN" — an exact-string match between the two
+    conventions silently fails for every model with a parenthetical
+    suffix, which is what caused plot_scenario_advantage_table and
+    plot_convective_cell_horizon's real-data panels to come back empty
+    (all-NaN) even though the data was present in df_real all along.
+    Applied to BOTH sides of any comparison, so labels that already
+    match exactly (e.g. "ST-GNN DynEdge", no parens either side) are
+    unaffected.
+    """
+    import re
+    core = re.sub(r"\s*\(.*?\)\s*", "", str(name)).strip().lower()
+    return core
+
+
+def _extract_horizon_hours(value, step_min: int = 15) -> Optional[float]:
+    """
+    Extract a comparable numeric hour value from either a raw step-count
+    horizon (int, e.g. 4) or an externally-formatted horizon string (e.g.
+    "1hr", "1 hr", "12 hr" — global_metrics_summary.csv uses the latter
+    with a space, this file's own HZ_LABEL uses the former without one;
+    an exact string match between "1hr" and "1 hr" silently fails).
+    Returns None if unparseable.
+    """
+    import re
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) * step_min / 60.0
+    m = re.match(r"\s*([\d.]+)", str(value))
+    return float(m.group(1)) if m else None
+
+
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load real and scenario result CSVs."""
     if not SCEN_CSV.exists():
@@ -150,21 +190,30 @@ def plot_scenario_advantage_table(df_scen: pd.DataFrame,
 
     print(f'plot_scenario_advantage_table|df_real.columns: {df_real.columns}')
 
-    # Real-data NSE per model at hz=4
+    # Real-data NSE per model at hz=4. Matches by NORMALISED model name
+    # and horizon (in hours) rather than exact string equality — see
+    # _normalize_model_name/_extract_horizon_hours docstrings for why:
+    # global_metrics_summary.csv (from analyse_experiments.py) uses
+    # "GRU (no graph)"/"1 hr" while this file's own conventions are
+    # "GRU"/"1hr" (no space) — an exact match silently returns nothing
+    # for every row, which is what produced the all-NaN heatmap.
     real_nse = {}
-    if not df_real.empty and "nse_mean" in df_real.columns:
-        for m in models:
-            sub = df_real[(df_real.model == m) | (df_real.model == MODEL_LABELS.get(m, ""))]
-            if not sub.empty:
-                real_nse[m] = float(sub["nse_mean"].values[0])
-    elif not df_real.empty and "NSE mean" in df_real.columns:
-        for m in models:
-            sub = df_real[
-                ((df_real.model == m) | (df_real.model == MODEL_LABELS.get(m, ""))) &
-                (df_real.get("horizon", pd.Series()) == HZ_LABEL.get(hz, ""))
-            ]
-            if not sub.empty:
-                real_nse[m] = float(sub["NSE mean"].values[0])
+    if not df_real.empty:
+        nse_col = "NSE mean" if "NSE mean" in df_real.columns else (
+            "nse_mean" if "nse_mean" in df_real.columns else None)
+        if nse_col is not None and "horizon" in df_real.columns:
+            target_hours = _extract_horizon_hours(hz)
+            df_real_norm = df_real.copy()
+            df_real_norm["_model_norm"] = df_real_norm["model"].map(_normalize_model_name)
+            df_real_norm["_hz_hours"] = df_real_norm["horizon"].map(_extract_horizon_hours)
+            for m in models:
+                target_norm = _normalize_model_name(MODEL_LABELS.get(m, m))
+                sub = df_real_norm[
+                    (df_real_norm["_model_norm"] == target_norm) &
+                    (df_real_norm["_hz_hours"] == target_hours)
+                ]
+                if not sub.empty:
+                    real_nse[m] = float(sub[nse_col].values[0])
 
     # Build ΔNSE matrix
     data = np.full((len(models), len(scenarios)), np.nan)
@@ -497,20 +546,21 @@ def plot_convective_cell_horizon(df_scen: pd.DataFrame,
     # Panel 2: ΔNSE (scenario − real data) to isolate scenario effect
     if not df_real.empty:
         real_col = "NSE mean" if "NSE mean" in df_real.columns else "nse_mean"
-        hz_col   = "horizon"
+        df_real_norm = df_real.copy()
+        df_real_norm["_model_norm"] = df_real_norm.get("model", pd.Series(dtype=str)).map(_normalize_model_name)
+        df_real_norm["_hz_hours"] = df_real_norm.get("horizon", pd.Series(dtype=float)).map(_extract_horizon_hours)
         for m in models:
             c   = MODEL_COLORS.get(m, "#888888")
             mk  = MODEL_MARKERS.get(m, "o")
             lbl = MODEL_LABELS.get(m, m)
+            target_norm = _normalize_model_name(MODEL_LABELS.get(m, m))
             deltas = []
             for hz in hz_list:
                 sub_s1 = df_s1[(df_s1.model == m) & (df_s1.horizon == hz)]
-                hz_str = HZ_LABEL.get(hz, str(hz))
-                sub_rd = df_real[
-                    ((df_real.get("model", pd.Series()) == m) |
-                     (df_real.get("model", pd.Series()) == MODEL_LABELS.get(m, ""))) &
-                    ((df_real.get(hz_col, pd.Series()) == hz) |
-                     (df_real.get(hz_col, pd.Series()) == hz_str))
+                target_hours = _extract_horizon_hours(hz)
+                sub_rd = df_real_norm[
+                    (df_real_norm["_model_norm"] == target_norm) &
+                    (df_real_norm["_hz_hours"] == target_hours)
                 ]
                 if sub_s1.empty or sub_rd.empty:
                     deltas.append(np.nan)
