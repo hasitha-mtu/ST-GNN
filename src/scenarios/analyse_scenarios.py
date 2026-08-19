@@ -145,6 +145,10 @@ def plot_scenario_advantage_table(df_scen: pd.DataFrame,
     hz = 4
     scenarios = [s for s in SCEN_LABELS if s in df_scen["scenario"].unique()]
     models    = [m for m in MODEL_ORDER if m in df_scen["model"].unique()]
+    print(f'plot_scenario_advantage_table|scenarios: {scenarios}')
+    print(f'plot_scenario_advantage_table|models: {models}')
+
+    print(f'plot_scenario_advantage_table|df_real.columns: {df_real.columns}')
 
     # Real-data NSE per model at hz=4
     real_nse = {}
