@@ -55,7 +55,7 @@ SCEN_RES    = RESULTS_DIR / "scenarios"
 FIGS_DIR    = RESULTS_DIR / "figures"
 FIGS_DIR.mkdir(parents=True, exist_ok=True)
 
-REAL_CSV    = RESULTS_DIR / "global_metrics_summary.csv"
+REAL_CSV    = RESULTS_DIR / "figures/model_comparison/global_metrics_summary.csv"
 SCEN_CSV    = SCEN_RES    / "scenario_summary.csv"
 
 STEP_MIN    = 15
