@@ -279,7 +279,104 @@ def identify_downstream_nodes(nd: pd.DataFrame, n: int = 5) -> list[int]:
     return valid.head(n)["node_idx"].tolist()
 
 
-def select_base_windows(X: np.ndarray, y: np.ndarray,
+# ══════════════════════════════════════════════════════════════════════════════
+# Multi-realization parameter sampling (reviewer point 2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Previously, each scenario applied ONE fixed, deterministic set of
+# injection parameters (pulse magnitude, release ramp rate, blockage
+# severity, etc.) across many different REAL historical base windows.
+# That gives variation in antecedent conditions but not in the synthetic
+# event itself -- a reviewer can reasonably ask whether conclusions
+# depend on the one specific magnitude chosen. This module samples
+# injection MAGNITUDE from a physically-justified range per realization,
+# while deliberately keeping injection TIMING (pulse_at_step,
+# t_release_step, t_blockage_step, sat_breakthrough_step) fixed across
+# realizations -- every s1..s6_metrics function in scenario_evaluator.py
+# reads timing as a single scalar from meta shared across all windows;
+# varying timing per realization would require rewriting every one of
+# those alignment computations. Varying magnitude does not, since the
+# event still happens at the same relative step every time -- only how
+# large it is changes. This directly addresses "do conclusions depend on
+# the chosen perturbation parameters" without touching the evaluation
+# side at all.
+#
+# Base windows (from select_base_windows) are computed ONCE per scenario
+# and reused across all realizations, not redrawn per realization --
+# select_base_windows has no randomness of its own, so calling it again
+# with the same arguments returns the same windows, not new ones. This
+# also cleanly separates two different axes of variation: which
+# historical period (existing, via n_windows) vs. how severe the
+# synthetic event is (new, via n_realizations) -- conflating them would
+# make it harder to attribute any given result to one or the other.
+
+# S1: pulse intensity. Marchi et al. (2010, J. Hydrology) characterise a
+# genuine range of rainfall intensities across documented European flash
+# flood events, not one fixed figure -- default of 30mm/15min sits near
+# the middle of a plausible range for an isolated convective cell.
+S1_PULSE_PEAK_RANGE_MM = (15.0, 45.0)
+
+# S3: release severity. Real ESB-style controlled releases vary in both
+# how high they ramp and how quickly -- no single fixed magnitude
+# represents "a release event" any more than one fixed rainfall
+# intensity represents "a storm".
+S3_PLATEAU_RISE_RANGE_M   = (0.5, 1.3)
+S3_RAMP_RATE_RANGE_M_STEP = (0.03, 0.08)
+
+# S4's realization parameters (excess_threshold, sat_start, sat_rate,
+# rain_peak_mm) are sampled by sample_s4_realization_params(), defined
+# just above generate_s4_sat_breakthrough below -- kept there rather
+# than here because sat_breakthrough_step is DERIVED from the other
+# three and that derivation belongs next to the parameters it depends
+# on, not separated from them.
+
+# S5: gradient ratio. Zhu, Wright & Yu (2018, WRR) support a range of
+# spatial rainfall heterogeneity intensities, not one fixed 2.5x ratio.
+S5_GRADIENT_MAX_RANGE = (1.8, 3.0)
+
+# S6: blockage severity, expressed as a single 0-1 fraction rather than
+# two independently-sampled numbers -- McDermott & Quinn (2023) report
+# ~50% flow-capacity reduction during a real documented Irish blockage
+# event; that figure anchors the centre of this range rather than being
+# hardcoded as the only value ever tested. backwater_cap and
+# suppression_cap are BOTH derived from this one severity value below,
+# consistent with the "single shared parameter, not two independent
+# guesses" principle already discussed for this scenario.
+S6_SEVERITY_RANGE = (0.30, 0.75)
+
+
+def sample_s1_params(rng: np.random.Generator) -> dict:
+    return {"pulse_peak_mm_per_15min": float(rng.uniform(*S1_PULSE_PEAK_RANGE_MM))}
+
+
+def sample_s3_params(rng: np.random.Generator) -> dict:
+    return {
+        "plateau_rise_m":    float(rng.uniform(*S3_PLATEAU_RISE_RANGE_M)),
+        "ramp_rate_m_per_step": float(rng.uniform(*S3_RAMP_RATE_RANGE_M_STEP)),
+    }
+
+
+def sample_s5_params(rng: np.random.Generator) -> dict:
+    return {"gradient_max": float(rng.uniform(*S5_GRADIENT_MAX_RANGE))}
+
+
+def sample_s6_params(rng: np.random.Generator) -> dict:
+    severity = float(rng.uniform(*S6_SEVERITY_RANGE))
+    # Derived, not independently sampled: a more severe blockage produces
+    # both a larger backwater rise AND a larger downstream suppression,
+    # from the same underlying physical cause -- sampling them
+    # independently would let a random draw produce a large backwater
+    # rise with almost no downstream suppression, which isn't a
+    # physically coherent combination for a single blockage event.
+    return {
+        "severity":         severity,
+        "backwater_cap_m":  round(0.8 + severity * 1.4, 4),    # 0.8-2.0m at severity 0-1
+        "suppression_cap_m": round(0.1 + severity * 0.35, 4),  # 0.1-0.45m at severity 0-1
+    }
+
+
+def select_base_windows(
+    X: np.ndarray, y: np.ndarray,
                         bankfull: np.ndarray,
                         sat_min: float = 0.60, sat_max: float = 0.92,
                         max_stage_frac: float = 0.40,
@@ -395,7 +492,9 @@ def save_scenario(name: str, out_dir: Path,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
-                                 n_windows: int = 50) -> None:
+                                 n_windows: int = 50,
+                                 n_realizations: int = 20,
+                                 seed: int = 0) -> None:
     """
     Isolated convective storm over 6 headwater gauges. Rapid stage rise
     within 45–90 minutes. Flood pulse arrives at Cork city gauges 2–4 hr later.
@@ -403,9 +502,16 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
     Physical motivation: tests whether cross-tributary HAND edges carry the
     lateral flood signal before it reaches the Cork city gauges via the
     river-network alone.
+
+    n_realizations: number of independent draws of pulse_peak_mm_per_15min
+    from S1_PULSE_PEAK_RANGE_MM, applied across the SAME window_starts
+    (see the multi-realization module docstring above this function for
+    why timing stays fixed while only magnitude varies). Total generated
+    windows = n_windows * n_realizations.
     """
     print("\nS1: ConvectiveCell")
     out_dir = SCEN_DIR / "S1_ConvectiveCell"
+    rng = np.random.default_rng(seed)
 
     headwater_idx = identify_headwater_nodes(nd, n=6)
 
@@ -457,20 +563,13 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
         print("  [skip] No valid base windows found for S1")
         return
 
-    # Build the convective rainfall pulse (triangular, 90 min duration)
-    pulse_peak    = 30.0     # mm per 15-min at storm centre
-    pulse_steps   = 6        # 90 minutes
-    pulse = np.zeros(pulse_steps)
-    half  = pulse_steps // 2
-    for t in range(half): pulse[t] = pulse_peak * t / half
-    for t in range(half, pulse_steps): pulse[t] = pulse_peak * (pulse_steps - t) / half
+    pulse_steps = 6        # 90 minutes, fixed across realizations
+    pulse_at = T_IN + 2    # storm begins 2 steps into prediction horizon, fixed
 
-    T_s   = T_WINDOW * len(window_starts)
+    T_s   = T_WINDOW * len(window_starts) * n_realizations
     X_syn = np.zeros((T_s, X.shape[1], X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, y.shape[1]),              dtype=np.float32)
     m_syn = np.zeros((T_s, mask.shape[1]),           dtype=np.float32)
-
-    pulse_at = T_IN + 2    # storm begins 2 steps into prediction horizon
 
     # Per-node stage_range for converting injected stage deltas (in
     # metres) into equivalent normalised_stage deltas. S1's own stated
@@ -484,84 +583,102 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
     stage_range = (nd.set_index("node_idx")["p90_mAOD"]
                    - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
 
-    for i, t0 in enumerate(window_starts):
-        sl = slice(i * T_WINDOW, (i+1) * T_WINDOW)
+    realizations_meta = []
+    window_realization_id = []
+    row = 0
 
-        # Copy baseline window
-        X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+    for real_id in range(n_realizations):
+        params = sample_s1_params(rng)
+        pulse_peak = params["pulse_peak_mm_per_15min"]
+        realizations_meta.append({"id": real_id, **params})
 
-        # Set antecedent saturation synthetically.
-        # swvl2_sat_ratio may be 0.0 in X.npy if ERA5-Land was not
-        # integrated correctly. Always write a physically meaningful
-        # value directly rather than relying on X.npy content.
-        # S1: moderate saturation (0.72) — not too dry, not flooded.
-        # Ramp up slightly over the input window to simulate
-        # ongoing light rain before the convective event.
-        for _t in range(T_WINDOW):
-            ramp = min(0.08, _t / T_WINDOW * 0.10)
-            X_w[_t, :, F_SW2_SAT] = np.clip(0.72 + ramp, 0, 1)
-            X_w[_t, :, F_SW1_SAT] = np.clip(0.68 + ramp, 0, 1)
-            X_w[_t, :, F_SW2_RAW] = X_w[_t, :, F_SW2_SAT] * 0.472
-            X_w[_t, :, F_SW1_RAW] = X_w[_t, :, F_SW1_SAT] * 0.472
+        # Build the convective rainfall pulse (triangular, 90 min duration)
+        # for THIS realization's magnitude.
+        pulse = np.zeros(pulse_steps)
+        half  = pulse_steps // 2
+        for t in range(half): pulse[t] = pulse_peak * t / half
+        for t in range(half, pulse_steps): pulse[t] = pulse_peak * (pulse_steps - t) / half
 
-        # Apply convective rainfall pulse to headwater nodes only
-        for n_idx in headwater_idx:
-            ref = str(int(nd.loc[nd.node_idx == n_idx, "ref"].values[0]))
-            if ref not in uh:
-                continue
-            p = uh[ref]
-            # Rainfall perturbation at headwater gauges
-            rain_start = pulse_at
-            rain_end   = min(pulse_at + pulse_steps, T_WINDOW)
-            X_w[rain_start:rain_end, n_idx, F_RAIN] += pulse[:rain_end-rain_start]
+        for t0 in window_starts:
+            sl = slice(row * T_WINDOW, (row+1) * T_WINDOW)
+            window_realization_id.append(real_id)
 
-            # Compute rainfall excess (sat-dependent infiltration)
-            sat_ratio = float(np.mean(X_w[:T_IN, n_idx, F_SW2_SAT]))
-            excess_factor = sat_ratio   # near 1 when saturated
-            total_excess  = float(np.sum(pulse)) * excess_factor
+            # Copy baseline window
+            X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
 
-            # Stage response via UH
-            uh_arr = triangular_uh(
-                p["peak_rate_m_per_mm"],
-                p["tc_hr"],
-                T_WINDOW - pulse_at)
-            stage_delta = uh_arr * total_excess
+            # Set antecedent saturation synthetically.
+            # swvl2_sat_ratio may be 0.0 in X.npy if ERA5-Land was not
+            # integrated correctly. Always write a physically meaningful
+            # value directly rather than relying on X.npy content.
+            # S1: moderate saturation (0.72) — not too dry, not flooded.
+            # Ramp up slightly over the input window to simulate
+            # ongoing light rain before the convective event.
+            for _t in range(T_WINDOW):
+                ramp = min(0.08, _t / T_WINDOW * 0.10)
+                X_w[_t, :, F_SW2_SAT] = np.clip(0.72 + ramp, 0, 1)
+                X_w[_t, :, F_SW1_SAT] = np.clip(0.68 + ramp, 0, 1)
+                X_w[_t, :, F_SW2_RAW] = X_w[_t, :, F_SW2_SAT] * 0.472
+                X_w[_t, :, F_SW1_RAW] = X_w[_t, :, F_SW1_SAT] * 0.472
 
-            # Apply to stage_anomaly and dh_dt
-            t_start = pulse_at + round(p["tp_hr"] / STEP_MIN * 60)
-            t_start = min(t_start, T_WINDOW - 1)
-            uh_len  = min(len(stage_delta), T_WINDOW - t_start)
-            y_w[t_start : t_start + uh_len, n_idx] += stage_delta[:uh_len]
-            X_w[t_start : t_start + uh_len, n_idx, F_STAGE] += stage_delta[:uh_len]
-            sr = float(stage_range.loc[n_idx])
-            if sr > 0:
-                X_w[t_start : t_start + uh_len, n_idx, F_NORM] += stage_delta[:uh_len] / sr
+            # Apply convective rainfall pulse to headwater nodes only
+            for n_idx in headwater_idx:
+                ref = str(int(nd.loc[nd.node_idx == n_idx, "ref"].values[0]))
+                if ref not in uh:
+                    continue
+                p = uh[ref]
+                # Rainfall perturbation at headwater gauges
+                rain_start = pulse_at
+                rain_end   = min(pulse_at + pulse_steps, T_WINDOW)
+                X_w[rain_start:rain_end, n_idx, F_RAIN] += pulse[:rain_end-rain_start]
 
-        # Route headwater signal downstream through the river network,
-        # multiple hops out from each headwater — a single-pass edge loop
-        # (the previous implementation) only reaches nodes one edge away
-        # from a headwater, which the BFS check above confirmed never
-        # includes any of this scenario's own downstream evaluation
-        # nodes. Reuses the same per-headwater topology precomputed
-        # before the window loop (static, doesn't depend on window
-        # content) and the same propagate_downstream_chain mechanism S3
-        # uses, called once per headwater that actually received a pulse
-        # this window — += accumulation in propagate_downstream_chain
-        # correctly sums contributions where multiple headwaters' chains
-        # converge on the same downstream node.
-        for n_idx in headwater_idx:
-            if y_w[:, n_idx].max() <= y_w[:T_IN, n_idx].max():
-                continue   # no signal to route from this headwater
-            base = float(np.mean(y_w[:T_IN, n_idx]))
-            propagate_downstream_chain(
-                y_w, X_w, n_idx, headwater_chains[n_idx], lags,
-                baseline=base, stage_range=stage_range)
+                # Compute rainfall excess (sat-dependent infiltration)
+                sat_ratio = float(np.mean(X_w[:T_IN, n_idx, F_SW2_SAT]))
+                excess_factor = sat_ratio   # near 1 when saturated
+                total_excess  = float(np.sum(pulse)) * excess_factor
 
-        X_syn[sl] = X_w
-        y_syn[sl] = y_w
-        m_syn[sl] = m_w
+                # Stage response via UH
+                uh_arr = triangular_uh(
+                    p["peak_rate_m_per_mm"],
+                    p["tc_hr"],
+                    T_WINDOW - pulse_at)
+                stage_delta = uh_arr * total_excess
+
+                # Apply to stage_anomaly and dh_dt
+                t_start = pulse_at + round(p["tp_hr"] / STEP_MIN * 60)
+                t_start = min(t_start, T_WINDOW - 1)
+                uh_len  = min(len(stage_delta), T_WINDOW - t_start)
+                y_w[t_start : t_start + uh_len, n_idx] += stage_delta[:uh_len]
+                X_w[t_start : t_start + uh_len, n_idx, F_STAGE] += stage_delta[:uh_len]
+                sr = float(stage_range.loc[n_idx])
+                if sr > 0:
+                    X_w[t_start : t_start + uh_len, n_idx, F_NORM] += stage_delta[:uh_len] / sr
+
+            # Route headwater signal downstream through the river network,
+            # multiple hops out from each headwater — a single-pass edge loop
+            # (the previous implementation) only reaches nodes one edge away
+            # from a headwater, which the BFS check above confirmed never
+            # includes any of this scenario's own downstream evaluation
+            # nodes. Reuses the same per-headwater topology precomputed
+            # before the window loop (static, doesn't depend on window
+            # content) and the same propagate_downstream_chain mechanism S3
+            # uses, called once per headwater that actually received a pulse
+            # this window — += accumulation in propagate_downstream_chain
+            # correctly sums contributions where multiple headwaters' chains
+            # converge on the same downstream node.
+            for n_idx in headwater_idx:
+                if y_w[:, n_idx].max() <= y_w[:T_IN, n_idx].max():
+                    continue   # no signal to route from this headwater
+                base = float(np.mean(y_w[:T_IN, n_idx]))
+                propagate_downstream_chain(
+                    y_w, X_w, n_idx, headwater_chains[n_idx], lags,
+                    baseline=base, stage_range=stage_range)
+
+            X_syn[sl] = X_w
+            y_syn[sl] = y_w
+            m_syn[sl] = m_w
+            row += 1
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S1")
 
@@ -570,16 +687,54 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
         "description": (
             "Isolated convective storm over 6 headwater gauges. "
             "Rapid stage rise within 90 min. Tests HAND topology advantage."),
-        "n_windows":       len(window_starts),
+        "n_windows":       row,
+        "n_windows_per_realization": len(window_starts),
+        "n_realizations":  n_realizations,
         "T_per_window":    T_WINDOW,
         "T_total":         T_s,
         "headwater_nodes": headwater_idx,
         "downstream_nodes": downstream_idx,
-        "pulse_peak_mm_per_15min": 30.0,
-        "pulse_duration_steps":    pulse_steps,
+        "pulse_duration_steps": pulse_steps,
         "pulse_at_step":   pulse_at,
+        "realizations":    realizations_meta,
+        "window_realization_id": window_realization_id,
     }
     save_scenario("S1_ConvectiveCell", out_dir, X_syn, y_syn, m_syn, meta)
+
+
+def compute_node_criticality(nd: pd.DataFrame, ed: pd.DataFrame) -> list[int]:
+    """
+    Ranks all N nodes by downstream-reachability count (how many other
+    nodes sit downstream of, and therefore hydraulically depend on
+    routing information passing through, this one) — a direct,
+    topology-grounded measure of "how disruptive would losing this
+    gauge be to the network's information flow", used to distinguish
+    random gauge failure from failure targeted at hydrologically/
+    network-critical gauges (reviewer point 1).
+
+    Returns node indices sorted descending by reachability count (most
+    critical first).
+    """
+    N = len(nd)
+    reach_counts = []
+    for n in range(N):
+        chain = downstream_bfs_edges(n, ed)
+        reach_counts.append((n, len(set(dst for _s, dst in chain))))
+    reach_counts.sort(key=lambda x: -x[1])
+    return [n for n, _ in reach_counts]
+
+
+# S2: failure severity as a FRACTION of the network (27 gauges), not a
+# fixed count -- a fixed [1,3,5] doesn't scale meaningfully if the gauge
+# network size ever changes, and doesn't span "how bad can it get"
+# (reviewer point 1 asks for 5/10/20/30/40%).
+S2_FAILURE_FRACTIONS = [0.05, 0.10, 0.20, 0.30, 0.40]
+
+# Failure duration: wide range from a brief outage to effectively
+# permanent-within-window (T_WINDOW=104) -- a fixed "fails and never
+# recovers" (the old behaviour) is one point on this range, not the
+# only condition worth testing for a genuine resilience curve.
+S2_DURATION_RANGE_STEPS = (8, 90)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,88 +742,169 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_s2_gauge_failure(X, y, mask, nd, ed, uh, lags, bankfull,
-                               n_windows: int = 40) -> None:
+                               n_windows: int = 40,
+                               n_random_repeats: int = 4,
+                               n_windows_per_realization: int = 2,
+                               seed: int = 0) -> None:
     """
-    Real flood windows from the test set with upstream gauges progressively
-    zeroed from T_failure onward. Tests graph spatial redundancy.
+    Real flood windows with gauges failed from t_failure onward.
 
-    Three failure severities per window:
-        1 gauge failed, 3 gauges failed, 5 gauges failed.
+    Rebuilt from a fixed [1,3,5]-gauge-count, headwater-only, permanent-
+    failure design into a genuine sensor-network resilience experiment
+    (reviewer point 1), combined with point 2's multi-realization
+    requirement rather than treated as separate work, since both touch
+    this same function:
+
+      - Severity: S2_FAILURE_FRACTIONS = [5,10,20,30,40]% of the 27-gauge
+        network, not a fixed count.
+      - Selection: "random" (uniform draw from all 27 gauges, repeated
+        n_random_repeats times per fraction for robustness against one
+        unlucky/lucky draw) vs "critical" (the n_fail gauges with the
+        highest downstream-reachability count, via
+        compute_node_criticality() — deterministic per fraction, so not
+        repeated the same way, but still combined with varying duration
+        across its own realizations for some variation).
+      - Duration: S2_DURATION_RANGE_STEPS, sampled per realization —
+        from a brief outage to effectively permanent-within-window,
+        rather than only ever "fails and never recovers".
+
+    Unlike S1/S3/S4/S5/S6, WHICH NODES fail is itself random per
+    realization (not just a magnitude), so s2_metrics cannot reconstruct
+    the failed-node set from a fixed formula the way it previously did
+    (headwater_idx[:n_fail] from a deterministic block index) — this
+    version explicitly saves fail_nodes and duration_steps per
+    realization in meta, and s2_metrics has been rewritten to read them.
     """
-    print("\nS2: GaugeFailure")
+    print("\nS2: GaugeFailure (multi-realization sensor-network resilience)")
     out_dir = SCEN_DIR / "S2_GaugeFailure"
+    rng = np.random.default_rng(seed)
 
-    # Select windows that ARE flood events (high stage)
     T     = X.shape[0]
     N     = X.shape[1]
     test_start = int(T * 0.85)
 
-    # Load bankfull thresholds (in anomaly space)
     flood_windows = []
     t = test_start
     while t < T - T_WINDOW and len(flood_windows) < n_windows:
         y_w = y[t : t + T_WINDOW]
-        # Window must have at least 3 gauges exceeding 50% of bankfull
         n_exceeding = int(np.sum(
             np.nanmax(y_w[T_IN:T_IN+24], axis=0) > 0.5 * bankfull))
         if n_exceeding >= 3:
             flood_windows.append(t)
-        t += T_IN // 2   # overlapping OK for scenario diversity
+        t += T_IN // 2
 
     if not flood_windows:
         print("  [warn] No flood windows found — using high-stage windows")
         flood_windows = select_base_windows(
             X, y, bankfull, sat_min=0.80, sat_max=1.0, n_windows=n_windows)
+    if not flood_windows:
+        print("  [skip] No valid base windows found for S2")
+        return
 
-    headwater_idx = identify_headwater_nodes(nd, n=8)
-    failure_levels = [1, 3, 5]   # number of upstream gauges failed
+    all_nodes = list(range(N))
+    critical_order = compute_node_criticality(nd, ed)
+    t_failure = T_IN + 4   # failure onset fixed across all realizations
 
-    T_s   = T_WINDOW * len(flood_windows) * len(failure_levels)
+    # Build the full list of (n_fail, selection_mode) configurations,
+    # then n_random_repeats realizations for "random" and 1 realization
+    # (still with its own sampled duration) for "critical" per fraction —
+    # "critical" selection is deterministic given a fraction, so
+    # repeating it with the SAME node set wouldn't test anything new the
+    # way repeating "random" draws does.
+    configs = []
+    for frac in S2_FAILURE_FRACTIONS:
+        n_fail = max(1, round(frac * N))
+        configs.append((n_fail, frac, "critical", 1))
+        configs.append((n_fail, frac, "random",   n_random_repeats))
+
+    realizations_meta = []
+    window_realization_id = []
+    all_windows: list[tuple[int, int]] = []   # (t0, realization_id)
+
+    real_id = 0
+    window_pool_idx = 0
+    for n_fail, frac, mode, n_repeats in configs:
+        for _ in range(n_repeats):
+            if mode == "critical":
+                fail_nodes = critical_order[:n_fail]
+            else:
+                fail_nodes = sorted(rng.choice(all_nodes, size=n_fail, replace=False).tolist())
+            duration_steps = int(rng.integers(*S2_DURATION_RANGE_STEPS))
+
+            realizations_meta.append({
+                "id": real_id, "failure_fraction": frac, "n_fail": n_fail,
+                "selection_mode": mode, "fail_nodes": fail_nodes,
+                "duration_steps": duration_steps,
+            })
+
+            n_take = min(n_windows_per_realization, len(flood_windows))
+            chosen_windows = [flood_windows[(window_pool_idx + k) % len(flood_windows)]
+                              for k in range(n_take)]
+            window_pool_idx += n_take
+            for t0 in chosen_windows:
+                all_windows.append((t0, real_id))
+                window_realization_id.append(real_id)
+            real_id += 1
+
+    if not all_windows:
+        print("  [skip] S2: no windows available after realization allocation")
+        return
+
+    n_total = len(all_windows)
+    T_s   = T_WINDOW * n_total
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    t_failure = T_IN + 4   # failure begins 1 hr into the forecast
+    real_by_id = {r["id"]: r for r in realizations_meta}
 
-    row = 0
-    failed_node_sets = []
-    for t0 in flood_windows:
-        for n_fail in failure_levels:
-            sl = slice(row * T_WINDOW, (row + 1) * T_WINDOW)
+    for i, (t0, rid) in enumerate(all_windows):
+        sl = slice(i * T_WINDOW, (i + 1) * T_WINDOW)
+        X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+        y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+        m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
 
-            X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-            y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-            m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+        r = real_by_id[rid]
+        fail_nodes = r["fail_nodes"]
+        duration_steps = r["duration_steps"]
+        t_recover = min(t_failure + duration_steps, T_WINDOW)
 
-            fail_nodes = headwater_idx[:n_fail]
-            failed_node_sets.append(fail_nodes)
+        # Zero dynamic features for failed gauges from t_failure until
+        # t_recover (or end of window, whichever comes first) -- unlike
+        # the original always-permanent-to-end-of-window version, a
+        # short duration_steps draw lets the gauge come back online
+        # within the same window.
+        X_w[t_failure:t_recover, fail_nodes, F_STAGE] = 0.0
+        X_w[t_failure:t_recover, fail_nodes, F_DHDT]  = 0.0
+        X_w[t_failure:t_recover, fail_nodes, F_DISC]  = 0.0
+        X_w[t_failure:t_recover, fail_nodes, F_RAIN]  = 0.0
+        m_w[t_failure:t_recover, fail_nodes] = 0.0
 
-            # Zero dynamic features for failed gauges from t_failure onward
-            X_w[t_failure:, fail_nodes, F_STAGE] = 0.0
-            X_w[t_failure:, fail_nodes, F_DHDT]  = 0.0
-            X_w[t_failure:, fail_nodes, F_DISC]  = 0.0
-            X_w[t_failure:, fail_nodes, F_RAIN]  = 0.0
-            # Mark failed gauges as invalid in the mask
-            m_w[t_failure:, fail_nodes] = 0.0
-
-            X_syn[sl] = X_w
-            y_syn[sl] = y_w
-            m_syn[sl] = m_w
-            row += 1
+        X_syn[sl] = X_w
+        y_syn[sl] = y_w
+        m_syn[sl] = m_w
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S2")
 
     meta = {
         "name": "S2_GaugeFailure",
         "description": (
-            "Flood windows with progressive upstream gauge failure. "
-            "Tests graph spatial redundancy and information recovery."),
-        "n_windows":       len(flood_windows),
-        "failure_levels":  failure_levels,
+            "Sensor-network resilience experiment: gauges fail from "
+            "t_failure for a sampled duration. Severity spans 5-40% of "
+            "the 27-gauge network; selection is either uniformly random "
+            "(repeated for robustness) or targeted at the most "
+            "hydrologically/network-critical gauges by downstream-"
+            "reachability count; duration varies from brief to "
+            "effectively permanent-within-window."),
+        "n_windows":       n_total,
+        "n_realizations":  len(realizations_meta),
+        "n_windows_per_realization": n_windows_per_realization,
         "T_per_window":    T_WINDOW,
         "T_total":         T_s,
         "t_failure_step":  t_failure,
-        "headwater_nodes": headwater_idx,
+        "failure_fractions": S2_FAILURE_FRACTIONS,
+        "realizations":          realizations_meta,
+        "window_realization_id": window_realization_id,
     }
     save_scenario("S2_GaugeFailure", out_dir, X_syn, y_syn, m_syn, meta)
 
@@ -679,7 +915,9 @@ def generate_s2_gauge_failure(X, y, mask, nd, ed, uh, lags, bankfull,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
-                                    n_windows: int = 30) -> None:
+                                    n_windows: int = 30,
+                                    n_realizations: int = 20,
+                                    seed: int = 0) -> None:
     """
     ESB operates a controlled release from Inniscarra dam, ramping stage
     at the Inniscarra Tailrace gauge (ref 19109) independently of
@@ -704,9 +942,17 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
           "does the physics gate resist an implausible propagation"
           question, now framed around a real operational event rather
           than a hypothetical debris blockage.
+
+    n_realizations: independent draws of (ramp_rate_m_per_step,
+    plateau_rise_m) from sample_s3_params(), applied across the SAME
+    window_starts (same principle as S1: which historical period vs.
+    how severe the synthetic event is are separate axes of variation).
+    Release ONSET timing (t_release) stays fixed across realizations,
+    so s3_metrics needs no changes -- only magnitude/duration vary.
     """
-    print("\nS3: InniscarraRelease")
+    print("\nS3: InniscarraRelease (multi-realization)")
     out_dir = SCEN_DIR / "S3_InniscarraRelease"
+    rng = np.random.default_rng(seed)
 
     T = X.shape[0]; N = X.shape[1]
 
@@ -737,26 +983,8 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
     edges_order = downstream_bfs_edges(tailrace_idx, ed)
     downstream_idx = [dst for _src, dst in edges_order]
 
-    # Select calm-to-moderate windows so the release signal is clearly
-    # attributable rather than swamped by a concurrent flood event.
-    #
-    # node_subset restricts the calm-baseline check to only the nodes
-    # this scenario actually perturbs (tailrace + downstream chain).
-    # The original blockage version of S3 required all 27 Lee gauges
-    # calm simultaneously — appropriate when an injected anomaly could
-    # plausibly interact anywhere, but an unnecessarily strict (and
-    # yield-limiting) constraint here: whether some unrelated headwater
-    # gauge is mid-flood has no bearing on whether an Inniscarra release
-    # is physically valid to inject. Narrowing this recovered most of
-    # the window shortfall reported after the first --all run (11/30
-    # windows found under the old all-27-gauges check).
     release_relevant_nodes = [tailrace_idx] + downstream_idx
 
-    # Same retry structure as before (and S5): the joint saturation +
-    # calm-baseline constraint can still return zero windows in the
-    # validation-period search region even scoped down, so loosen
-    # max_stage_frac once before giving up rather than silently
-    # producing a zero-length scenario.
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.60, sat_max=0.92,
         max_stage_frac=0.30, n_windows=n_windows,
@@ -777,58 +1005,58 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
               "search_from_frac=0.70 region")
         return
 
-    T_s   = T_WINDOW * len(window_starts)
+    T_s   = T_WINDOW * len(window_starts) * n_realizations
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    t_release      = T_IN + 4     # release begins 1 hr into the forecast
-    ramp_rate      = 0.04         # m per timestep during ramp-up/down —
-                                   # gradual, per ESB operational
-                                   # convention of staged releases rather
-                                   # than an instantaneous step change
-    plateau_rise   = 0.90         # m held at the tailrace during release
-    ramp_steps     = int(round(plateau_rise / ramp_rate))   # ≈23 steps
-    plateau_steps  = 20           # ≈5 hr sustained release
-    # Full ramp-up + plateau + ramp-down = 36 + 23 + 20 + 23 = 102 steps,
-    # fits inside T_WINDOW (104) with margin.
+    t_release      = T_IN + 4     # release begins 1 hr into the forecast, fixed across realizations
+    plateau_steps  = 20           # ≈5 hr sustained release, fixed across realizations
 
-    for i, t0 in enumerate(window_starts):
-        sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
-        X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+    realizations_meta = []
+    window_realization_id = []
+    row = 0
 
-        base_tail = float(np.mean(y_w[:T_IN, tailrace_idx]))
+    for real_id in range(n_realizations):
+        params = sample_s3_params(rng)
+        ramp_rate    = params["ramp_rate_m_per_step"]
+        plateau_rise = params["plateau_rise_m"]
+        ramp_steps   = int(round(plateau_rise / ramp_rate))
+        realizations_meta.append({"id": real_id, **params, "ramp_steps": ramp_steps})
 
-        # Trapezoidal release profile at the tailrace: ramp up, hold,
-        # ramp down. Nothing else in the window is touched at this
-        # point — the upstream inflow gauges keep their copied baseline
-        # untouched, which is the whole point of the scenario.
-        for t in range(t_release, T_WINDOW):
-            dt = t - t_release
-            if dt < ramp_steps:
-                delta = ramp_rate * dt
-            elif dt < ramp_steps + plateau_steps:
-                delta = plateau_rise
-            else:
-                dt_down = dt - ramp_steps - plateau_steps
-                delta = max(0.0, plateau_rise - ramp_rate * dt_down)
-            y_w[t, tailrace_idx] = base_tail + delta
-            X_w[t, tailrace_idx, F_STAGE] = base_tail + delta
+        for t0 in window_starts:
+            sl  = slice(row * T_WINDOW, (row+1) * T_WINDOW)
+            window_realization_id.append(real_id)
 
-        # Route the release signal downstream through the river network,
-        # multiple hops out from the tailrace (Waterworks Weir ->
-        # Fitzgerald's Park -> Pope's Quay -> St. Patrick's Quay ->
-        # Currach Club), attenuating per edge via the same routing lags
-        # used elsewhere in this module. Topology precomputed above —
-        # same chain for every window.
-        propagate_downstream_chain(
-            y_w, X_w, tailrace_idx, edges_order, lags, baseline=base_tail)
+            X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
 
-        X_syn[sl] = X_w
-        y_syn[sl] = y_w
-        m_syn[sl] = m_w
+            base_tail = float(np.mean(y_w[:T_IN, tailrace_idx]))
+
+            # Trapezoidal release profile at the tailrace: ramp up, hold,
+            # ramp down. Nothing else in the window is touched at this
+            # point — the upstream inflow gauges keep their copied
+            # baseline untouched, which is the whole point of the scenario.
+            for t in range(t_release, T_WINDOW):
+                dt = t - t_release
+                if dt < ramp_steps:
+                    delta = ramp_rate * dt
+                elif dt < ramp_steps + plateau_steps:
+                    delta = plateau_rise
+                else:
+                    dt_down = dt - ramp_steps - plateau_steps
+                    delta = max(0.0, plateau_rise - ramp_rate * dt_down)
+                y_w[t, tailrace_idx] = base_tail + delta
+                X_w[t, tailrace_idx, F_STAGE] = base_tail + delta
+
+            propagate_downstream_chain(
+                y_w, X_w, tailrace_idx, edges_order, lags, baseline=base_tail)
+
+            X_syn[sl] = X_w
+            y_syn[sl] = y_w
+            m_syn[sl] = m_w
+            row += 1
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S3")
 
@@ -839,8 +1067,13 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
             "the tailrace gauge independently of rainfall. Tests whether "
             "the model anticipates the downstream propagation while "
             "correctly leaving the two upstream reservoir inflow gauges "
-            "(which the release cannot physically affect) undisturbed."),
-        "n_windows":       len(window_starts),
+            "(which the release cannot physically affect) undisturbed. "
+            "Multi-realization: ramp_rate/plateau_rise vary per real "
+            "ESB-style staged-release documentation; release onset "
+            "timing stays fixed."),
+        "n_windows":       row,
+        "n_windows_per_realization": len(window_starts),
+        "n_realizations":  n_realizations,
         "T_per_window":    T_WINDOW,
         "T_total":         T_s,
         "release_node":    {"idx": tailrace_idx, "ref": "19109",
@@ -851,10 +1084,9 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
         },
         "downstream_nodes":      downstream_idx,
         "t_release_step":        t_release,
-        "ramp_rate_m_per_step":  ramp_rate,
-        "plateau_rise_m":        plateau_rise,
-        "ramp_steps":            ramp_steps,
         "plateau_steps":         plateau_steps,
+        "realizations":          realizations_meta,
+        "window_realization_id": window_realization_id,
     }
     save_scenario("S3_InniscarraRelease", out_dir, X_syn, y_syn, m_syn, meta)
 
@@ -863,97 +1095,147 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
 # S4 — Saturation breakthrough: dry → saturated mid-event
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
-                                  n_windows: int = 30) -> None:
+def sample_s4_realization_params(rng: np.random.Generator) -> dict:
     """
-    Catchment begins moderately dry (sat_ratio 0.55–0.68) then receives
-    heavy rainfall that rapidly pushes soil to saturation, triggering an
-    abrupt switch from infiltration-excess to saturation-excess runoff.
+    Physically-plausible parameter draw for one S4 realization.
+
+    excess_threshold is grounded directly in the peer-reviewed literature
+    already cited for this scenario (see the literature-backing pass
+    earlier in this project): Meissl et al. (2023, Heliyon) report a
+    critical saturation deficit of ~0.28 (72% of pore volume filled) in
+    an Alpine catchment before exceptionally high runoff coefficients
+    occur; Western & Grayson (1998) and Penna et al. (2011, HESS)
+    independently document threshold-like runoff generation in the same
+    general range. Sampled here as uniform(0.68, 0.80), centered on that
+    ~0.72 reported value with a modest spread rather than treating it as
+    a single precise constant.
+
+    rain_peak_mm, sat_start, and sat_rate do NOT have the same direct
+    literature anchor -- they are documented, physically reasonable
+    ranges (heavy-but-plausible frontal/convective rainfall; dry-to-
+    moderate antecedent saturation matching this scenario's own window-
+    selection criteria; a soil-wetting rate consistent with the range of
+    sat_rate values already validated in single-realization testing
+    earlier this session) rather than values independently confirmed
+    against a specific cited source. Flagged explicitly here so the
+    methods section doesn't overstate which numbers are literature-
+    grounded and which are reasoned defaults.
+    """
+    excess_threshold = float(rng.uniform(0.68, 0.80))
+    sat_start         = float(rng.uniform(0.50, 0.65))
+    sat_rate          = float(rng.uniform(0.010, 0.020))
+    rain_peak_mm      = float(rng.uniform(12.0, 28.0))
+
+    steps_to_threshold = math.ceil((excess_threshold - sat_start) / sat_rate)
+    sat_breakthrough_step = T_IN + steps_to_threshold
+
+    return {
+        "excess_threshold":      excess_threshold,
+        "sat_start":             sat_start,
+        "sat_rate":              sat_rate,
+        "rain_peak_mm":          rain_peak_mm,
+        "sat_breakthrough_step": sat_breakthrough_step,
+    }
+
+
+def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
+                                  n_realizations: int = 20,
+                                  n_windows_per_realization: int = 2,
+                                  seed: int = 0) -> None:
+    """
+    Catchment begins moderately dry then receives heavy rainfall that
+    rapidly pushes soil to saturation, triggering an abrupt switch from
+    infiltration-excess to saturation-excess runoff.
 
     Tests whether STGNNSoilGate detects the approaching breakthrough via
     rising swvl2_sat_ratio before stage rises at gauges.
+
+    MULTI-REALIZATION DESIGN: previously used one fixed set of injection
+    parameters (rain_peak_mm=20.0, sat_start=0.55, sat_rate=0.015,
+    excess_threshold=0.75) replayed across many different REAL historical
+    base windows -- meaning every "window" varied only in antecedent
+    real conditions, never in the synthetic event's own characteristics.
+    A reviewer correctly noted this leaves conclusions vulnerable to the
+    argument that results depend on the specific (arbitrarily chosen)
+    perturbation parameters rather than the underlying mechanism being
+    tested. Now draws n_realizations independent parameter sets from
+    sample_s4_realization_params(), each applied to
+    n_windows_per_realization real historical baselines -- producing
+    genuine event-to-event diversity, not just baseline-condition
+    diversity, while keeping total data volume comparable to the
+    original single-realization n_windows=30 (default here:
+    20 x 2 = 40 windows).
     """
-    print("\nS4: SatBreakthrough")
+    print("\nS4: SatBreakthrough (multi-realization)")
     out_dir = SCEN_DIR / "S4_SatBreakthrough"
+    rng = np.random.default_rng(seed)
 
     T = X.shape[0]; N = X.shape[1]
-    test_start = int(T * 0.85)
 
-    # Select windows starting in dry-to-moderate conditions (summer/early autumn)
-    # S4 needs dry-to-moderate initial conditions (summer/early autumn).
-    # Search from 50% to capture both training summers (2023, 2024)
-    # where swvl2_sat_ratio drops to 0.50-0.68 during dry spells.
-    window_starts = select_base_windows(
+    window_starts_pool = select_base_windows(
         X, y, bankfull, sat_min=0.45, sat_max=0.70,
-        max_stage_frac=0.20, n_windows=n_windows,
+        max_stage_frac=0.20, n_windows=n_realizations * n_windows_per_realization,
         search_from_frac=0.50)
-
-    if not window_starts:
-        # Wider fallback if dry conditions are scarce in this period
-        window_starts = select_base_windows(
-            X, y, bankfull, sat_min=0.45, sat_max=0.80, n_windows=n_windows,
+    if not window_starts_pool:
+        window_starts_pool = select_base_windows(
+            X, y, bankfull, sat_min=0.45, sat_max=0.80,
+            n_windows=n_realizations * n_windows_per_realization,
             search_from_frac=0.40)
+    if not window_starts_pool:
+        print("  [skip] S4: no base windows found meeting antecedent-condition criteria")
+        return
 
-    T_s   = T_WINDOW * len(window_starts)
+    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
+                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
+
+    all_windows: list[tuple[int, int, dict]] = []   # (t0, realization_id, params)
+    realization_params_list: list[dict] = []
+    pool_idx = 0
+    for r in range(n_realizations):
+        params = sample_s4_realization_params(rng)
+        n_avail = len(window_starts_pool) - pool_idx
+        n_take = min(n_windows_per_realization, n_avail)
+        if n_take <= 0:
+            break
+        realization_params_list.append(params)
+        for _ in range(n_take):
+            all_windows.append((window_starts_pool[pool_idx], r, params))
+            pool_idx += 1
+
+    if not all_windows:
+        print("  [skip] S4: no windows available after realization allocation")
+        return
+
+    n_total = len(all_windows)
+    T_s   = T_WINDOW * n_total
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    rain_peak_mm = 20.0                 # heavy but realistic frontal rainfall
+    realization_id_per_window: list[int] = []
 
-    # Per-node stage_range for F_NORM sync. Needed here specifically
-    # because this scenario's own docstring frames it as a reactive-vs-
-    # anticipatory comparison ("tests whether STGNNSoilGate detects the
-    # approaching breakthrough... before stage rises"), which implicitly
-    # requires STGNNHANDEdge's REACTIVE gate to be able to eventually
-    # fire once stage does rise, for that comparison to be meaningful.
-    # STGNNSoilGate's own gate already correctly reads F_SW2_SAT (set
-    # directly below) and needs no fix; this is specifically about
-    # giving HANDEdge's H = datum + normalised_stage*stage_range gate a
-    # fair chance to react at all.
-    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
-                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
-
-    # Saturation ramp parameters — kept as named constants (not inlined
-    # below) because sat_breakthrough_step is DERIVED from them. Previously
-    # sat_breakthrough_step was hardcoded to T_IN+8 independently of these,
-    # under the assumption that reached "2hr into the forecast" — but with
-    # sat_start=0.55, sat_rate=0.015/step, the ramp doesn't actually cross
-    # excess_threshold=0.75 until T_IN+14 (0.75-0.55=0.20; 0.20/0.015=13.3,
-    # rounds up to 14 steps). At the old T_IN+8, saturation was only 0.67 —
-    # excess_factor = max(0, 0.67-0.75)*4 = 0 EVERY window, EVERY node, so
-    # the "abrupt post-breakthrough acceleration" this scenario exists to
-    # test never actually fired. y_syn was silently just the calm baseline
-    # plus a tiny 8-step ramp, which is also why NSE was catastrophic for
-    # every model uniformly (implied target std ≈ 0.11m regardless of
-    # architecture — an artifact of the near-flat target, not model
-    # quality). Deriving sat_breakthrough_step here instead of hardcoding
-    # it separately makes this class of drift impossible to reintroduce.
-    sat_start        = 0.55
-    sat_rate         = 0.015   # per-step saturation increase
-    sat_cap          = 0.40    # matches the np.clip below
-    excess_threshold = 0.75
-    steps_to_threshold = math.ceil((excess_threshold - sat_start) / sat_rate)
-    sat_breakthrough_step = T_IN + steps_to_threshold   # = T_IN + 14
-
-    for i, t0 in enumerate(window_starts):
+    for i, (t0, real_id, params) in enumerate(all_windows):
         sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
         X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
         y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
         m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
 
-        # Heavy rainfall beginning T_IN steps in (throughout forecast window)
+        rain_peak_mm     = params["rain_peak_mm"]
+        sat_start        = params["sat_start"]
+        sat_rate         = params["sat_rate"]
+        excess_threshold = params["excess_threshold"]
+        sat_breakthrough_step = params["sat_breakthrough_step"]
+        sat_cap = 0.40   # matches the np.clip below; not varied per realization
+
+        realization_id_per_window.append(real_id)
+
         X_w[T_IN:, :, F_RAIN] += rain_peak_mm * np.exp(
             -np.arange(T_WINDOW - T_IN)[:, None] * 0.05)
 
-        # Set soil moisture synthetically — do not rely on X.npy sat values
-        # which may be 0.0. S4 starts dry (0.55) and ramps to saturated.
-        # Set baseline sat for entire input window (pre-event dry state)
         X_w[:T_IN, :, F_SW2_SAT] = sat_start
         X_w[:T_IN, :, F_SW1_SAT] = 0.50
         X_w[:T_IN, :, F_SW2_RAW] = sat_start * 0.472
         X_w[:T_IN, :, F_SW1_RAW] = 0.50 * 0.472
-        # Progressive soil saturation build-up from rainfall
         for t in range(T_IN, T_WINDOW):
             steps_of_rain = t - T_IN
             sat_increase  = min(sat_cap, steps_of_rain * sat_rate)
@@ -962,38 +1244,38 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
             X_w[t, :, F_SW2_RAW] = X_w[t, :, F_SW2_SAT] * 0.472
             X_w[t, :, F_SW1_RAW] = X_w[t, :, F_SW1_SAT] * 0.472
 
-        # Before breakthrough: slow, infiltration-limited stage response
         stage_range_arr = stage_range.reindex(range(N)).values.astype(np.float32)
         stage_range_safe = np.where(stage_range_arr > 0, stage_range_arr, np.inf)
-        for t in range(T_IN, sat_breakthrough_step):
+        sat_bt_clamped = min(sat_breakthrough_step, T_WINDOW)
+        for t in range(T_IN, sat_bt_clamped):
             slow_rise = 0.01 * (t - T_IN)
             y_w[t, :] += slow_rise
             X_w[t, :, F_STAGE] += slow_rise
             X_w[t, :, F_NORM] += slow_rise / stage_range_safe
 
-        # After breakthrough: abrupt acceleration in stage rise
-        for n_idx in range(N):
-            ref = str(int(nd.iloc[n_idx]["ref"]))
-            if ref not in uh: continue
-            p   = uh[ref]
-            sat_at_breakthrough = float(
-                X_w[sat_breakthrough_step, n_idx, F_SW2_SAT])
-            excess_factor = max(0.0, sat_at_breakthrough - excess_threshold) * 4.0
-            if excess_factor <= 0: continue
-            uh_arr = triangular_uh(
-                p["peak_rate_m_per_mm"] * 2.0,  # 2× amplification post-breakthrough
-                p["tc_hr"],
-                T_WINDOW - sat_breakthrough_step)
-            delta = uh_arr * rain_peak_mm * 6 * excess_factor
-            t_end = sat_breakthrough_step + len(delta)
-            t_end = min(t_end, T_WINDOW)
-            y_w[sat_breakthrough_step:t_end, n_idx] += delta[:t_end-sat_breakthrough_step]
-            X_w[sat_breakthrough_step:t_end, n_idx, F_STAGE] += \
-                delta[:t_end-sat_breakthrough_step]
-            sr = float(stage_range.loc[n_idx])
-            if sr > 0:
-                X_w[sat_breakthrough_step:t_end, n_idx, F_NORM] += \
-                    delta[:t_end-sat_breakthrough_step] / sr
+        if sat_bt_clamped < T_WINDOW:
+            for n_idx in range(N):
+                ref = str(int(nd.iloc[n_idx]["ref"]))
+                if ref not in uh: continue
+                p   = uh[ref]
+                sat_at_breakthrough = float(
+                    X_w[sat_bt_clamped, n_idx, F_SW2_SAT])
+                excess_factor = max(0.0, sat_at_breakthrough - excess_threshold) * 4.0
+                if excess_factor <= 0: continue
+                uh_arr = triangular_uh(
+                    p["peak_rate_m_per_mm"] * 2.0,
+                    p["tc_hr"],
+                    T_WINDOW - sat_bt_clamped)
+                delta = uh_arr * rain_peak_mm * 6 * excess_factor
+                t_end = sat_bt_clamped + len(delta)
+                t_end = min(t_end, T_WINDOW)
+                y_w[sat_bt_clamped:t_end, n_idx] += delta[:t_end-sat_bt_clamped]
+                X_w[sat_bt_clamped:t_end, n_idx, F_STAGE] += \
+                    delta[:t_end-sat_bt_clamped]
+                sr = float(stage_range.loc[n_idx])
+                if sr > 0:
+                    X_w[sat_bt_clamped:t_end, n_idx, F_NORM] += \
+                        delta[:t_end-sat_bt_clamped] / sr
 
         X_syn[sl] = X_w
         y_syn[sl] = y_w
@@ -1006,15 +1288,23 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
         "description": (
             "Moderate-saturation catchment receives heavy rainfall, "
             "crossing the saturation threshold mid-forecast. Abrupt "
-            "stage acceleration tests anticipatory soil gate (Idea 1)."),
-        "n_windows":              len(window_starts),
-        "T_total":                T_s,
-        "sat_breakthrough_step":  sat_breakthrough_step,
-        "rain_peak_mm":           rain_peak_mm,
-        "initial_sat_range":      [0.50, 0.68],
-        "sat_start":              sat_start,
-        "sat_rate_per_step":      sat_rate,
-        "excess_threshold":       excess_threshold,
+            "stage acceleration tests anticipatory soil gate. Multi-"
+            "realization: excess_threshold ~ U(0.68,0.80) grounded in "
+            "Meissl et al. (2023)/Western & Grayson (1998)/Penna et al. "
+            "(2011); rain_peak_mm, sat_start, sat_rate use documented "
+            "illustrative ranges (see sample_s4_realization_params). "
+            "Unlike S1/S3/S5/S6, timing (sat_breakthrough_step) VARIES "
+            "per realization along with magnitude -- deliberately, since "
+            "a fixed, memorisable breakthrough timing would understate "
+            "the anticipatory-vs-reactive gate comparison this scenario "
+            "exists to test."),
+        "n_windows":                 n_total,
+        "n_windows_per_realization": n_windows_per_realization,
+        "n_realizations":            n_realizations,
+        "T_per_window":              T_WINDOW,
+        "T_total":                   T_s,
+        "realizations":              [dict(id=i, **p) for i, p in enumerate(realization_params_list)],
+        "window_realization_id":     realization_id_per_window,
     }
     save_scenario("S4_SatBreakthrough", out_dir, X_syn, y_syn, m_syn, meta)
 
@@ -1024,7 +1314,9 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
-                                  n_windows: int = 40) -> None:
+                                  n_windows: int = 40,
+                                  n_realizations: int = 20,
+                                  seed: int = 0) -> None:
     """
     A frontal system oriented SW–NE delivers heavy rainfall to western headwaters
     but light rainfall to eastern Cork city gauges. The flood signal must propagate
@@ -1032,9 +1324,19 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
 
     Tests whether graph routing correctly anticipates the arriving flood at
     Cork city before it appears in the local rainfall record.
+
+    n_realizations: independent draws of gradient_max from
+    sample_s5_params() -- Zhu, Wright & Yu (2018, WRR) support a range
+    of spatial rainfall heterogeneity intensities, not one fixed 2.5x
+    ratio. Topology (source_idx/downstream_idx/source_chains) is
+    computed ONCE using a fixed reference gradient rather than
+    recomputed per realization: the river network's structural
+    reachability is a graph property that doesn't depend on rainfall
+    intensity, only the injected magnitude should vary.
     """
-    print("\nS5: SpatialGradient")
+    print("\nS5: SpatialGradient (multi-realization)")
     out_dir = SCEN_DIR / "S5_SpatialGradient"
+    rng = np.random.default_rng(seed)
 
     T = X.shape[0]; N = X.shape[1]
 
@@ -1043,34 +1345,22 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
         search_from_frac=0.70)
 
     if not window_starts:
-        # Same defensive guard as S1/S3 — without this, an empty result
-        # here would silently produce a zero-length scenario exactly like
-        # the S3 bug (T_s = T_WINDOW * len(window_starts) = 0), just with
-        # no warning until scenario_evaluator.py reports "got 0 steps".
         print("  [skip] No valid base windows found for S5")
         return
 
-    # Compute west-to-east gradient weight per node using easting_itm
     easting = nd["easting_itm"].values.astype(np.float64)
     e_min, e_max = easting.min(), easting.max()
-    # Western (low easting) nodes get multiplier >1; eastern get <1
-    gradient = 1.0 + 1.5 * (1.0 - (easting - e_min) / (e_max - e_min + 1))
-    # gradient: western nodes ≈ 2.5×, eastern nodes ≈ 1.0×
-    gradient = gradient.astype(np.float32)
+    spatial_weight = 1.0 - (easting - e_min) / (e_max - e_min + 1)   # [0,1] per node, fixed
 
-    # BUG FIX (same class as S1): downstream_idx was selected by catchment
-    # size alone via identify_downstream_nodes(), independent of whether
-    # those nodes are actually reachable from the western/high-gradient
-    # source nodes this scenario injects at, and the routing loop below
-    # only propagated one hop. Unlike S1, this scenario's source set
-    # (any node with gradient>=1.3, not just 6 tiny headwaters) is broad
-    # enough that SOME downstream signal often got through by chance —
-    # but that's luck, not a guarantee, and multiple overlapping direct
-    # injections from many qualifying source nodes could also be
-    # inflating the apparent magnitude beyond what genuine multi-hop
-    # attenuation would produce. Fixed the same way as S1: BFS
-    # reachability from the actual source set, multi-hop propagation.
-    source_idx = [n for n in range(N) if gradient[n] >= 1.3]
+    def _gradient_for(gradient_max: float) -> np.ndarray:
+        g = 1.0 + (gradient_max - 1.0) * spatial_weight
+        return g.astype(np.float32)
+
+    # Reference topology at gradient_max=2.5 (the original single-realization
+    # value, near the middle of S5_GRADIENT_MAX_RANGE) -- fixed for all
+    # realizations, see docstring above.
+    ref_gradient = _gradient_for(2.5)
+    source_idx = [n for n in range(N) if ref_gradient[n] >= 1.3]
     source_chains: dict[int, list[tuple[int, int]]] = {}
     reachable = set()
     for src in source_idx:
@@ -1091,74 +1381,88 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
         print(f"  [warn] Only {len(downstream_idx)} downstream nodes reachable "
               f"from source_idx (wanted 5): {downstream_idx}")
 
-    # Per-node stage_range for F_NORM sync -- same rationale as S1/S4/S6:
-    # elevation-reconstructing gates (HAND/SoilGate/BackwaterEdge) read
-    # F_NORM, not F_STAGE.
     stage_range = (nd.set_index("node_idx")["p90_mAOD"]
                    - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
 
-    T_s   = T_WINDOW * len(window_starts)
+    T_s   = T_WINDOW * len(window_starts) * n_realizations
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    for i, t0 in enumerate(window_starts):
-        sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
-        X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+    realizations_meta = []
+    window_realization_id = []
+    row = 0
 
-        # Apply spatial gradient to rainfall features in the forecast window
-        X_w[T_IN:, :, F_RAIN] *= gradient[None, :]
+    for real_id in range(n_realizations):
+        params = sample_s5_params(rng)
+        gradient_max = params["gradient_max"]
+        gradient = _gradient_for(gradient_max)
+        realizations_meta.append({
+            "id": real_id, **params,
+            "gradient_range": [float(gradient.min()), float(gradient.max())],
+        })
 
-        # Compute synthetic stage response per node using scaled rainfall
-        for n_idx in range(N):
-            ref = str(int(nd.iloc[n_idx]["ref"]))
-            if ref not in uh: continue
-            p    = uh[ref]
-            g    = float(gradient[n_idx])
-            if g <= 1.05: continue    # eastern nodes — no significant perturbation
-            rain_excess = float(np.sum(X_w[T_IN:T_IN+16, n_idx, F_RAIN]))
-            sat = float(np.mean(X_w[:T_IN, n_idx, F_SW2_SAT]))
-            excess = rain_excess * sat
-            if excess < 5.0: continue
-            uh_arr = triangular_uh(p["peak_rate_m_per_mm"], p["tc_hr"],
-                                   T_WINDOW - T_IN)
-            t_off = T_IN + round(p["tp_hr"] / STEP_MIN * 60)
-            t_off = min(t_off, T_WINDOW - 1)
-            uh_len = min(len(uh_arr), T_WINDOW - t_off)
-            y_w[t_off : t_off + uh_len, n_idx] += uh_arr[:uh_len] * excess
-            X_w[t_off : t_off + uh_len, n_idx, F_STAGE] += uh_arr[:uh_len] * excess
+        for t0 in window_starts:
+            sl  = slice(row * T_WINDOW, (row+1) * T_WINDOW)
+            window_realization_id.append(real_id)
 
-        # Route western/high-gradient signal downstream through the
-        # river network, multiple hops out from each qualifying source
-        # node -- a single-pass edge loop (the previous implementation)
-        # only reaches nodes one edge away from a source.
-        for src in source_idx:
-            if y_w[:, src].max() <= y_w[:T_IN, src].max():
-                continue   # no signal to route from this source
-            base = float(np.mean(y_w[:T_IN, src]))
-            propagate_downstream_chain(
-                y_w, X_w, src, source_chains[src], lags,
-                baseline=base, stage_range=stage_range)
+            X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
 
-        X_syn[sl] = X_w
-        y_syn[sl] = y_w
-        m_syn[sl] = m_w
+            X_w[T_IN:, :, F_RAIN] *= gradient[None, :]
+
+            for n_idx in range(N):
+                ref = str(int(nd.iloc[n_idx]["ref"]))
+                if ref not in uh: continue
+                p    = uh[ref]
+                g    = float(gradient[n_idx])
+                if g <= 1.05: continue    # eastern nodes — no significant perturbation
+                rain_excess = float(np.sum(X_w[T_IN:T_IN+16, n_idx, F_RAIN]))
+                sat = float(np.mean(X_w[:T_IN, n_idx, F_SW2_SAT]))
+                excess = rain_excess * sat
+                if excess < 5.0: continue
+                uh_arr = triangular_uh(p["peak_rate_m_per_mm"], p["tc_hr"],
+                                       T_WINDOW - T_IN)
+                t_off = T_IN + round(p["tp_hr"] / STEP_MIN * 60)
+                t_off = min(t_off, T_WINDOW - 1)
+                uh_len = min(len(uh_arr), T_WINDOW - t_off)
+                y_w[t_off : t_off + uh_len, n_idx] += uh_arr[:uh_len] * excess
+                X_w[t_off : t_off + uh_len, n_idx, F_STAGE] += uh_arr[:uh_len] * excess
+
+            for src in source_idx:
+                if y_w[:, src].max() <= y_w[:T_IN, src].max():
+                    continue   # no signal to route from this source
+                base = float(np.mean(y_w[:T_IN, src]))
+                propagate_downstream_chain(
+                    y_w, X_w, src, source_chains[src], lags,
+                    baseline=base, stage_range=stage_range)
+
+            X_syn[sl] = X_w
+            y_syn[sl] = y_w
+            m_syn[sl] = m_w
+            row += 1
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S5")
 
     meta = {
         "name": "S5_SpatialGradient",
         "description": (
-            "SW-NE frontal band delivers 2.5× more rainfall to western "
+            "SW-NE frontal band delivers heavier rainfall to western "
             "headwaters than eastern Cork city gauges. Tests whether "
-            "graph models correctly route the gradient."),
-        "n_windows":    len(window_starts),
+            "graph models correctly route the gradient. Multi-"
+            "realization: gradient_max ~ U(1.8,3.0), Zhu, Wright & Yu "
+            "(2018, WRR); source/downstream topology fixed at "
+            "gradient_max=2.5 reference (structural, not intensity-"
+            "dependent)."),
+        "n_windows":    row,
+        "n_windows_per_realization": len(window_starts),
+        "n_realizations": n_realizations,
         "T_per_window": T_WINDOW,
         "T_total":      T_s,
-        "gradient_range": [float(gradient.min()), float(gradient.max())],
         "downstream_nodes": downstream_idx,
+        "realizations":          realizations_meta,
+        "window_realization_id": window_realization_id,
     }
     save_scenario("S5_SpatialGradient", out_dir, X_syn, y_syn, m_syn, meta)
 
@@ -1169,7 +1473,9 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
-                                  n_windows: int = 30) -> None:
+                                  n_windows: int = 30,
+                                  n_realizations: int = 20,
+                                  seed: int = 0) -> None:
     """
     Debris/ice blockage at a real bridge or culvert location decouples
     upstream and downstream stage: backwater raises stage AT and
@@ -1215,17 +1521,23 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
     the point. A model architecture that does NOT show this failure
     would itself be the interesting/suspicious result, worth
     investigating for how it's getting the signal.
+
+    n_realizations: independent draws of blockage severity (and its
+    two DERIVED caps, backwater_cap_m/suppression_cap_m) from
+    sample_s6_params(). Severity is anchored at McDermott & Quinn
+    (2023)'s ~50% documented flow-capacity reduction; caps are derived
+    from one shared severity value rather than sampled independently,
+    since a real blockage's upstream rise and downstream suppression
+    share the same physical cause. rise_rate/suppression_rate (the
+    SPEED of approach to those caps, distinct from final magnitude)
+    stay fixed across realizations, as does t_block.
     """
-    print("\nS6: ChannelBlockage (architectural-limitation diagnostic)")
+    print("\nS6: ChannelBlockage (multi-realization architectural-limitation diagnostic)")
     out_dir = SCEN_DIR / "S6_ChannelBlockage"
+    rng = np.random.default_rng(seed)
 
     T = X.shape[0]; N = X.shape[1]
 
-    # Select moderate-flow windows (not already flooded) so the injected
-    # backwater signal is clearly attributable. Same retry structure used
-    # everywhere else in this module — a tight joint saturation +
-    # calm-baseline constraint can return zero windows in the
-    # validation-period search region.
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.60, sat_max=0.92,
         max_stage_frac=0.30, n_windows=n_windows,
@@ -1244,41 +1556,22 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
               "loosening max_stage_frac.")
         return
 
-    # Pick the blockage location from an ACTUAL bridge-named node — a
-    # real, nameable constriction point rather than an arbitrary graph
-    # position. Uses a name-substring heuristic against nodes.csv, since
-    # there's no explicit "is_bridge" flag in the current node schema
-    # (only is_reservoir/is_tidal). Falls back to the old area-percentile
-    # heuristic if no bridge-named node with a usable upstream edge exists.
     bridge_mask = nd["name"].str.contains(
         "Bridge|Br$|Br ", case=False, regex=True, na=False)
     bridge_candidates = nd.loc[bridge_mask, "node_idx"].tolist()
 
-    block_dst = None   # the bridge/constriction node itself
-    block_src = None   # its immediate upstream neighbour (backwater rises here too)
-    block_next = None  # its immediate downstream neighbour (suppression applies here)
+    block_dst = None
+    block_src = None
+    block_next = None
 
     for cand_dst in bridge_candidates:
         upstream_edges = ed[ed["dst_idx"] == cand_dst]
-        # Exclude any "downstream" edge that loops straight back to the
-        # chosen upstream node. Two of this graph's 28 edges form genuine
-        # bidirectional pairs (0<->1, 2<->3 — confirmed against
-        # routing_lags.json, which has independently different, non-
-        # symmetric lags for each direction, e.g. 2_3=7 vs 3_2=2,
-        # suggesting an intentionally-represented braided/distributary
-        # reach rather than a duplicate data-entry error). Without this
-        # exclusion, a candidate bridge sitting on one of those pairs
-        # (e.g. Glennamought Bridge, node 3) would have its "downstream"
-        # edge selected as the very node the backwater is already being
-        # applied to as the upstream neighbour — collapsing block_src,
-        # block_dst, block_next into effectively two nodes instead of
-        # three and corrupting the suppression-side metric.
         downstream_edges = ed[ed["src_idx"] == cand_dst]
         if not upstream_edges.empty:
             candidate_src = int(upstream_edges.iloc[0]["src_idx"])
             downstream_edges = downstream_edges[downstream_edges["dst_idx"] != candidate_src]
         if upstream_edges.empty or downstream_edges.empty:
-            continue   # need both an upstream and a genuinely distinct downstream neighbour
+            continue
         block_dst  = int(cand_dst)
         block_src  = int(upstream_edges.iloc[0]["src_idx"])
         block_next = int(downstream_edges.iloc[0]["dst_idx"])
@@ -1293,80 +1586,56 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
     bridge_name = nd.loc[nd.node_idx == block_dst, "name"].values[0]
     print(f"  Blockage location: {bridge_name} (node {block_dst})")
 
-    T_s   = T_WINDOW * len(window_starts)
+    t_block           = T_IN + 4    # blockage occurs 1 hr into the forecast, fixed
+    rise_rate         = 0.05        # m per timestep, fixed (speed, not magnitude)
+    suppression_rate  = 0.02        # m per timestep, fixed (speed, not magnitude)
+
+    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
+                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
+
+    T_s   = T_WINDOW * len(window_starts) * n_realizations
     X_syn = np.zeros((T_s, N, X.shape[2]), dtype=np.float32)
     y_syn = np.zeros((T_s, N),             dtype=np.float32)
     m_syn = np.zeros((T_s, N),             dtype=np.float32)
 
-    t_block          = T_IN + 4     # blockage occurs 1 hr into the forecast
-    rise_rate        = 0.05         # m per timestep backwater build-up
-    backwater_cap    = 1.5          # m, cap on backwater rise
-    suppression_rate = 0.02         # m per timestep downstream flow reduction
-    suppression_cap  = 0.3          # m, cap on downstream reduction
+    realizations_meta = []
+    window_realization_id = []
+    row = 0
 
-    # Per-node stage_range for converting the backwater rise (in metres)
-    # into an equivalent normalised_stage delta. Every elevation-
-    # reconstructing gate in this project (STGNNHANDEdge, STGNNSoilGate,
-    # STGNNBackwaterEdge) computes H = gauge_datum + normalised_stage *
-    # stage_range from F_NORM specifically — NOT from F_STAGE
-    # (stage_anomaly). Only writing F_STAGE, as the original version of
-    # this function did, leaves the injected backwater event completely
-    # invisible to any gate mechanism (the GRU/embedding pathway would
-    # still see it, since all 11 features feed into input_proj — but the
-    # gate itself, the exact thing STGNNBackwaterEdge exists to test,
-    # would never open). Same recurring bug class as the earlier HAND
-    # gate fix (stage_anomaly vs. absolute-elevation frame mismatch) —
-    # see this project's own prior notes on that pattern.
-    stage_range = (nd.set_index("node_idx")["p90_mAOD"]
-                   - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
+    for real_id in range(n_realizations):
+        params = sample_s6_params(rng)
+        backwater_cap   = params["backwater_cap_m"]
+        suppression_cap = params["suppression_cap_m"]
+        realizations_meta.append({"id": real_id, **params})
 
-    for i, t0 in enumerate(window_starts):
-        sl  = slice(i * T_WINDOW, (i+1) * T_WINDOW)
-        X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
-        m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+        for t0 in window_starts:
+            sl  = slice(row * T_WINDOW, (row+1) * T_WINDOW)
+            window_realization_id.append(real_id)
 
-        # Backwater rise AT the bridge and its immediate upstream
-        # neighbour — a simplified two-node stand-in for the true M1
-        # backwater profile (which in reality extends further upstream
-        # proportional to channel slope and blockage severity; modelling
-        # the full profile length is out of scope here, since two nodes
-        # is already sufficient to demonstrate the architectural blind
-        # spot this scenario exists to show).
-        for affected in (block_dst, block_src):
-            base = float(np.mean(y_w[:T_IN, affected]))
-            sr = float(stage_range.loc[affected])
-            base_norm = float(np.mean(X_w[:T_IN, affected, F_NORM])) if sr > 0 else 0.0
+            X_w = np.array(X[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            y_w = np.array(y[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+            m_w = np.array(mask[t0 : t0 + T_WINDOW]).copy().astype(np.float32)
+
+            for affected in (block_dst, block_src):
+                base = float(np.mean(y_w[:T_IN, affected]))
+                sr = float(stage_range.loc[affected])
+                base_norm = float(np.mean(X_w[:T_IN, affected, F_NORM])) if sr > 0 else 0.0
+                for t in range(t_block, T_WINDOW):
+                    backwater = min(rise_rate * (t - t_block), backwater_cap)
+                    y_w[t, affected] = base + backwater
+                    X_w[t, affected, F_STAGE] = base + backwater
+                    if sr > 0:
+                        X_w[t, affected, F_NORM] = base_norm + backwater / sr
+
             for t in range(t_block, T_WINDOW):
-                backwater = min(rise_rate * (t - t_block), backwater_cap)
-                y_w[t, affected] = base + backwater
-                X_w[t, affected, F_STAGE] = base + backwater
-                if sr > 0:
-                    X_w[t, affected, F_NORM] = base_norm + backwater / sr
+                reduction = min(suppression_rate * (t - t_block), suppression_cap)
+                y_w[t, block_next] -= reduction
+                X_w[t, block_next, F_STAGE] -= reduction
 
-        # Suppressed flow immediately downstream of the blockage.
-        # BUG FIX: was `y_w[t, block_next] *= suppression` (0.6) --
-        # a straight multiplicative scaling of stage_anomaly, which can
-        # be positive OR negative relative to its own rolling baseline.
-        # Confirmed against real generated output: when the pre-blockage
-        # baseline at this node was negative, multiplying by 0.6 made it
-        # LESS negative (closer to zero) -- visually a RISE at the
-        # blockage marker, the opposite of "suppression". Fixed to an
-        # absolute, always-downward, capped reduction -- same additive-
-        # and-capped style as the upstream backwater rise above, and
-        # unambiguous in direction regardless of the current anomaly
-        # sign. Not synced to F_NORM: s6_downstream_suppression_rmse is
-        # designed to be learnable from the node's own ordinary feature
-        # history (rainfall, its own recent trend) without needing any
-        # gate to fire — see s6_metrics' docstring in scenario_evaluator.py.
-        for t in range(t_block, T_WINDOW):
-            reduction = min(suppression_rate * (t - t_block), suppression_cap)
-            y_w[t, block_next] -= reduction
-            X_w[t, block_next, F_STAGE] -= reduction
-
-        X_syn[sl] = X_w
-        y_syn[sl] = y_w
-        m_syn[sl] = m_w
+            X_syn[sl] = X_w
+            y_syn[sl] = y_w
+            m_syn[sl] = m_w
+            row += 1
 
     physical_consistency_check(X_syn, y_syn, nd, bankfull, "S6")
 
@@ -1379,8 +1648,14 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
             "limitation: no model in this suite has a message-passing "
             "pathway for downstream-to-upstream backwater causality, so "
             "large upstream under-prediction is the EXPECTED result for "
-            "every model, not a failure to be optimised away."),
-        "n_windows":      len(window_starts),
+            "every model, not a failure to be optimised away. Multi-"
+            "realization: severity ~ U(0.30,0.75), anchored at McDermott "
+            "& Quinn (2023)'s ~50% documented flow-capacity reduction; "
+            "backwater_cap_m/suppression_cap_m derived from one shared "
+            "severity value, not sampled independently."),
+        "n_windows":      row,
+        "n_windows_per_realization": len(window_starts),
+        "n_realizations": n_realizations,
         "T_per_window":   T_WINDOW,
         "T_total":        T_s,
         "blockage_node":  {"idx": block_dst,  "name": bridge_name},
@@ -1388,9 +1663,9 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
         "downstream_node":{"idx": block_next, "name": nd.loc[nd.node_idx==block_next, "name"].values[0]},
         "t_blockage_step": t_block,
         "backwater_rate_m_per_step": rise_rate,
-        "backwater_cap_m": backwater_cap,
         "suppression_rate_m_per_step": suppression_rate,
-        "suppression_cap_m": suppression_cap,
+        "realizations":          realizations_meta,
+        "window_realization_id": window_realization_id,
     }
     save_scenario("S6_ChannelBlockage", out_dir, X_syn, y_syn, m_syn, meta)
 

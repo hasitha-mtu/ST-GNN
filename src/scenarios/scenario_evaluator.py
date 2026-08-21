@@ -291,40 +291,32 @@ def s2_metrics(pred: np.ndarray, y_syn: np.ndarray,
                T_in: int, T_out: int) -> dict:
     """
     GaugeFailure: RMSE after failure onset, both pooled across all nodes
-    and restricted specifically to the failed nodes themselves.
+    and restricted specifically to the actively-failed nodes.
 
-    FIXED (time alignment): previously sliced pred[t_fail:] as a single
-    global cutoff, which only excludes the first ~36 rows of the ENTIRE
-    concatenated array (spanning 40 flood-windows x 3 failure_levels =
-    120 segments) rather than isolating genuinely post-failure rows
-    WITHIN each of the 120 segments — diluting true post-failure steps
-    with pre-failure calm steps from every other segment. This version
-    isolates post-failure rows per-window using the same local-step
-    recovery as s1/s3_metrics.
+    REBUILT for the sensor-network resilience redesign (reviewer point 1
+    + point 2 combined): fail_nodes are now genuinely random per
+    realization (uniform draw, or the highest-network-criticality nodes),
+    not reconstructible from a fixed formula the way the old
+    headwater_idx[:failure_levels[...]] block-index scheme was.
+    scenario_generator.py's generate_s2_gauge_failure now saves
+    fail_nodes and duration_steps explicitly per realization in
+    meta["realizations"], keyed by meta["window_realization_id"] — this
+    reads that directly instead of reconstructing anything.
 
-    FIXED (node scope): the docstring here previously claimed "RMSE at
-    downstream nodes", but the implementation never filtered by node at
-    all — it pooled ALL 27 nodes together, meaning the 1-5 nodes whose
-    sensor actually failed were diluted among the 22-26 completely
-    unaffected nodes in every single evaluation. Even total failure to
-    predict the corrupted nodes correctly would barely move a pooled
-    27-node RMSE. scenario_generator.py's generate_s2_gauge_failure
-    computes failed_node_sets during generation but never saves it to
-    meta — this version reconstructs which nodes were failed for any
-    given row from the deterministic block ordering
-    (row = flood_window_idx * len(failure_levels) + failure_level_idx,
-    fail_nodes = headwater_idx[:failure_levels[failure_level_idx]]),
-    using headwater_idx and failure_levels, both of which ARE saved.
+    Also accounts for failure DURATION: a node is only "actively failed"
+    between t_failure and t_failure+duration_steps, not for the rest of
+    the window unconditionally — the old version assumed permanent
+    failure to end-of-window, which is no longer true now that duration
+    varies per realization (S2_DURATION_RANGE_STEPS).
 
-    Both metrics are reported: s2_post_failure_rmse_all (the original,
-    pooled — kept for continuity with prior results) and
-    s2_post_failure_rmse_failed_nodes (new, the metric this scenario's
-    own docstring already claimed to be computing).
+    Both metrics are reported: s2_post_failure_rmse_all (pooled across
+    all 27 nodes, post-onset) and s2_post_failure_rmse_failed_nodes
+    (restricted to nodes actively failed at that specific row).
     """
     t_fail    = meta.get("t_failure_step", 36)
     T_window  = meta.get("T_per_window", 104)
-    headwater_idx = meta.get("headwater_nodes", [])
-    failure_levels = meta.get("failure_levels", [])
+    realizations = meta.get("realizations")
+    per_window_realization_id = meta.get("window_realization_id")
     n_rows    = pred.shape[0]
 
     nan_result = {
@@ -333,7 +325,7 @@ def s2_metrics(pred: np.ndarray, y_syn: np.ndarray,
         "s2_degradation_ratio": float("nan"),
         "s2_degradation_ratio_failed_nodes": float("nan"),
     }
-    if n_rows == 0 or not headwater_idx or not failure_levels:
+    if n_rows == 0 or not realizations or not per_window_realization_id:
         return nan_result
 
     local_step, window_idx = _window_local_step(n_rows, T_in, T_out, T_window)
@@ -342,22 +334,29 @@ def s2_metrics(pred: np.ndarray, y_syn: np.ndarray,
     if is_post.sum() < 5:
         return nan_result
 
-    # Pooled (original) metric, kept for continuity with prior results.
     p_post = pred[is_post]
     t_post = y_syn[is_post]
     m_post = np.ones_like(p_post, dtype=bool)
     rmse_all = _rmse(p_post, t_post, m_post)
 
-    # Node-restricted metric: build a per-row mask selecting only the
-    # nodes actually failed in that row's block.
-    n_levels = len(failure_levels)
+    # Node-restricted, duration-aware mask: True only for (row, node)
+    # pairs where that node is ACTIVELY failed at that row's local_step.
+    # np.ix_ with a boolean row mask selects exactly the True rows,
+    # crossed with the fail_nodes columns (verified directly before use:
+    # np.ix_(bool_array, int_list) does NOT need bool_array converted to
+    # indices first -- it handles this correctly on its own).
+    real_by_id = {r["id"]: r for r in realizations}
     node_mask = np.zeros_like(pred, dtype=bool)   # [n_rows, N]
     for w in np.unique(window_idx):
-        level_idx = int(w) % n_levels
-        n_fail = failure_levels[level_idx]
-        fail_nodes = headwater_idx[:n_fail]
+        rid = per_window_realization_id[int(w)]
+        r = real_by_id.get(rid)
+        if r is None:
+            continue
+        fail_nodes = r["fail_nodes"]
+        duration = r.get("duration_steps", T_window)
         rows_in_window = (window_idx == w)
-        node_mask[np.ix_(rows_in_window, fail_nodes)] = True
+        actively_failed = rows_in_window & (local_step >= t_fail) & (local_step < t_fail + duration)
+        node_mask[np.ix_(actively_failed, fail_nodes)] = True
 
     combined_mask = node_mask & is_post[:, None]
     if combined_mask.sum() < 5:
@@ -473,10 +472,15 @@ def s4_metrics(pred: np.ndarray, y_syn: np.ndarray,
     parameters, fixed from an earlier hardcoded T_IN+8 that didn't
     actually coincide with the ramp crossing its own excess_factor
     threshold), despite producing plausible-looking, non-zero numbers.
-    This version isolates pre/post-breakthrough rows WITHIN every window
-    using the same local-step recovery as s1/s2/s3_metrics.
+    FIXED (per-window breakthrough step): scenario_generator.py's S4 now
+    draws sat_breakthrough_step independently per realization (see
+    sample_s4_realization_params), rather than one value shared by every
+    window. Using meta["sat_breakthrough_step"] (a single old-format
+    scalar) here would silently misalign is_pre/is_post for every window
+    whose own breakthrough step differs from that one value. Falls back
+    to the single-scalar field for any single-realization scenario data
+    generated before this fix, so this function works against both.
     """
-    t_bt      = meta.get("sat_breakthrough_step", 46)
     T_window  = meta.get("T_per_window", 104)
     n_rows    = pred.shape[0]
 
@@ -485,9 +489,21 @@ def s4_metrics(pred: np.ndarray, y_syn: np.ndarray,
                 "s4_rmse_post_breakthrough": float("nan"),
                 "s4_post_pre_ratio":         float("nan")}
 
-    local_step, _ = _window_local_step(n_rows, T_in, T_out, T_window)
-    is_pre  = local_step <  t_bt
-    is_post = local_step >= t_bt
+    local_step, window_idx = _window_local_step(n_rows, T_in, T_out, T_window)
+
+    per_window_realization_id = meta.get("window_realization_id")
+    realizations = meta.get("realizations")
+    if per_window_realization_id is not None and realizations is not None:
+        bt_by_realization = {r["id"]: r["sat_breakthrough_step"] for r in realizations}
+        bt_lookup = np.array([bt_by_realization[rid] for rid in per_window_realization_id])
+        t_bt_per_row = bt_lookup[window_idx]   # per-ROW breakthrough step
+    else:
+        # Old single-realization scenario data: one scalar for every window.
+        t_bt_scalar = meta.get("sat_breakthrough_step", 46)
+        t_bt_per_row = np.full(n_rows, t_bt_scalar)
+
+    is_pre  = local_step <  t_bt_per_row
+    is_post = local_step >= t_bt_per_row
 
     if is_pre.sum() < 5 or is_post.sum() < 5:
         return {"s4_rmse_pre_breakthrough":  float("nan"),
