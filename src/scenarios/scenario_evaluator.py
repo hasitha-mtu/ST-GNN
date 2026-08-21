@@ -857,6 +857,7 @@ def main() -> None:
 
         for i, ckpt_dir in enumerate(all_ckpts):
             tag   = resolve_model_tag(ckpt_dir)
+            print(f'tag: {tag}')
             rel   = ckpt_dir.relative_to(CKPT_ROOT)
             label = str(rel)
 
@@ -870,6 +871,7 @@ def main() -> None:
 
             print(f"  [{i+1:3d}/{len(all_ckpts)}] {label} … ", end="", flush=True)
             try:
+                print('evaluating checkpoints...')
                 row = evaluate_checkpoint(ckpt_dir, scen_dir, device, bankfull)
             except Exception as e:
                 # Belt-and-braces: evaluate_checkpoint() already catches
