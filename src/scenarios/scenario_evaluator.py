@@ -146,17 +146,22 @@ def compute_scenario_extended_metrics(
     explicitly here and in the returned dict key name rather than
     silently presented as exact.
     """
-    print('compute_scenario_extended_metrics')
-    kge_results = _kge_per_node(pred, target, mask)
-    print(f'compute_scenario_extended_metrics|kge_results: {kge_results}')
+    # mask_synthetic.npy (and therefore mask_arr in evaluate_checkpoint)
+    # is saved as float32 (0.0/1.0), not bool -- scenario_generator.py's
+    # m_syn arrays are all built with dtype=np.float32 throughout. The
+    # existing _rmse/_nse functions in this file already account for
+    # this (mask.astype(bool) & ...); _kge_per_node/_peak_timing_error
+    # (imported from run_inference.py) do the same `&` internally but
+    # assume a bool input already, since run_inference.py's own mask
+    # arrays come from valid_mask.npy loaded with .astype(bool) at the
+    # call site. Cast once here, matching that same expectation, rather
+    # than requiring every caller to remember to cast before passing in.
+    mask = mask.astype(bool)
 
+    kge_results = _kge_per_node(pred, target, mask)
     kge_vals   = [r["kge"]   for r in kge_results if not np.isnan(r["kge"])]
     r_vals     = [r["r"]     for r in kge_results if not np.isnan(r["r"])]
     alpha_vals = [r["alpha"] for r in kge_results if not np.isnan(r["alpha"])]
-
-    print(f'compute_scenario_extended_metrics|kge_vals: {kge_vals}')
-    print(f'compute_scenario_extended_metrics|r_vals: {r_vals}')
-    print(f'compute_scenario_extended_metrics|alpha_vals: {alpha_vals}')
 
     result = {
         "kge_mean_syn":       round(float(np.mean(kge_vals)),   4) if kge_vals   else float("nan"),
