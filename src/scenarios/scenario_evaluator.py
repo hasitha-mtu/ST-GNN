@@ -54,6 +54,8 @@ from run_inference import (  # type: ignore
     load_graph,
     resolve_model_tag,
     CKPT_ROOT as _RI_CKPT_ROOT,
+    _kge_per_node,
+    _peak_timing_error,
 )
 
 STEP_MIN  = 15
@@ -104,6 +106,91 @@ def _pod_far(pred: np.ndarray, target: np.ndarray,
     pod = TP / max(TP + FN, 1)
     far = FP / max(TP + FP, 1)
     return pod, far
+
+
+def compute_scenario_extended_metrics(
+    pred: np.ndarray, target: np.ndarray, mask: np.ndarray,
+    bankfull: np.ndarray, meta: dict, T_in: int, T_out: int,
+) -> dict:
+    """
+    KGE and peak-timing error for scenario evaluation, reusing
+    run_inference.py's _kge_per_node and _peak_timing_error directly
+    (both are generic over raw [T,N] arrays with no data-source
+    assumption — confirmed by direct inspection before reuse here,
+    not reimplemented, so there's no risk of drifting from the
+    real-data version's exact formulas).
+
+    KGE is computed on the full pooled (pred, target, mask) — safe to
+    pool across windows, since it's a per-node correlation/variability
+    statistic, not sensitive to window boundaries.
+
+    Peak-timing error is NOT pooled the same way. _peak_timing_error
+    uses a +/-48hr internal search window when matching a predicted
+    peak to an observed one -- far larger than a scenario's own
+    T_per_window (typically 104 steps = 26hr). Calling it on the full
+    concatenated array risks matching an observed peak in one window to
+    a "predicted peak" that's actually inside a completely unrelated
+    window (different historical base period, different injected
+    event). This calls it once PER WINDOW instead, using
+    _window_local_step to recover window boundaries -- the same
+    per-window isolation principle every s1-s6_metrics function already
+    uses for the same underlying reason.
+
+    Aggregation across windows: the pooled MEAN is mathematically exact
+    (weighted by each window's own event count -- mean of a union of
+    groups equals sum(group_mean*group_n)/sum(group_n) always). The
+    pooled MEDIAN is an approximation (median of per-window medians,
+    each weighted by event count) -- a true pooled median would need
+    the raw per-event errors, which _peak_timing_error does not expose
+    without duplicating its internal peak-matching logic. Flagged
+    explicitly here and in the returned dict key name rather than
+    silently presented as exact.
+    """
+    kge_results = _kge_per_node(pred, target, mask)
+    kge_vals   = [r["kge"]   for r in kge_results if not np.isnan(r["kge"])]
+    r_vals     = [r["r"]     for r in kge_results if not np.isnan(r["r"])]
+    alpha_vals = [r["alpha"] for r in kge_results if not np.isnan(r["alpha"])]
+
+    result = {
+        "kge_mean_syn":       round(float(np.mean(kge_vals)),   4) if kge_vals   else float("nan"),
+        "kge_r_mean_syn":     round(float(np.mean(r_vals)),     4) if r_vals     else float("nan"),
+        "kge_alpha_mean_syn": round(float(np.mean(alpha_vals)), 4) if alpha_vals else float("nan"),
+    }
+
+    T_window = meta.get("T_per_window", 104)
+    n_rows = pred.shape[0]
+    _, window_idx = _window_local_step(n_rows, T_in, T_out, T_window)
+
+    window_means, window_medians, window_counts = [], [], []
+    for w in np.unique(window_idx):
+        rows = (window_idx == w)
+        if rows.sum() < 2:
+            continue
+        pt = _peak_timing_error(pred[rows], target[rows], mask[rows], bankfull)
+        if pt["peak_timing_n_events"] > 0:
+            window_means.append(pt["peak_timing_mean_hr"])
+            window_medians.append(pt["peak_timing_median_hr"])
+            window_counts.append(pt["peak_timing_n_events"])
+
+    total_events = int(sum(window_counts))
+    if total_events > 0:
+        weights = np.array(window_counts, dtype=float)
+        pooled_mean = float(np.average(window_means, weights=weights))
+        # Approximate pooled median -- see docstring. Named
+        # "_approx" so it isn't mistaken for the exact statistic
+        # _peak_timing_error itself reports for real-data evaluation.
+        pooled_median_approx = float(np.average(window_medians, weights=weights))
+    else:
+        pooled_mean = float("nan")
+        pooled_median_approx = float("nan")
+
+    result.update({
+        "peak_timing_mean_hr_syn":          round(pooled_mean, 4) if total_events else float("nan"),
+        "peak_timing_median_hr_syn_approx": round(pooled_median_approx, 4) if total_events else float("nan"),
+        "peak_timing_n_events_syn":         total_events,
+        "peak_timing_n_windows_with_events_syn": len(window_counts),
+    })
+    return result
 
 def find_leaf_checkpoints(root_dir):
     checkpoint_root = Path(root_dir)
@@ -641,6 +728,8 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
     nse  = _nse(pred,  target_arr, mask_arr)
     rmse = _rmse(pred, target_arr, mask_arr)
     pod, far = _pod_far(pred, target_arr, bankfull)
+    extended = compute_scenario_extended_metrics(
+        pred, target_arr, mask_arr, bankfull, meta, T_in, T_out)
 
     # Real-data RMSE for degradation ratio
     real_rmse = float("nan")
@@ -662,6 +751,7 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
         "degradation_ratio": round(rmse / real_rmse, 3)
             if (np.isfinite(rmse) and np.isfinite(real_rmse) and real_rmse > 0)
             else None,
+        **extended,
     }
 
     # Scenario-specific extras
