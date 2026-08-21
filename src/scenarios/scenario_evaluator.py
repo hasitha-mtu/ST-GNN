@@ -826,7 +826,7 @@ def main() -> None:
                      if resolve_model_tag(c) == args.model]
     if args.horizon:
         all_ckpts = [c for c in all_ckpts
-                     if c.parent.name == str(args.horizon)]
+                     if c.name == str(args.horizon)]
     print(f"Checkpoints to evaluate: {len(all_ckpts)}")
 
     all_rows: list[dict] = []
