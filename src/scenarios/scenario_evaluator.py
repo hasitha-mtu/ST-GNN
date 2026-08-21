@@ -863,6 +863,7 @@ def main() -> None:
 
             # Cache check
             cache_path = scen_results_dir / f"{label.replace('/', '_')}.json"
+            print(f'cache_path: {cache_path}')
             if cache_path.exists() and not args.force:
                 with open(cache_path) as f:
                     row = json.load(f)
