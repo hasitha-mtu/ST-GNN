@@ -869,7 +869,7 @@ def main() -> None:
                     row = json.load(f)
                 rows.append(row)
                 continue
-
+            print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
             print(f"  [{i+1:3d}/{len(all_ckpts)}] {label} … ", end="", flush=True)
             try:
                 print('evaluating checkpoints...')
