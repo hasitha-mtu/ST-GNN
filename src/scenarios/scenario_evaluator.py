@@ -655,7 +655,6 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
     Load one checkpoint, run it on the synthetic scenario, compute metrics.
     Returns a flat dict of results suitable for a CSV row.
     """
-    print(f'evaluate_checkpoint|ckpt_dir:{ckpt_dir}')
     tag = resolve_model_tag(ckpt_dir)
     rel = ckpt_dir.relative_to(CKPT_ROOT)
     parts = rel.parts
@@ -699,7 +698,6 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
     # surrounding try/except, that crash kills the ENTIRE sweep instead of
     # skipping just this one (model, seed, horizon) combination.
     n_windows = pred.shape[0]
-    print(f'evaluate_checkpoint|n_windows:{n_windows}')
     if n_windows == 0:
         min_len_needed = T_in + T_out
         print(f"    [skip] scenario series too short for this checkpoint: "
@@ -732,7 +730,6 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
         return None
 
     pred = pred[:len(target_arr)]
-    print(f'evaluate_checkpoint|pred:{pred}')
     # Global metrics on synthetic data
     nse  = _nse(pred,  target_arr, mask_arr)
     rmse = _rmse(pred, target_arr, mask_arr)
@@ -857,19 +854,16 @@ def main() -> None:
 
         for i, ckpt_dir in enumerate(all_ckpts):
             tag   = resolve_model_tag(ckpt_dir)
-            print(f'tag: {tag}')
             rel   = ckpt_dir.relative_to(CKPT_ROOT)
             label = str(rel)
 
             # Cache check
             cache_path = scen_results_dir / f"{label.replace('/', '_')}.json"
-            print(f'cache_path: {cache_path}')
             if cache_path.exists() and not args.force:
                 with open(cache_path) as f:
                     row = json.load(f)
                 rows.append(row)
                 continue
-            print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')
             print(f"  [{i+1:3d}/{len(all_ckpts)}] {label} … ", end="", flush=True)
             try:
                 print('evaluating checkpoints...')
