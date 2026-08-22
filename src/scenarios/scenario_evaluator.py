@@ -669,12 +669,72 @@ def run_on_scenario(
 # Per-checkpoint evaluation
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _per_realization_metrics(pred: np.ndarray, target: np.ndarray, mask: np.ndarray,
+                             meta: dict, T_in: int, T_out: int,
+                             scenario: str, tag: str, seed: int, T_out_col: int) -> list[dict]:
+    """
+    NSE/RMSE computed SEPARATELY for each realization, not pooled across
+    all of them the way the main result row's nse_syn/rmse_syn are.
+    Needed as the data foundation for proper repeated-measures
+    statistical inference (reviewer point 3): treating realization as
+    the independent sampling unit requires one metric value PER
+    realization, not one pooled value per (scenario, model, seed,
+    horizon) that has already averaged the very variation being tested.
+
+    Returns one row per realization actually present in this
+    prediction/target pair (a realization with too few rows to compute
+    a meaningful NSE is skipped, not filled with NaN, since a repeated-
+    measures test with an all-NaN row for some models but not others
+    would bias rather than just weaken the comparison).
+    """
+    realizations = meta.get("realizations")
+    per_window_realization_id = meta.get("window_realization_id")
+    if realizations is None or per_window_realization_id is None:
+        return []   # old single-realization scenario data -- nothing to break out
+
+    T_window = meta.get("T_per_window", 104)
+    n_rows = pred.shape[0]
+    _, window_idx = _window_local_step(n_rows, T_in, T_out, T_window)
+
+    rows = []
+    for r in realizations:
+        rid = r["id"]
+        windows_this_real = [w for w, wr in enumerate(per_window_realization_id) if wr == rid]
+        if not windows_this_real:
+            continue
+        row_mask = np.isin(window_idx, windows_this_real)
+        if row_mask.sum() < 5:
+            continue   # too few rows for a meaningful per-realization NSE
+
+        p_r = pred[row_mask]
+        t_r = target[row_mask]
+        m_r = mask[row_mask] if mask is not None else np.ones_like(p_r, dtype=bool)
+
+        nse_r  = _nse(p_r, t_r, m_r)
+        rmse_r = _rmse(p_r, t_r, m_r)
+
+        rows.append({
+            "scenario": scenario, "model": tag, "seed": seed, "horizon": T_out_col,
+            "realization_id": rid, "n_rows": int(row_mask.sum()),
+            "nse_syn_realization": round(nse_r, 4) if np.isfinite(nse_r) else None,
+            "rmse_syn_realization": round(rmse_r, 4) if np.isfinite(rmse_r) else None,
+        })
+    return rows
+
+
 def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
                         device: torch.device,
                         bankfull: np.ndarray) -> dict | None:
     """
     Load one checkpoint, run it on the synthetic scenario, compute metrics.
     Returns a flat dict of results suitable for a CSV row.
+
+    Per-realization metrics (needed for point 3's statistical inference)
+    are stashed on the returned dict under a "_per_realization" key
+    rather than added as a second return value, to avoid changing this
+    function's existing single-dict-or-None contract for any other
+    caller. main() pops this key off before writing the main CSV row,
+    so scenario_summary.csv's existing shape is unaffected.
     """
     tag = resolve_model_tag(ckpt_dir)
     rel = ckpt_dir.relative_to(CKPT_ROOT)
@@ -796,6 +856,10 @@ def evaluate_checkpoint(ckpt_dir: Path, scen_dir: Path,
     elif scen_id == "S6":
         result.update(s6_metrics(pred, target_arr, meta, T_in, T_out))
 
+    result["_per_realization"] = _per_realization_metrics(
+        pred, target_arr, mask_arr, meta, T_in, T_out,
+        scenario=meta["name"], tag=tag, seed=seed, T_out_col=T_out)
+
     return result
 
 
@@ -857,6 +921,7 @@ def main() -> None:
     print(f"Checkpoints to evaluate: {len(all_ckpts)}")
 
     all_rows: list[dict] = []
+    all_realization_rows: list[dict] = []
 
     for scen_name in scen_names:
         scen_dir = SCEN_DIR / scen_name
@@ -890,14 +955,11 @@ def main() -> None:
                 print('evaluating checkpoints...')
                 row = evaluate_checkpoint(ckpt_dir, scen_dir, device, bankfull)
             except Exception as e:
-                # Belt-and-braces: evaluate_checkpoint() already catches
-                # the failure modes we know about (model load, inference,
-                # empty-window alignment) and returns None for those. This
-                # catches anything else so one bad checkpoint can't take
-                # down the remaining ~130 in the sweep.
                 print(f"FAILED (unhandled: {type(e).__name__}: {e})")
                 row = None
             if row:
+                per_realization_rows = row.pop("_per_realization", [])
+                all_realization_rows.extend(per_realization_rows)
                 rows.append(row)
                 all_rows.append(row)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -921,6 +983,18 @@ def main() -> None:
         out_csv = RESULTS / "scenario_summary.csv"
         df_all.to_csv(out_csv, index=False)
         print(f"\nConsolidated: {out_csv} ({len(all_rows)} rows)")
+
+    # Per-realization CSV -- one row per (scenario, model, seed, horizon,
+    # realization_id), needed for point 3's repeated-measures statistical
+    # inference. Empty for any scenario still on the old single-
+    # realization schema (nothing to break out), so this file may have
+    # fewer rows than 6 scenarios x models x seeds x horizons x
+    # n_realizations if some scenarios haven't been regenerated yet.
+    if all_realization_rows:
+        df_real = pd.DataFrame(all_realization_rows)
+        out_real_csv = RESULTS / "scenario_summary_per_realization.csv"
+        df_real.to_csv(out_real_csv, index=False)
+        print(f"Per-realization: {out_real_csv} ({len(all_realization_rows)} rows)")
 
 
 if __name__ == "__main__":
