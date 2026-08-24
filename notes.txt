@@ -31,3 +31,144 @@ python src\analyse_experiments.py
 python .\src\scenarios\unit_hydrograph.py
 python .\src\scenarios\scenario_generator.py --all
 python .\src\scenarios\scenario_evaluator.py --all-scenarios --all-models
+
+========================================================================================================================
+---
+
+## Phase 1 — Regenerate scenario data (points 1 + 2)
+
+```
+python src/scenarios/scenario_generator.py --all
+```
+
+**Validation gate before proceeding — check the schema, not just "did it run":**
+```
+cat dataset/scenarios/S4_SatBreakthrough/scenario_meta.json
+```
+Confirm `"realizations"` (a list of dicts) and `"window_realization_id"` are present — this is the new schema every downstream script now expects. Also check `n_windows` for S1/S5/S6 specifically — these have a known undersampled base-window pool (documented earlier this session); confirm the number is in the same ballpark as your last run (large multiplier from realizations, e.g. ~400+ for S1/S5) rather than something that changed unexpectedly.
+
+**Stop here if this schema check fails** — nothing downstream will work correctly against old-format data.
+
+---
+
+## Phase 2 — Mechanism diagnostics (point 6), against your existing checkpoints
+
+These don't depend on Phase 1 except where noted. Run all four; each is fast.
+
+```
+python src/check_soilgate_threshold_sweep.py
+python src/check_dfc_gate_scenario_invariance.py --checkpoint checkpoints/dfc_gnn/42/4/best_model.pt --model dfc_gnn
+python src/check_dfc_gate_scenario_invariance.py --checkpoint checkpoints/dfc_gnn_unified/42/4/best_model.pt --model dfc_gnn_unified
+python src/check_dfc_unified_hand_responsiveness.py --checkpoint checkpoints/dfc_gnn_unified/42/4/best_model.pt
+python src/check_backwater_gate_health.py --sweep
+```
+
+**Validation gate:** SoilGate sweep should show `0/15` collapsed (already confirmed last time you ran this). If any regression shows up here, stop and investigate before spending time on the expensive evaluation sweep below — a broken gate means every downstream S4 number for that model is meaningless regardless of what else you fix.
+
+**Depends on Phase 1** (needs the new S4/S6 schema):
+```
+python src/check_soilgate_s4_behavior.py --checkpoint checkpoints/st_gnn_soil_gate/42/24/best_model.pt
+python src/check_backwater_gate_health.py --checkpoint checkpoints/st_gnn_backwater_edge/42/4/best_model.pt
+```
+
+---
+
+## Phase 3 — Small-scale evaluation verification (before the full sweep)
+
+**Do not skip this** — same discipline as the S2 verification earlier. One model, one horizon, one scenario:
+
+```
+python src/scenarios/scenario_evaluator.py --model st_gnn_hand_edge --horizon 4 --scenario S4_SatBreakthrough --force
+```
+
+**Validation gate:**
+```
+python src/check_result_duplicates.py --model st_gnn_hand_edge
+```
+Confirm clean (no duplicates). Then open the resulting `model_metrics.csv` and check the new columns are populated: `kge_mean_syn`, `peak_timing_n_events_syn`, and (S4-specific) that nothing crashed on the per-realization breakthrough lookup.
+
+**Stop here if this fails.** Fix before committing to the full sweep — this is the cheapest place to catch a schema mismatch.
+
+---
+
+## Phase 4 — Full evaluation sweep (the expensive step)
+
+```
+python src/scenarios/scenario_evaluator.py --all-scenarios --all-models
+```
+
+This is the long-running one — 10 models × 5 horizons × 6 scenarios. Let it complete.
+
+**Validation gate immediately after:**
+```
+python src/check_result_duplicates.py --model st_gnn_soil_gate
+```
+Run this **before** looking at any numbers. If it flags duplicates, the sweep silently appended rather than overwrote somewhere, and nothing downstream should be trusted until resolved.
+
+**Also confirm the new per-realization file exists and has real content:**
+```
+python -c "import pandas as pd; df = pd.read_csv('results/scenarios/scenario_summary_per_realization.csv'); print(df.shape); print(df.head())"
+```
+This file is the entire foundation for Phase 6 (point 3) — if it's empty or missing, point 3 can't proceed, and it's worth knowing that now rather than after Phase 5.
+
+---
+
+## Phase 5 — Real-data evaluation refresh (if any model changed since last run)
+
+Only needed for models retrained or fixed since the last `global_metrics_summary.csv` was generated (at minimum: SoilGate, BackwaterEdge):
+
+```
+python src/run_inference.py --model st_gnn_soil_gate
+python src/run_inference.py --model st_gnn_backwater_edge
+```
+
+**Validation gate:** same duplicate check, against `global_metrics_summary.csv`:
+```
+python src/check_result_duplicates.py --model st_gnn_soil_gate
+```
+
+---
+
+## Phase 6 — Statistical inference (point 3)
+
+Depends entirely on Phase 4's per-realization CSV existing and being non-empty (checked above).
+
+```
+python src/scenario_repeated_measures_inference.py --all
+```
+
+**Validation gate before trusting specific numbers:** scan the output for any `[note] N/M subjects dropped` lines — heavy listwise deletion for a particular scenario/horizon means that comparison has less power than it looks, worth flagging in the writeup rather than treating all comparisons as equally well-powered.
+
+Then targeted comparisons for whatever's going in the paper, e.g.:
+```
+python src/scenario_repeated_measures_inference.py --scenario S4_SatBreakthrough --horizon 24 --compare st_gnn_soil_gate gru
+python src/scenario_repeated_measures_inference.py --scenario S1_ConvectiveCell --horizon 24 --compare dfc_gnn gru
+```
+
+---
+
+## Phase 7 — Downstream analysis and figures
+
+```
+python src/analyse_experiments.py
+python src/scenarios/analyse_scenarios.py
+python src/plot_scenario_examples.py --individual
+```
+
+**Validation gate:** open `scenario_advantage_table.png` and `scenario_examples_grid.png` — visually confirm no blank panels, no obviously-wrong magnitudes (e.g., check S6's downstream suppression line still shows a real decline, not the old sign-flipped behavior, and S1's downstream panel shows genuine multi-hop signal, not a flat line).
+
+---
+
+## Separate track — Point 7 (spatial holdout)
+
+Not part of the linear pipeline above; requires your manual code integration first.
+
+1. Pick 3 real node indices from `nodes.csv`, fill in `spatial_holdout.HOLDOUT_NODES`
+2. Add the one-line integration into `train_epoch` (shown last message)
+3. Retrain (this is real, unavoidable GPU time — no shortcut)
+4. ```
+   python src/evaluate_spatial_holdout.py --pred <path> --target <path> --mask <path> --nodes-csv dataset/graph/nodes.csv
+   ```
+**Validation gate:** `generalization_gap_ratio` close to 1.0 is the result you want; check the per-node breakdown before trusting the aggregate either way.
+
+---
