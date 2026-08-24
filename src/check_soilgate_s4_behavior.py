@@ -42,6 +42,10 @@ def main():
     p.add_argument("--scenario-dir", type=str,
                    default="dataset/scenarios/S4_SatBreakthrough",
                    help="Directory containing X_synthetic.npy/scenario_meta.json for S4")
+    p.add_argument("--window", type=int, default=0,
+                   help="Which generated window to inspect (default 0). Each "
+                        "window belongs to a specific realization with its own "
+                        "excess_threshold/sat_breakthrough_step.")
     args = p.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -101,20 +105,46 @@ def main():
     meta = json.load(open(meta_path))
     X = np.load(x_path)
     T_WINDOW = meta.get("T_per_window", 104)
-    bt = meta["sat_breakthrough_step"]
-    excess_threshold = meta.get("excess_threshold", 0.75)
     swvl2_sat_idx = 9   # matches STGNNSoilGate's default swvl2_sat_idx
 
-    # Catchment-mean saturation trajectory for the first window, exactly
-    # as STGNNSoilGate's own S_bar computation does (mean over N nodes).
-    window0 = X[:T_WINDOW]
-    S_bar_trajectory = window0[:, :, swvl2_sat_idx].mean(axis=1)   # [T_WINDOW]
+    # Multi-realization schema: sat_breakthrough_step/excess_threshold
+    # now vary per realization (meta["realizations"]), looked up via
+    # meta["window_realization_id"] for the specific window being
+    # inspected -- no longer a single top-level scalar shared by every
+    # window. Falls back to the old scalar fields for any
+    # single-realization scenario data generated before this schema
+    # change, so this script works against both.
+    window_idx = args.window
+    realizations = meta.get("realizations")
+    per_window_realization_id = meta.get("window_realization_id")
+    if realizations is not None and per_window_realization_id is not None:
+        n_windows_available = len(per_window_realization_id)
+        if not (0 <= window_idx < n_windows_available):
+            print(f"  [warn] --window {window_idx} out of range "
+                  f"(0-{n_windows_available - 1} available) -- using window 0")
+            window_idx = 0
+        rid = per_window_realization_id[window_idx]
+        r = next(rr for rr in realizations if rr["id"] == rid)
+        bt = r["sat_breakthrough_step"]
+        excess_threshold = r["excess_threshold"]
+        print(f"  Window {window_idx} -> realization {rid}: "
+              f"excess_threshold={excess_threshold:.4f}, sat_breakthrough_step={bt}")
+    else:
+        bt = meta["sat_breakthrough_step"]
+        excess_threshold = meta.get("excess_threshold", 0.75)
+        window_idx = 0
+
+    # Catchment-mean saturation trajectory for the selected window,
+    # exactly as STGNNSoilGate's own S_bar computation does (mean over
+    # N nodes).
+    window_slice = X[window_idx * T_WINDOW : (window_idx + 1) * T_WINDOW]
+    S_bar_trajectory = window_slice[:, :, swvl2_sat_idx].mean(axis=1)   # [T_WINDOW]
 
     gate_trajectory = torch.sigmoid(
         sat_sharpness * (torch.from_numpy(S_bar_trajectory).float() - sat_threshold)
     ).numpy()
 
-    print(f"\nReal S4 injection, window 0, breakthrough at step {bt}:")
+    print(f"\nReal S4 injection, window {window_idx}, breakthrough at step {bt}:")
     print(f"  S_bar at breakthrough:        {S_bar_trajectory[bt]:.4f}  "
           f"(excess_threshold={excess_threshold})")
     print(f"  Gate activation at breakthrough: {gate_trajectory[bt]:.4f}")
