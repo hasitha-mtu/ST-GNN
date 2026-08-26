@@ -134,15 +134,15 @@ python src/check_result_duplicates.py --model st_gnn_soil_gate
 Depends entirely on Phase 4's per-realization CSV existing and being non-empty (checked above).
 
 ```
-python src/scenario_repeated_measures_inference.py --all
+python src/scenarios/scenario_repeated_measures_inference.py --all
 ```
 
 **Validation gate before trusting specific numbers:** scan the output for any `[note] N/M subjects dropped` lines — heavy listwise deletion for a particular scenario/horizon means that comparison has less power than it looks, worth flagging in the writeup rather than treating all comparisons as equally well-powered.
 
 Then targeted comparisons for whatever's going in the paper, e.g.:
 ```
-python src/scenario_repeated_measures_inference.py --scenario S4_SatBreakthrough --horizon 24 --compare st_gnn_soil_gate gru
-python src/scenario_repeated_measures_inference.py --scenario S1_ConvectiveCell --horizon 24 --compare dfc_gnn gru
+python src/scenarios/scenario_repeated_measures_inference.py --scenario S4_SatBreakthrough --horizon 24 --compare st_gnn_soil_gate gru
+python src/scenarios/scenario_repeated_measures_inference.py --scenario S1_ConvectiveCell --horizon 24 --compare dfc_gnn gru
 ```
 
 ---
