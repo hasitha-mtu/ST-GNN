@@ -1368,18 +1368,39 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
         source_chains[src] = edges_order
         reachable.update(dst for _s, dst in edges_order)
 
+    # BUG FIX: downstream_idx previously only excluded source_idx
+    # (g>=1.3 at the reference gradient) -- but the direct-injection
+    # loop's own eligibility threshold is g>1.05, and gradient varies
+    # per realization up to gradient_max=3.0. Confirmed by direct
+    # calculation: 4 of 5 originally-selected downstream nodes (all
+    # except Currach Club) reach g=1.06-1.19 at gradient_max=3.0 --
+    # comfortably past the injection threshold, meaning they received a
+    # direct local rainfall amplification of their own on top of any
+    # routed signal, undermining this scenario's own stated test ("...
+    # before it appears in the LOCAL rainfall record" -- not true if the
+    # local record already shows it directly). Excluding every node
+    # that could EVER become injection-eligible at the worst-case
+    # gradient_max (not just the reference-gradient source_idx used for
+    # topology) closes this the same way S1's headwater/downstream
+    # overlap was closed earlier this session.
+    max_gradient = _gradient_for(S5_GRADIENT_MAX_RANGE[1])
+    injection_eligible_ever = set(n for n in range(N) if max_gradient[n] > 1.05)
+
     downstream_candidates = nd[(nd.is_reservoir == 0)
                                & (nd.node_idx.isin(reachable))
-                               & (~nd.node_idx.isin(source_idx))].copy()
+                               & (~nd.node_idx.isin(source_idx))
+                               & (~nd.node_idx.isin(injection_eligible_ever))].copy()
     downstream_candidates = downstream_candidates.sort_values("log_catchment_area_km2", ascending=False)
     downstream_idx = downstream_candidates.head(5)["node_idx"].tolist()
     if not downstream_idx:
         print("  [skip] No downstream nodes reachable from any high-gradient "
-              "source node — check the gradient threshold or graph topology.")
+              "source node, after excluding all injection-eligible nodes — "
+              "check the gradient threshold or graph topology.")
         return
     if len(downstream_idx) < 5:
         print(f"  [warn] Only {len(downstream_idx)} downstream nodes reachable "
-              f"from source_idx (wanted 5): {downstream_idx}")
+              f"from source_idx and never injection-eligible "
+              f"(wanted 5): {downstream_idx}")
 
     stage_range = (nd.set_index("node_idx")["p90_mAOD"]
                    - nd.set_index("node_idx")["gauge_datum_mOSGM15"])
