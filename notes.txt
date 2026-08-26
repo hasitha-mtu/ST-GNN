@@ -135,14 +135,17 @@ Depends entirely on Phase 4's per-realization CSV existing and being non-empty (
 
 ```
 python src/scenarios/scenario_repeated_measures_inference.py --all
+
+python src/scenarios/scenario_repeated_measures_inference.py --all --out-csv results/scenarios/repeated_measures_all.csv
+python src/scenarios/scenario_repeated_measures_inference.py --scenario S4_SatBreakthrough --horizon 24 --compare st_gnn_soil_gate gru --rank-based --out-csv results/scenarios/s4_soilgate_vs_gru.csv
 ```
 
 **Validation gate before trusting specific numbers:** scan the output for any `[note] N/M subjects dropped` lines — heavy listwise deletion for a particular scenario/horizon means that comparison has less power than it looks, worth flagging in the writeup rather than treating all comparisons as equally well-powered.
 
 Then targeted comparisons for whatever's going in the paper, e.g.:
 ```
-python src/scenarios/scenario_repeated_measures_inference.py --scenario S4_SatBreakthrough --horizon 24 --compare st_gnn_soil_gate gru
-python src/scenarios/scenario_repeated_measures_inference.py --scenario S1_ConvectiveCell --horizon 24 --compare dfc_gnn gru
+python src/scenarios/scenario_repeated_measures_inference.py --scenario S4_SatBreakthrough --horizon 24 --compare st_gnn_soil_gate gru --rank-based --out-csv results/scenarios/s4_soilgate_vs_gru.csv
+python src/scenarios/scenario_repeated_measures_inference.py --scenario S1_ConvectiveCell --horizon 24 --compare dfc_gnn gru --rank-based --out-csv results/scenarios/s4_dfc_vs_gru.csv
 ```
 
 ---
@@ -152,7 +155,7 @@ python src/scenarios/scenario_repeated_measures_inference.py --scenario S1_Conve
 ```
 python src/analyse_experiments.py
 python src/scenarios/analyse_scenarios.py
-python src/plot_scenario_examples.py --individual
+python src/scenarios/plot_scenario_examples.py --individual
 ```
 
 **Validation gate:** open `scenario_advantage_table.png` and `scenario_examples_grid.png` — visually confirm no blank panels, no obviously-wrong magnitudes (e.g., check S6's downstream suppression line still shows a real decline, not the old sign-flipped behavior, and S1's downstream panel shows genuine multi-hop signal, not a flat line).
