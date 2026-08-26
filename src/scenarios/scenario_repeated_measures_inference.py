@@ -98,7 +98,34 @@ def build_subject_matrix(df: pd.DataFrame, scenario: str, horizon: int,
     return pivot[models], n_before, n_after
 
 
-def run_friedman_and_posthoc(pivot: pd.DataFrame, models: list[str]) -> dict:
+def to_within_subject_ranks(pivot: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts a (subjects x models) NSE matrix to within-subject ranks
+    (1 = best/highest NSE among the models being compared for that
+    subject, k = worst, where k = number of models). Applied ROW-WISE --
+    each subject's own set of model values gets ranked independently,
+    same principle as the earlier check_dfc_scenario_rank_significance.py
+    fix for S4's scale distortion.
+
+    Why this matters: NSE's denominator is the target's own variance,
+    which differs enormously by scenario (confirmed: S4's near-zero-
+    variance target inflates raw NSE differences to 10-20x the scale of
+    every other scenario, even though the underlying absolute prediction
+    errors are comparable). Friedman's omnibus test is already rank-
+    based internally and is unaffected by this, but the post-hoc
+    Wilcoxon test and median_diff/bootstrap CI operate on raw values and
+    inherit the scale distortion directly -- a "5.17 NSE point"
+    difference on S4 is not comparable to a "0.05 NSE point" difference
+    on S1, even though both may reflect a similar RELATIVE ordering
+    advantage. Ranking within each subject first makes every subject
+    (and by extension every scenario) contribute on the same 1..k scale
+    regardless of the target's own variance that day.
+    """
+    return pivot.rank(axis=1, ascending=False)
+
+
+def run_friedman_and_posthoc(pivot: pd.DataFrame, models: list[str],
+                             rank_based: bool = False) -> dict:
     if len(pivot) < 8:
         return {"n_subjects": len(pivot), "note": "too few subjects (<8) for a reliable Friedman test"}
 
@@ -127,10 +154,11 @@ def run_friedman_and_posthoc(pivot: pd.DataFrame, models: list[str]) -> dict:
             medians_diff.append(float(diff.median()))
 
         corrected_p = holm_bonferroni(raw_p)
+        diff_key = "median_rank_diff_a_minus_b" if rank_based else "median_diff_a_minus_b"
         for (a, b), p_raw, p_corr, med_diff in zip(pairs, raw_p, corrected_p, medians_diff):
             result["posthoc"].append({
                 "model_a": a, "model_b": b,
-                "median_diff_a_minus_b": round(med_diff, 4),
+                diff_key: round(med_diff, 4),
                 "p_raw": round(p_raw, 5),
                 "p_holm": round(p_corr, 5),
                 "significant_after_correction": bool(p_corr < 0.05),
@@ -141,7 +169,9 @@ def run_friedman_and_posthoc(pivot: pd.DataFrame, models: list[str]) -> dict:
 
 def bootstrap_median_diff_ci(pivot: pd.DataFrame, model_a: str, model_b: str,
                              n_boot: int = 5000, seed: int = 0) -> dict:
-    """95% bootstrap CI on the median paired (model_a - model_b) NSE difference."""
+    """95% bootstrap CI on the median paired (model_a - model_b) difference,
+    on whatever scale `pivot` is in -- raw NSE, or within-subject rank if
+    to_within_subject_ranks() was applied first."""
     diff = (pivot[model_a] - pivot[model_b]).values
     rng = np.random.default_rng(seed)
     n = len(diff)
@@ -169,6 +199,24 @@ def main():
                    help="Two model tags for a bootstrap CI on their paired median difference")
     p.add_argument("--all", action="store_true",
                    help="Run the omnibus test for every scenario x horizon combination present")
+    p.add_argument("--rank-based", action="store_true",
+                   help="Convert each subject's model values to within-subject ranks "
+                        "before testing, instead of using raw NSE differences. Friedman's "
+                        "omnibus test is already rank-based internally and unaffected either "
+                        "way, but the post-hoc median_diff and bootstrap CI operate on raw "
+                        "values -- these inherit any scale distortion in the underlying "
+                        "metric directly (confirmed: S4_SatBreakthrough's near-zero target "
+                        "variance inflates raw NSE differences to 10-20x the scale of every "
+                        "other scenario, even for a comparable underlying prediction-error "
+                        "gap). Use this flag for any cross-scenario comparison, or whenever "
+                        "reporting an effect SIZE (not just direction/significance) for a "
+                        "scenario with this kind of scale sensitivity.")
+    p.add_argument("--out-csv", type=str, default=None,
+                   help="If given, saves all results (one row per pairwise "
+                        "comparison, plus one omnibus-only row for any "
+                        "scenario/horizon where the omnibus test wasn't "
+                        "significant) to this CSV path. Without this flag, "
+                        "results only print to the console.")
     args = p.parse_args()
 
     csv_path = Path(args.csv)
@@ -182,6 +230,10 @@ def main():
         print(f"{csv_path} is empty -- no per-realization data yet.")
         return
 
+    diff_key = "median_rank_diff_a_minus_b" if args.rank_based else "median_diff_a_minus_b"
+    diff_label = "median_rank_diff" if args.rank_based else "median_diff"
+    out_rows = []   # accumulated for --out-csv, regardless of --all vs single-scenario mode
+
     if args.all:
         combos = df[["scenario", "horizon"]].drop_duplicates().sort_values(["scenario", "horizon"])
         for _, row in combos.iterrows():
@@ -190,7 +242,7 @@ def main():
             if len(models) < 2:
                 continue
             print(f"\n{'='*70}\n{scen}  horizon={hz} ({STEP_TO_HZ.get(hz, hz)})  "
-                  f"models={len(models)}\n{'='*70}")
+                  f"models={len(models)}{'  [RANK-BASED]' if args.rank_based else ''}\n{'='*70}")
             pivot, n_before, n_after = build_subject_matrix(df, scen, hz, models)
             if n_after < n_before:
                 print(f"  [note] {n_before - n_after}/{n_before} subjects dropped "
@@ -198,15 +250,43 @@ def main():
             if pivot.empty:
                 print("  [skip] no complete-case data")
                 continue
-            result = run_friedman_and_posthoc(pivot, models)
+            if args.rank_based:
+                pivot = to_within_subject_ranks(pivot)
+            result = run_friedman_and_posthoc(pivot, models, rank_based=args.rank_based)
             print(f"  n_subjects={result.get('n_subjects')}  "
                   f"Friedman p={result.get('friedman_p')}  "
                   f"significant={result.get('significant_omnibus')}")
-            for ph in result.get("posthoc", []):
+            posthoc = result.get("posthoc", [])
+            if not posthoc:
+                # Omnibus-only row -- keeps the CSV a complete record of
+                # every scenario/horizon tested, not just the ones with a
+                # significant omnibus result (and therefore posthoc rows).
+                out_rows.append({
+                    "scenario": scen, "horizon": hz, "rank_based": args.rank_based,
+                    "n_subjects": result.get("n_subjects"),
+                    "friedman_stat": result.get("friedman_stat"),
+                    "friedman_p": result.get("friedman_p"),
+                    "significant_omnibus": result.get("significant_omnibus"),
+                    "model_a": None, "model_b": None, "diff_type": diff_key,
+                    "diff_value": None, "p_raw": None, "p_holm": None,
+                    "significant_posthoc": None,
+                })
+            for ph in posthoc:
                 flag = " *" if ph["significant_after_correction"] else ""
                 print(f"    {ph['model_a']:<22} vs {ph['model_b']:<22} "
-                      f"median_diff={ph['median_diff_a_minus_b']:+.4f}  "
+                      f"{diff_label}={ph[diff_key]:+.4f}  "
                       f"p_holm={ph['p_holm']:.5f}{flag}")
+                out_rows.append({
+                    "scenario": scen, "horizon": hz, "rank_based": args.rank_based,
+                    "n_subjects": result.get("n_subjects"),
+                    "friedman_stat": result.get("friedman_stat"),
+                    "friedman_p": result.get("friedman_p"),
+                    "significant_omnibus": result.get("significant_omnibus"),
+                    "model_a": ph["model_a"], "model_b": ph["model_b"], "diff_type": diff_key,
+                    "diff_value": ph[diff_key], "p_raw": ph["p_raw"], "p_holm": ph["p_holm"],
+                    "significant_posthoc": ph["significant_after_correction"],
+                })
+        _save_out_csv(out_rows, args.out_csv)
         return
 
     if not args.scenario or args.horizon is None:
@@ -215,7 +295,8 @@ def main():
 
     models = args.models or sorted(
         df[(df.scenario == args.scenario) & (df.horizon == args.horizon)]["model"].unique())
-    print(f"Scenario: {args.scenario}   Horizon: {args.horizon} ({STEP_TO_HZ.get(args.horizon, '?')})")
+    print(f"Scenario: {args.scenario}   Horizon: {args.horizon} ({STEP_TO_HZ.get(args.horizon, '?')})"
+          f"{'  [RANK-BASED]' if args.rank_based else ''}")
     print(f"Models ({len(models)}): {models}")
 
     pivot, n_before, n_after = build_subject_matrix(df, args.scenario, args.horizon, models)
@@ -226,28 +307,76 @@ def main():
         print("No complete-case data for this scenario/horizon/model set.")
         return
 
-    result = run_friedman_and_posthoc(pivot, models)
+    if args.rank_based:
+        pivot = to_within_subject_ranks(pivot)
+
+    result = run_friedman_and_posthoc(pivot, models, rank_based=args.rank_based)
     print(f"\nFriedman omnibus test: n_subjects={result.get('n_subjects')}  "
           f"stat={result.get('friedman_stat')}  p={result.get('friedman_p')}  "
           f"significant={result.get('significant_omnibus')}")
     if "note" in result:
         print(f"  {result['note']}")
-    for ph in result.get("posthoc", []):
+    posthoc = result.get("posthoc", [])
+    if not posthoc:
+        out_rows.append({
+            "scenario": args.scenario, "horizon": args.horizon, "rank_based": args.rank_based,
+            "n_subjects": result.get("n_subjects"),
+            "friedman_stat": result.get("friedman_stat"),
+            "friedman_p": result.get("friedman_p"),
+            "significant_omnibus": result.get("significant_omnibus"),
+            "model_a": None, "model_b": None, "diff_type": diff_key,
+            "diff_value": None, "p_raw": None, "p_holm": None,
+            "significant_posthoc": None,
+        })
+    for ph in posthoc:
         flag = " *** significant after Holm correction ***" if ph["significant_after_correction"] else ""
         print(f"  {ph['model_a']:<22} vs {ph['model_b']:<22} "
-              f"median_diff={ph['median_diff_a_minus_b']:+.4f}  "
+              f"{diff_label}={ph[diff_key]:+.4f}  "
               f"p_raw={ph['p_raw']:.5f}  p_holm={ph['p_holm']:.5f}{flag}")
+        out_rows.append({
+            "scenario": args.scenario, "horizon": args.horizon, "rank_based": args.rank_based,
+            "n_subjects": result.get("n_subjects"),
+            "friedman_stat": result.get("friedman_stat"),
+            "friedman_p": result.get("friedman_p"),
+            "significant_omnibus": result.get("significant_omnibus"),
+            "model_a": ph["model_a"], "model_b": ph["model_b"], "diff_type": diff_key,
+            "diff_value": ph[diff_key], "p_raw": ph["p_raw"], "p_holm": ph["p_holm"],
+            "significant_posthoc": ph["significant_after_correction"],
+        })
 
     if args.compare:
         a, b = args.compare
         if a in pivot.columns and b in pivot.columns:
             ci = bootstrap_median_diff_ci(pivot, a, b)
-            print(f"\nBootstrap 95% CI, {a} - {b}:")
+            unit = "rank" if args.rank_based else "NSE"
+            print(f"\nBootstrap 95% CI ({unit} scale), {a} - {b}:")
             print(f"  median diff = {ci['median_diff']:+.4f}  "
                   f"95% CI [{ci['ci_95_low']:+.4f}, {ci['ci_95_high']:+.4f}]  "
                   f"(n={ci['n_subjects']} subjects)")
+            out_rows.append({
+                "scenario": args.scenario, "horizon": args.horizon, "rank_based": args.rank_based,
+                "n_subjects": ci["n_subjects"], "friedman_stat": None, "friedman_p": None,
+                "significant_omnibus": None, "model_a": a, "model_b": b,
+                "diff_type": "bootstrap_median_diff", "diff_value": ci["median_diff"],
+                "p_raw": None, "p_holm": None, "significant_posthoc": None,
+                "ci_95_low": ci["ci_95_low"], "ci_95_high": ci["ci_95_high"],
+            })
         else:
             print(f"\n[skip] --compare {a} {b}: one or both not present in complete-case data")
+
+    _save_out_csv(out_rows, args.out_csv)
+
+
+def _save_out_csv(rows: list[dict], out_csv: str | None) -> None:
+    if not out_csv:
+        return
+    if not rows:
+        print(f"\n[note] --out-csv given but no results to save.")
+        return
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"\nSaved {len(rows)} rows to {out_path}")
 
 
 if __name__ == "__main__":
