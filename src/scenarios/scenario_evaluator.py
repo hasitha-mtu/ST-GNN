@@ -977,12 +977,16 @@ def main() -> None:
             print(f"  Saved: {scen_results_dir / 'model_metrics.csv'} "
                   f"({len(rows)} rows)")
 
-    # Save consolidated CSV
+    # Save consolidated CSV -- MERGES with existing on-disk data rather
+    # than overwriting, so a scoped run (e.g. --scenario S5_SpatialGradient
+    # after only S5 needed regenerating) replaces just that scenario's
+    # rows without destroying results already on disk for every other
+    # scenario. Confirmed necessary: the original version here did
+    # df_all.to_csv(out_csv) unconditionally, which would have silently
+    # wiped the other 5 scenarios' rows on any scoped run.
     if all_rows:
-        df_all = pd.DataFrame(all_rows)
         out_csv = RESULTS / "scenario_summary.csv"
-        df_all.to_csv(out_csv, index=False)
-        print(f"\nConsolidated: {out_csv} ({len(all_rows)} rows)")
+        _merge_and_save(pd.DataFrame(all_rows), out_csv, scen_names, "scenario")
 
     # Per-realization CSV -- one row per (scenario, model, seed, horizon,
     # realization_id), needed for point 3's repeated-measures statistical
@@ -990,11 +994,34 @@ def main() -> None:
     # realization schema (nothing to break out), so this file may have
     # fewer rows than 6 scenarios x models x seeds x horizons x
     # n_realizations if some scenarios haven't been regenerated yet.
+    # Same merge-not-overwrite fix as above.
     if all_realization_rows:
-        df_real = pd.DataFrame(all_realization_rows)
         out_real_csv = RESULTS / "scenario_summary_per_realization.csv"
-        df_real.to_csv(out_real_csv, index=False)
-        print(f"Per-realization: {out_real_csv} ({len(all_realization_rows)} rows)")
+        _merge_and_save(pd.DataFrame(all_realization_rows), out_real_csv, scen_names, "scenario")
+
+
+def _merge_and_save(df_new: pd.DataFrame, out_path: Path,
+                    scenarios_being_updated: list[str], key_col: str) -> None:
+    """
+    Merges df_new into whatever already exists at out_path, replacing
+    only rows whose key_col value is in scenarios_being_updated --
+    every other scenario's existing rows pass through untouched. If
+    out_path doesn't exist yet, just writes df_new directly (first run).
+    """
+    if out_path.exists():
+        df_old = pd.read_csv(out_path)
+        df_old_kept = df_old[~df_old[key_col].isin(scenarios_being_updated)]
+        n_replaced = len(df_old) - len(df_old_kept)
+        df_merged = pd.concat([df_old_kept, df_new], ignore_index=True)
+        print(f"  Merged: kept {len(df_old_kept)} existing rows "
+              f"(other scenarios), replaced {n_replaced} stale rows "
+              f"for {scenarios_being_updated}, added {len(df_new)} new rows")
+    else:
+        df_merged = df_new
+        print(f"  {out_path} did not exist yet -- writing fresh")
+
+    df_merged.to_csv(out_path, index=False)
+    print(f"Saved: {out_path} ({len(df_merged)} total rows)")
 
 
 if __name__ == "__main__":
