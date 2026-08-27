@@ -1,21 +1,26 @@
 """
-check_result_duplicates.py — verifies global_metrics_summary.csv and
-scenario_summary.csv have exactly one row per their expected key, before
-trusting analyse_experiments.py / analyse_scenarios.py's output.
+check_result_duplicates.py — verifies global_metrics_summary.csv,
+scenario_summary.csv, and scenario_summary_per_realization.csv have
+exactly one row per their expected key, before trusting
+analyse_experiments.py / analyse_scenarios.py /
+scenario_repeated_measures_inference.py's output.
 
 Why this matters right now specifically: after retraining a model (e.g.
-st_gnn_soil_gate, following the sat_threshold collapse fix), re-running
-run_inference.py / scenario_evaluator.py should REPLACE that model's old
-rows, not append new ones alongside them. If the underlying pipeline
-appends instead of overwrites, every plot and rank table downstream
-silently averages the broken (pre-fix) and fixed (post-fix) results
-together -- worse than not fixing it at all, since it would look like a
-smaller improvement than what was actually achieved, or mask the fix
-entirely depending on how badly the old rows skew the mean.
+st_gnn_soil_gate, following the sat_threshold collapse fix) or
+regenerating a single scenario (e.g. S5_SpatialGradient, following the
+downstream-node injection-leakage fix), re-running run_inference.py /
+scenario_evaluator.py should REPLACE the affected rows, not append new
+ones alongside them. If the underlying pipeline appends instead of
+overwrites/merges, every plot and rank table downstream silently
+averages the broken (pre-fix) and fixed (post-fix) results together --
+worse than not fixing it at all, since it would look like a smaller
+improvement than what was actually achieved, or mask the fix entirely
+depending on how badly the old rows skew the mean.
 
 Expected uniqueness:
-  global_metrics_summary.csv : one row per (model, horizon)
-  scenario_summary.csv       : one row per (scenario, model, seed, horizon)
+  global_metrics_summary.csv            : one row per (model, horizon)
+  scenario_summary.csv                  : one row per (scenario, model, seed, horizon)
+  scenario_summary_per_realization.csv  : one row per (scenario, model, seed, horizon, realization_id)
 
 Usage:
     python check_result_duplicates.py
@@ -29,6 +34,7 @@ import pandas as pd
 
 GLOBAL_CSV = Path("results/figures/model_comparison/global_metrics_summary.csv")
 SCENARIO_CSV = Path("results/scenarios/scenario_summary.csv")
+PER_REALIZATION_CSV = Path("results/scenarios/scenario_summary_per_realization.csv")
 
 
 def _normalize_model_name(name) -> str:
@@ -83,6 +89,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--global-csv", type=str, default=str(GLOBAL_CSV))
     p.add_argument("--scenario-csv", type=str, default=str(SCENARIO_CSV))
+    p.add_argument("--per-realization-csv", type=str, default=str(PER_REALIZATION_CSV))
     p.add_argument("--model", type=str, default=None,
                    help="Model tag/label to focus-report on, e.g. st_gnn_soil_gate "
                         "or 'ST-GNN Soil Gate' (matches whichever column is present)")
@@ -111,15 +118,26 @@ def main():
     else:
         print(f"[skip] {scsv} not found")
 
+    prcsv = Path(args.per_realization_csv)
+    if prcsv.exists():
+        pr = pd.read_csv(prcsv)
+        clean = check_duplicates(
+            pr, ["scenario", "model", "seed", "horizon", "realization_id"],
+            f"scenario_summary_per_realization.csv ({prcsv})",
+            focus_value=args.model, focus_col="model")
+        all_clean &= clean
+    else:
+        print(f"[skip] {prcsv} not found")
+
     print(f"\n{'='*70}")
     if all_clean:
-        print("Both files clean -- safe to run analyse_experiments.py / "
-              "analyse_scenarios.py.")
+        print("All files clean -- safe to run analyse_experiments.py / "
+              "analyse_scenarios.py / scenario_repeated_measures_inference.py.")
     else:
         print("Duplicates found -- do NOT trust downstream analysis until "
               "resolved. Inspect the duplicated rows above: if they show "
-              "old (collapsed-gate) and new (fixed) values for the same "
-              "key, the evaluation pipeline appended instead of overwriting.")
+              "old and new values for the same key, the evaluation "
+              "pipeline appended instead of overwriting/merging.")
 
 
 if __name__ == "__main__":

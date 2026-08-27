@@ -175,3 +175,30 @@ Not part of the linear pipeline above; requires your manual code integration fir
 **Validation gate:** `generalization_gap_ratio` close to 1.0 is the result you want; check the per-node breakdown before trusting the aggregate either way.
 
 ---
+
+python src/scenarios/scenario_generator.py --scenario S5_SpatialGradient
+
+python src/scenarios/scenario_evaluator.py --scenario S5 --all-models
+
+python src/check_result_duplicates.py --model st_gnn_hand_edge
+
+
+# 1. Regenerate S5 only
+python src/scenarios/scenario_generator.py --scenario S5
+
+# 2. Re-evaluate S5 only (updates BOTH scenario_summary.csv and
+#    scenario_summary_per_realization.csv via the merge fix)
+python src/scenarios/scenario_evaluator.py --scenario S5 --all-models
+
+# 3. Verify no duplicates in ALL THREE files (now checks per-realization too)
+python src/check_result_duplicates.py
+
+# 4. Rebuild statistical inference (source data is now complete/correct,
+#    so --all safely overwrites the full output)
+python src/scenarios/scenario_repeated_measures_inference.py --all --out-csv results/scenarios/repeated_measures_all.csv
+
+# 5. Rebuild the six comparison figures (reads the full, updated scenario_summary.csv)
+python src/scenarios/analyse_scenarios.py
+
+# 6. Rebuild S5's example trajectory panel (reads X_synthetic.npy/y_synthetic.npy directly)
+python src/plot_scenario_examples.py --individual
