@@ -26,6 +26,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -938,16 +939,53 @@ def main() -> None:
         scen_results_dir.mkdir(parents=True, exist_ok=True)
         rows = []
 
+        # Freshness signature for THIS scenario's data -- computed once
+        # per scenario, not per checkpoint, since it only depends on
+        # scenario_meta.json's content, not which model is being
+        # evaluated. Any regeneration of the scenario (new downstream
+        # nodes, new realization parameters, anything) changes this
+        # file's content and therefore this hash.
+        meta_path = scen_dir / "scenario_meta.json"
+        scen_data_signature = hashlib.sha256(meta_path.read_bytes()).hexdigest()[:16] \
+            if meta_path.exists() else None
+
         for i, ckpt_dir in enumerate(all_ckpts):
             tag   = resolve_model_tag(ckpt_dir)
             rel   = ckpt_dir.relative_to(CKPT_ROOT)
             label = str(rel)
 
-            # Cache check
+            # Checkpoint freshness signature: mtime of best_model.pt (or
+            # whatever the actual checkpoint file is named under this
+            # dir) -- catches a checkpoint retrained in-place at the same
+            # path (e.g. st_gnn_soil_gate after the sat_threshold
+            # reparameterization fix earlier this session), which a
+            # scenario-data-only signature would miss entirely.
+            ckpt_files = list(ckpt_dir.glob("*.pt"))
+            ckpt_signature = max((f.stat().st_mtime for f in ckpt_files), default=None)
+
+            # Cache check -- automatic staleness detection takes priority
+            # over --force: a cache whose stored signatures don't match
+            # the CURRENT scenario data or checkpoint is invalid
+            # regardless of whether --force was passed, since --force is
+            # a manual "recompute anyway" override for a different
+            # situation (nothing changed, but re-evaluate regardless),
+            # not a substitute for detecting that something DID change.
             cache_path = scen_results_dir / f"{label.replace('/', '_')}.json"
+            cache_valid = False
             if cache_path.exists() and not args.force:
                 with open(cache_path) as f:
-                    row = json.load(f)
+                    cached = json.load(f)
+                cached_scen_sig = cached.get("_scen_data_signature")
+                cached_ckpt_sig = cached.get("_ckpt_signature")
+                if cached_scen_sig == scen_data_signature and cached_ckpt_sig == ckpt_signature:
+                    cache_valid = True
+                else:
+                    print(f"  [{i+1:3d}/{len(all_ckpts)}] {label} … "
+                          f"cache STALE (scenario data or checkpoint changed since "
+                          f"cached) -- re-evaluating regardless of --force")
+            if cache_valid:
+                row = {k: v for k, v in cached.items()
+                      if k not in ("_scen_data_signature", "_ckpt_signature")}
                 rows.append(row)
                 continue
             print(f"  [{i+1:3d}/{len(all_ckpts)}] {label} … ", end="", flush=True)
@@ -963,8 +1001,11 @@ def main() -> None:
                 rows.append(row)
                 all_rows.append(row)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_row = dict(row)
+                cache_row["_scen_data_signature"] = scen_data_signature
+                cache_row["_ckpt_signature"] = ckpt_signature
                 with open(cache_path, "w") as f:
-                    json.dump(row, f)
+                    json.dump(cache_row, f)
                 print(f"NSE={row.get('nse_syn', 'nan'):.4f}  "
                       f"RMSE={row.get('rmse_syn', 'nan'):.4f}")
             else:
