@@ -188,7 +188,7 @@ python src/scenarios/scenario_generator.py --scenario S5
 
 # 2. Re-evaluate S5 only (updates BOTH scenario_summary.csv and
 #    scenario_summary_per_realization.csv via the merge fix)
-python src/scenarios/scenario_evaluator.py --scenario S5 --all-models
+python src/scenarios/scenario_evaluator.py --scenario S5 --all-models --force
 
 # 3. Verify no duplicates in ALL THREE files (now checks per-realization too)
 python src/check_result_duplicates.py
