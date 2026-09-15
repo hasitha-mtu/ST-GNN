@@ -381,19 +381,27 @@ def select_base_windows(
                         sat_min: float = 0.60, sat_max: float = 0.92,
                         max_stage_frac: float = 0.40,
                         n_windows: int = 50,
-                        search_from_frac: float = 0.70,
+                        search_from_frac: float = 0.85,
                         t_stride: int = 48,
                         node_subset: Optional[list[int]] = None) -> list[int]:
     """
-    Select T_WINDOW-length base windows from the validation + test period.
+    Select T_WINDOW-length base windows from the test period only.
 
-    Searches from search_from_frac (default 0.70 = start of validation)
-    rather than the test period only. This is necessary because the Lee
-    catchment test period (Sep 2025–Mar 2026) covers Irish autumn/winter
-    when swvl2_sat_ratio is consistently 0.85–0.99, making it impossible
-    to find "moderately wet but not saturated" pre-event conditions.
-    The validation period (Apr–Sep 2025) includes transitional saturation
-    states (0.65–0.88) needed for scenarios like ConvectiveCell.
+    Searches from search_from_frac (default 0.85 = start of test),
+    restricted to test-only data so no stress-scenario base window
+    overlaps the validation period used for checkpoint selection
+    (lowest-validation-loss retained). Prior to this fix, most scenarios
+    searched from 0.70 (start of validation), which the original
+    docstring justified by the Lee catchment test period (Sep
+    2025-Mar 2026, Irish autumn/winter) being consistently saturated
+    (swvl2_sat_ratio 0.85-0.99), making transitional pre-event
+    conditions hard to find there alone. That justification traded a
+    real methodological concern (validation-period leakage into
+    checkpoint-selection-adjacent evaluation) for search-pool
+    convenience; restricting to test-only closes that gap directly, at
+    the cost of a narrower (but test-only, leakage-free) window pool
+    for scenarios whose saturation criteria only narrowly overlap the
+    test period's actual range.
 
     Criteria:
         - swvl2_sat_ratio (mean across nodes) within [sat_min, sat_max]
@@ -553,11 +561,14 @@ def generate_s1_convective_cell(X, y, mask, nd, ed, uh, lags, bankfull,
     # Select windows: moderate pre-event saturation (0.65–0.90)
     # S1 requires soil not too dry (enough moisture for rapid runoff)
     # and not fully saturated (so the synthetic pulse adds clear signal).
-    # Search from validation period start (Apr 2025) to access the
-    # spring/summer drying + early autumn rewetting conditions.
+    # Restricted to test-only data (search_from_frac=0.85) so no base
+    # window overlaps the validation period used for checkpoint
+    # selection; this narrows the usable window pool to the test
+    # period's own upper end of the saturation range, a real
+    # consequence of closing the validation-leakage gap.
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.55, sat_max=0.90, n_windows=n_windows,
-        search_from_frac=0.70)
+        search_from_frac=0.85)
 
     if not window_starts:
         print("  [skip] No valid base windows found for S1")
@@ -988,7 +999,7 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.60, sat_max=0.92,
         max_stage_frac=0.30, n_windows=n_windows,
-        search_from_frac=0.70, node_subset=release_relevant_nodes)
+        search_from_frac=0.85, node_subset=release_relevant_nodes)
 
     if not window_starts:
         print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
@@ -996,13 +1007,13 @@ def generate_s3_inniscarra_release(X, y, mask, nd, ed, uh, lags, bankfull,
         window_starts = select_base_windows(
             X, y, bankfull, sat_min=0.60, sat_max=0.92,
             max_stage_frac=0.40, n_windows=n_windows,
-            search_from_frac=0.70, node_subset=release_relevant_nodes)
+            search_from_frac=0.85, node_subset=release_relevant_nodes)
 
     if not window_starts:
         print("  [skip] No valid base windows found for S3 even after "
               "loosening max_stage_frac — check sat_min/sat_max against "
               "the actual swvl2_sat_ratio distribution in the "
-              "search_from_frac=0.70 region")
+              "search_from_frac=0.85 (test-only) region")
         return
 
     T_s   = T_WINDOW * len(window_starts) * n_realizations
@@ -1342,7 +1353,7 @@ def generate_s5_spatial_gradient(X, y, mask, nd, ed, uh, lags, bankfull,
 
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.55, sat_max=0.92, n_windows=n_windows,
-        search_from_frac=0.70)
+        search_from_frac=0.85)
 
     if not window_starts:
         print("  [skip] No valid base windows found for S5")
@@ -1562,7 +1573,7 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
     window_starts = select_base_windows(
         X, y, bankfull, sat_min=0.60, sat_max=0.92,
         max_stage_frac=0.30, n_windows=n_windows,
-        search_from_frac=0.70)
+        search_from_frac=0.85)
 
     if not window_starts:
         print("  [warn] No windows at max_stage_frac=0.30 — retrying with "
@@ -1570,7 +1581,7 @@ def generate_s6_channel_blockage(X, y, mask, nd, ed, uh, lags, bankfull,
         window_starts = select_base_windows(
             X, y, bankfull, sat_min=0.60, sat_max=0.92,
             max_stage_frac=0.40, n_windows=n_windows,
-            search_from_frac=0.70)
+            search_from_frac=0.85)
 
     if not window_starts:
         print("  [skip] No valid base windows found for S6 even after "
