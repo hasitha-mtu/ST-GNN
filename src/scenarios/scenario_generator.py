@@ -1183,15 +1183,30 @@ def generate_s4_sat_breakthrough(X, y, mask, nd, ed, uh, lags, bankfull,
 
     T = X.shape[0]; N = X.shape[1]
 
+    # Base windows restricted to validation-only (search_from_frac=0.70),
+    # not test-only: S4's saturation requirement (0.45-0.70, fallback
+    # 0.45-0.80) has ZERO overlap with the test period's documented
+    # range (0.85-0.99, see select_base_windows' docstring) -- a true
+    # mechanical impossibility, not just a thin pool, confirmed directly
+    # rather than assumed. Restricting to validation-only instead closes
+    # the more severe of the two leakage classes identified during
+    # review (training-period overlap, where the model's weights were
+    # directly fit via gradient descent) while preserving the scenario's
+    # literature-grounded saturation range (Meissl et al. 2023's ~0.72
+    # threshold), which a test-only restriction would force abandoning
+    # entirely. The residual validation-period overlap is the same
+    # category of limitation already disclosed for S1/S3/S5/S6 prior to
+    # this session's fix, and is disclosed the same way here rather than
+    # left implicit.
     window_starts_pool = select_base_windows(
         X, y, bankfull, sat_min=0.45, sat_max=0.70,
         max_stage_frac=0.20, n_windows=n_realizations * n_windows_per_realization,
-        search_from_frac=0.50)
+        search_from_frac=0.70)
     if not window_starts_pool:
         window_starts_pool = select_base_windows(
             X, y, bankfull, sat_min=0.45, sat_max=0.80,
             n_windows=n_realizations * n_windows_per_realization,
-            search_from_frac=0.40)
+            search_from_frac=0.70)
     if not window_starts_pool:
         print("  [skip] S4: no base windows found meeting antecedent-condition criteria")
         return
