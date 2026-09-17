@@ -230,6 +230,29 @@ def main():
         print(f"{csv_path} is empty -- no per-realization data yet.")
         return
 
+    # Resolve a short-form --scenario (e.g. "S5") to the full name actually
+    # stored in the data (e.g. "S5_SpatialGradient") -- same startswith-or-
+    # exact-match pattern scenario_evaluator.py's own --scenario flag
+    # already uses. Without this, an exact-match filter against a short
+    # form never matches anything and silently returns zero rows/models
+    # rather than an error, which is easy to mistake for a data problem.
+    if args.scenario:
+        available = df["scenario"].unique().tolist()
+        matches = [s for s in available if s.startswith(args.scenario) or s == args.scenario]
+        if len(matches) == 1:
+            args.scenario = matches[0]
+        elif len(matches) > 1:
+            print(f"'{args.scenario}' matches multiple scenarios in the data: "
+                  f"{matches} -- use the full name to disambiguate.")
+            return
+        elif not args.all:
+            # --all doesn't use args.scenario for filtering (it iterates
+            # every scenario already present in the data), so an unresolved
+            # short form only matters for the single-scenario path below.
+            print(f"'{args.scenario}' does not match any scenario in the data. "
+                  f"Available: {available}")
+            return
+
     diff_key = "median_rank_diff_a_minus_b" if args.rank_based else "median_diff_a_minus_b"
     diff_label = "median_rank_diff" if args.rank_based else "median_diff"
     out_rows = []   # accumulated for --out-csv, regardless of --all vs single-scenario mode
