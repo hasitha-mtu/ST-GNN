@@ -90,18 +90,16 @@ MAX_EPOCHS = 300
 # weight → +dynamic topology → +hard gate (dfc_gnn) → all three combined
 # (dfc_gnn_unified)).
 MODEL_REGISTRY = [
-    # ("gru",              _train_gru),
-    # ("lstm",             _train_lstm),
-    # ("ealstm",           _train_ealstm),
-    # ("st_gnn",           _train_st_gnn),
-    # ("st_gnn_dyn_edge",  _mod_dyn.train),
-    # ("st_gnn_hand_edge", _mod_hand.train),
+    ("gru",              _train_gru),
+    ("lstm",             _train_lstm),
+    ("ealstm",           _train_ealstm),
+    ("st_gnn",           _train_st_gnn),
+    ("st_gnn_dyn_edge",  _mod_dyn.train),
+    ("st_gnn_hand_edge", _mod_hand.train),
     ("st_gnn_soil_gate", _mod_soil.train),  # anticipatory SM gate
-    # ("st_gnn_backwater_edge", _mod_backwater.train),  # gated bridge/
-                                             # culvert backwater edges —
-                                             # S6 diagnostic companion
-    # ("dfc_gnn",          _mod_dfc.train),
-    # ("dfc_gnn_unified",  _train_dfc_unified),
+    ("st_gnn_backwater_edge", _mod_backwater.train),
+    ("dfc_gnn",          _mod_dfc.train),
+    ("dfc_gnn_unified",  _train_dfc_unified),
 ]
 
 
