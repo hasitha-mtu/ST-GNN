@@ -890,16 +890,19 @@ def main() -> None:
     if args.all_scenarios:
         scen_names = SCENARIOS
     elif args.scenario:
-        # Accept short form (S1) or full name
-        scen_names = [s for s in SCENARIOS
-                      if s.startswith(args.scenario) or
-                      s == args.scenario]
+        scen_names = [x.strip() for x in args.scenario.split(',')]
+        # # Accept short form (S1) or full name
+        # scen_names = [s for s in SCENARIOS
+        #               if s.startswith(args.scenario) or
+        #               s == args.scenario]
         if not scen_names:
             print(f"Unknown scenario '{args.scenario}'. "
                   f"Available: {SCENARIOS}")
             return
     else:
         parser.error("Specify --all-scenarios or --scenario NAME")
+
+    print(f'scen_names: {scen_names}')
 
     # Load bankfull thresholds
     with open(GRAPH_DIR / "bankfull_thresholds.json") as f:
