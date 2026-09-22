@@ -121,7 +121,16 @@ def compute_tc_kirpich(nodes_df: pd.DataFrame,
         slope = head_drop / L_m
         slope = max(slope, 0.0002)         # floor for flat reaches
 
-        tc = 0.0195 * (L_m ** 0.77) * (slope ** -0.385) / 3600.0
+        # BUGFIX (2026-09-22): the metric Kirpich formula with coefficient
+        # 0.0195 and L in metres outputs T_c in MINUTES, not seconds --
+        # confirmed against the Texas DOT Hydraulic Design Manual (K=0.0195
+        # for SI units gives "time of concentration, in minutes"). This was
+        # previously divided by 3600.0 as if the raw output were seconds,
+        # which understated T_c by ~60x and drove the large majority of
+        # non-tidal nodes onto the 0.25h floor below instead of their true
+        # (often multi-hour) response time. Divide by 60.0 to convert
+        # minutes -> hours instead.
+        tc = 0.0195 * (L_m ** 0.77) * (slope ** -0.385) / 60.0
         tc = float(np.clip(tc, 0.25, 8.0))  # 15 min to 8 hr bounds
         tc_map[idx] = tc
 
