@@ -76,6 +76,12 @@ GRU_LAYERS   = 2
 DROPOUT      = 0.1
 LAMBDA_FLOOD = 0.1   # weight of auxiliary flood-flag BCE loss
 TAU_GATE     = 5.0   # elevation gate softness (m) — transitions over ±10m
+# REVISION AUDIT (A23): train_models_exp1.py sets USE_SAR_EDGE = False, but
+# the submitted script never defined or read this flag and build_dfc_gnn()
+# defaults to use_sar_edge=True, so the submitted DFC-GNN used the SAR
+# wetness similarity as a 5th edge feature whenever edge_features.npz
+# contained it (it did). The flag is now honoured and recorded.
+USE_SAR_EDGE = False
 
 BATCH_SIZE   = 32
 LR           = 5e-4
@@ -369,7 +375,7 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
             f"edge_features.npz not found at {ef_path}.\n"
             f"Run: python src/data/compute_edge_features.py"
         )
-    ef = load_edge_features(str(ef_path), device=str(DEVICE))
+    ef = load_edge_features(str(ef_path), device=str(DEVICE), use_sar_edge=USE_SAR_EDGE)
     _feat_names = ["river_dist", "elev_diff", "travel_time", "hand_diff"]
     if ef["edge_attr"].shape[1] == 5:
         _feat_names.append("sar_wetness")
@@ -426,6 +432,7 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
         dropout      = DROPOUT,
         lambda_flood = LAMBDA_FLOOD,
         device       = str(DEVICE),
+        use_sar_edge = USE_SAR_EDGE,
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -524,6 +531,7 @@ def train(logger, seed: int, t_in: int, t_out: int, max_epochs: int, base_dir = 
                     "batch_size":    BATCH_SIZE,
                     "lr":            LR,
                     "n_edges":       ef["n_edges"],
+                    "use_sar_edge":  USE_SAR_EDGE,
                 },
             }, ckpt_dir / "best_model.pt")
 

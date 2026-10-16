@@ -60,6 +60,14 @@ GAP_FILL_STEPS = 6          # forward-fill limit (6 × 15 min = 90 min)
 START_DATE     = "2023-01-01"   # ← was 2010-01-01
 END_DATE       = "2026-03-25"   # ← extend to yesterday
 
+# Optional emulation of operational soil-moisture availability (hours).
+# 0 = retrospective reanalysis (as in the submitted manuscript). ERA5-Land
+# is published with ~5 days latency, so SM_AVAILABILITY_LAG_HOURS = 120
+# gives an "operationally available" variant (manuscript Section 5.5).
+SM_AVAILABILITY_LAG_HOURS = 0
+TRAIN_FRAC, VAL_FRAC = 0.70, 0.15     # must match utils/gpu_sampler defaults
+DATUM_CFG = BASE_DIR / "config/station_datums.yaml"
+
 # Dynamic feature names — must match X tensor column order exactly
 GAUGE_FEATURES = [
     "stage_anomaly",       # [0]
@@ -83,6 +91,8 @@ import sys
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+from src.utils.datum import stage_reference, normalise_stage
+from src.utils.train_utils import get_split_boundary
 from src.data.soil_moisture_features import (compute_sm_features,
                                              build_node_sm_lookup,
                                              extract_node_sm_features,
@@ -154,7 +164,9 @@ def _load_csv_series(path: Path, value_hints: list[str], resample_how: str, freq
     s = s[~s.index.duplicated(keep="first")]
 
     if "level" in " ".join(value_hints):
-        s = s.where(s >= 0)
+        # Audit H1: levels are m OD Malin; tidal gauges are negative at
+        # low tide. Only drop error values.
+        s = s.where(s > -10)
 
     if resample_how == "mean":
         return s.resample(freq).mean()
@@ -191,6 +203,12 @@ def load_rainfall(ref: str, freq: str = TIMESTEP) -> pd.Series | None:
 def load_discharge(ref: str, freq: str = TIMESTEP) -> pd.Series | None:
     path = DISCHARGE_DIR / f"discharge_{ref}.csv"
     return _load_csv_series(path, ["value", "discharge", "flow", "q"], "mean", freq)
+
+
+def datum_cfg_station(ref: str) -> dict:
+    """Per-station vertical-datum settings (config/station_datums.yaml)."""
+    from src.data.compute_static_attributes import load_datum_config, station_cfg
+    return station_cfg(load_datum_config(DATUM_CFG), ref)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -240,6 +258,8 @@ def compute_node_features(
     discharge:    pd.Series | None,
     rainfall:     pd.Series | None,
     common_index: pd.DatetimeIndex,
+    stage_low:    float | None = None,
+    stage_rng:    float | None = None,
 ) -> pd.DataFrame:
     """
     Compute all 5 dynamic features for one node aligned to common_index.
@@ -265,11 +285,16 @@ def compute_node_features(
     stage_anomaly = wl - rolling_mean
 
     # ── [1] normalized_stage ─────────────────────────────────────────────
-    # Position within [gauge_datum, p90] range.
-    # Tidal / reservoir stations may have p90 ≈ gauge_datum — protect denom.
-    denom = p90 - gauge_datum if (p90 - gauge_datum) > 0.01 else 1.0
-    normalized_stage = (wl - gauge_datum) / denom
-    normalized_stage = normalized_stage.clip(-2.0, 5.0)  # cap sensor noise
+    # Position within [stage_ref_low, p90]. REVISION AUDIT: the reference
+    # pair now comes from utils.datum.stage_reference(), the same function
+    # every gate uses for the inverse H = low + norm * range, so the two
+    # are exact inverses for every node. stage_ref_low == gauge_datum
+    # except for local-zero datums (reservoir headraces).
+    if stage_low is None or stage_rng is None:
+        stage_low = gauge_datum
+        stage_rng = p90 - gauge_datum if (p90 - gauge_datum) > 0.05 else 1.0
+    normalized_stage = pd.Series(
+        normalise_stage(wl.values, stage_low, stage_rng), index=wl.index)
 
     # ── [2] dh_dt ────────────────────────────────────────────────────────
     # Rate of change in m/hr.  15-min diff × 4 → hourly rate.
@@ -376,7 +401,17 @@ def build_dataset(
     F_gauge = len(GAUGE_FEATURES)
     F       = len(DYNAMIC_FEATURES)
     X = np.full((T, N, F_gauge), np.nan, dtype=np.float32)
+    stage_abs = np.full((T, N), np.nan, dtype=np.float32)   # absolute stage (m OD)
+    raw_wl_cache: dict[str, pd.Series] = {}
     coverage_stats: list[dict] = []
+    ref_low, ref_rng = stage_reference(nodes_df)
+    t1, _t2 = get_split_boundary(T, TRAIN_FRAC, VAL_FRAC)
+    train_end_ts = common_index[t1]
+    logger.info("  Training boundary (exclusive): %s", train_end_ts)
+    if "stage_ref_low_m" not in nodes_df.columns:
+        logger.warning("  nodes.csv has no train-only static attributes yet - "
+                       "run src/data/compute_static_attributes.py first "
+                       "(p90 is otherwise a full-record statistic).")
 
     for i, row in nodes_df.iterrows():
         ref  = str(row["ref"])
@@ -391,6 +426,11 @@ def build_dataset(
             continue
 
         wl = wl.loc[start_date:end_date]
+        # REVISION AUDIT: explicit vertical-datum conversion of the raw
+        # reading (config/station_datums.yaml). 0.0 for every station
+        # unless verified otherwise.
+        wl = wl + float(datum_cfg_station(ref)["raw_offset_to_malin_m"])
+        raw_wl_cache[ref] = wl
         wl_coverage = float(wl.notna().sum()) / T
 
         # ── Discharge ─────────────────────────────────────────────────────
@@ -414,7 +454,10 @@ def build_dataset(
             discharge=discharge,
             rainfall=rainfall,
             common_index=common_index,
+            stage_low=float(ref_low[i]),
+            stage_rng=float(ref_rng[i]),
         )
+        stage_abs[:, i] = wl.reindex(common_index).values.astype(np.float32)
 
         X[:, i, :] = feat_df.values.astype(np.float32)
 
@@ -434,13 +477,18 @@ def build_dataset(
 # ── 5a. Soil moisture features ─────────────────────────────────────────
     if USE_SOIL_MOISTURE:
         logger.info("Computing ERA5-Land soil moisture features ...")
-        ds_sm = compute_sm_features(str(ERA5_SM_FILE), layers=SM_LAYERS)
+        # REVISION AUDIT: (1) the unguarded compute_sm_features() call that
+        # used to sit here, outside the try block, is removed (it raised
+        # before the friendly missing-file message); (2) the anomaly
+        # climatology is built from training timestamps only; (3) temporal
+        # alignment is backward-only (soil_moisture_features.causal_align).
         try:
             if not ERA5_SM_FILE.exists():
                 msg = "ERA5-Land file not found: " + str(ERA5_SM_FILE)
                 msg += " -- Run download_era5_land_sm() or set USE_SOIL_MOISTURE=False."
                 raise FileNotFoundError(msg)
-            ds_sm = compute_sm_features(str(ERA5_SM_FILE), layers=SM_LAYERS)
+            ds_sm = compute_sm_features(str(ERA5_SM_FILE), layers=SM_LAYERS,
+                                        climatology_end=train_end_ts)
             logger.info("  ERA5-Land features: %s", list(ds_sm.data_vars))
             if "lat" not in nodes_df.columns or "lon" not in nodes_df.columns:
                 raise KeyError("nodes.csv needs lat/lon for ERA5 spatial matching.")
@@ -456,6 +504,13 @@ def build_dataset(
             )
             logger.info("  SM matrix: %s  NaN: %.4f",
                         sm_matrix.shape, float(np.isnan(sm_matrix).mean()))
+            if SM_AVAILABILITY_LAG_HOURS:
+                lag_steps = int(SM_AVAILABILITY_LAG_HOURS * 4)
+                sm_matrix = np.concatenate(
+                    [np.full_like(sm_matrix[:lag_steps], np.nan),
+                     sm_matrix[:-lag_steps]], axis=0)
+                logger.info("  SM features lagged by %d h (operational emulation)",
+                            SM_AVAILABILITY_LAG_HOURS)
             X = append_sm_to_node_features(X, sm_matrix)
             logger.info("  Features: %d gauge + %d SM = %d total",
                         F_gauge, sm_matrix.shape[2], X.shape[2])
@@ -496,19 +551,29 @@ def build_dataset(
     # ── 8. Save ───────────────────────────────────────────────────────────
     node_refs = nodes_df["ref"].astype(str).tolist()
 
-    valid_mask = np.zeros((T, N), dtype=np.float32)
-
+    # REVISION AUDIT — mask alignment. y[t] = a(t+1), but the original
+    # valid_mask[t] flagged whether the OBSERVATION AT t was real, and the
+    # samplers index y and the mask with the same row. Every target was
+    # therefore validated by the previous time step's flag. We now save:
+    #   input_valid_mask.npy [T, N]  observation at t is real
+    #   valid_mask.npy       [T, N]  observation at t+1 is real (aligned to y)
+    # The samplers additionally require the last INPUT observation (the
+    # anchor of the delta target) to be real; see utils/gpu_sampler.py.
+    input_valid = np.zeros((T, N), dtype=np.float32)
     for i, row in nodes_df.iterrows():
         ref = str(row["ref"])
-        wl = load_water_level(ref)
+        wl = raw_wl_cache.get(ref)
         if wl is not None:
-            wl_aligned = wl.reindex(common_index)
-            valid_mask[:, i] = wl_aligned.notna().astype(np.float32)
+            input_valid[:, i] = wl.reindex(common_index).notna().astype(np.float32)
+    valid_mask = np.zeros_like(input_valid)
+    valid_mask[:-HORIZON] = input_valid[HORIZON:]
 
     if save:
         np.save(OUT_DIR / "X.npy",          X)
         np.save(OUT_DIR / "y.npy",          y)
         np.save(OUT_DIR / "valid_mask.npy", valid_mask)
+        np.save(OUT_DIR / "input_valid_mask.npy", input_valid)
+        np.save(OUT_DIR / "stage_abs.npy", stage_abs)
         np.save(OUT_DIR / "timestamps.npy", np.array(common_index, dtype="datetime64[ns]"))
 
         # ── timestamps.csv ────────────────────────────────────────
@@ -524,7 +589,14 @@ def build_dataset(
         # training script — use the .npy files for model training.
         save_dataset_csv(X, y, valid_mask, common_index, node_refs, OUT_DIR)
 
-        meta = {"start_date": str(common_index[0]), "end_date": str(common_index[-1]), "timestep": TIMESTEP,
+        meta = {"mask_convention": "valid_mask[t] = obs at t+1 is real (aligned to y); "
+                                   "input_valid_mask[t] = obs at t is real",
+                "train_end_exclusive": str(train_end_ts),
+                "sm_alignment": "backward-only ffill, tolerance 1h",
+                "sm_climatology": "training period only",
+                "sm_availability_lag_hours": SM_AVAILABILITY_LAG_HOURS,
+                "stage_reference": "utils.datum.stage_reference",
+                "start_date": str(common_index[0]), "end_date": str(common_index[-1]), "timestep": TIMESTEP,
                 "n_timesteps": int(T), "n_nodes": int(N), "n_features": int(X.shape[2]), "horizon_steps": HORIZON,
                 "soil_moisture_active": USE_SOIL_MOISTURE and X.shape[2] > len(GAUGE_FEATURES),
                 "sm_layers": SM_LAYERS if USE_SOIL_MOISTURE else [],

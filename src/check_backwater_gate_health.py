@@ -59,6 +59,8 @@ def load_gate_state(ckpt_path: Path):
     sd = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
     if any("_orig_mod." in k for k in sd):
         sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    if "gate_sharpness_raw" in sd:                 # revision: beta = softplus(raw)
+        sd = dict(sd, gate_sharpness=torch.nn.functional.softplus(sd["gate_sharpness_raw"]))
     if "gate_sharpness" not in sd or "bw_gate_reference" not in sd:
         return None
     return {

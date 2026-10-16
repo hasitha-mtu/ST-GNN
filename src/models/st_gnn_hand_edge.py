@@ -98,7 +98,10 @@ Zheng, X. et al. (2018). Enhancing HAND flood inundation mapping. J. Hydrol.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+try:
+    from .common import GATStack2, batched_graph, positive_param, log_conductance, as_node_ref
+except ImportError:          # run as a script
+    from models.common import GATStack2, batched_graph, positive_param, log_conductance, as_node_ref
 import numpy as np
 
 
@@ -167,6 +170,7 @@ class STGNNHANDEdge(nn.Module):
         discharge_idx:       int   = 3,
         discharge_ref:       float = 1.0,
         activation_sharpness: float = 5.0,
+        node_abs_valid:      torch.Tensor | None = None,
     ):
         super().__init__()
         self.hidden         = hidden
@@ -174,7 +178,8 @@ class STGNNHANDEdge(nn.Module):
         self.sar_emb_dim    = sar_emb_dim
         self.use_sar        = (sar_emb_dim > 0)
         self.discharge_idx  = discharge_idx
-        self.discharge_ref  = discharge_ref
+        # REVISION AUDIT (M2): per-node Q_ref,i buffer (was a Python scalar)
+        self.register_buffer("discharge_ref", as_node_ref(discharge_ref))
 
         # ── Precomputed HAND edge tensors (registered as buffers so they
         #    move to GPU with .to(device) and are saved in checkpoints) ──
@@ -200,12 +205,21 @@ class STGNNHANDEdge(nn.Module):
         # absolute water-surface elevation from normalised_stage.
         self.register_buffer("gauge_datum", gauge_datum.float())
         self.register_buffer("stage_range",  stage_range.float())
+        # REVISION AUDIT: nodes whose reconstructed H is NOT on the same
+        # absolute datum as the DEM (unverified local-zero headraces) are
+        # excluded from the H-vs-z_saddle comparison: their H is replaced
+        # by -inf inside max(H_i, H_j), so an edge is gated by its valid
+        # endpoint only, and is closed if neither endpoint is valid.
+        if node_abs_valid is None:
+            node_abs_valid = torch.ones_like(gauge_datum, dtype=torch.bool)
+        self.register_buffer("node_abs_valid", node_abs_valid.bool())
 
         # ── Learnable parameters ──────────────────────────────────────
-        self.conductance_scale    = nn.Parameter(torch.tensor(3.0))
-        self.activation_sharpness = nn.Parameter(
-            torch.tensor(float(activation_sharpness))
-        )
+        # REVISION AUDIT (M5): lambda, alpha > 0 via softplus (an
+        # unconstrained alpha < 0 would open HAND edges when the water
+        # surface is BELOW the saddle).
+        self.conductance_scale_raw    = positive_param(3.0)
+        self.activation_sharpness_raw = positive_param(float(activation_sharpness))
 
         # ── Input projection ──────────────────────────────────────────
         self.input_proj = nn.Sequential(
@@ -233,21 +247,8 @@ class STGNNHANDEdge(nn.Module):
             )
 
         # ── GATConv — f_edge=5 handles both edge classes ──────────────
-        self.gat1 = GATConv(hidden, hidden, heads=gat_heads, concat=True,
-                            dropout=dropout, edge_dim=f_edge)
-        self.norm1 = nn.LayerNorm(hidden * gat_heads)
-        self.res1  = nn.Linear(hidden, hidden * gat_heads, bias=False)
-
-        self.gat2 = GATConv(hidden * gat_heads, hidden, heads=gat_heads,
-                            concat=False, dropout=dropout, edge_dim=f_edge)
-        self.norm2 = nn.LayerNorm(hidden)
-        self.res2  = nn.Linear(hidden * gat_heads, hidden, bias=False)
-
-        self.gat3 = GATConv(hidden, hidden // 2, heads=2, concat=False,
-                            dropout=dropout, edge_dim=f_edge)
-        self.norm3 = nn.LayerNorm(hidden // 2)
-        self.res3  = nn.Linear(hidden, hidden // 2, bias=False)
-
+        # Two-layer GAT stack (manuscript Section 3.5; M6)
+        self.gat_stack = GATStack2(hidden, gat_heads, f_edge, dropout)
         # ── HAND message gate (Fix 2.1) ──────────────────────────────
         # Linear transform applied to source node features for HAND edges,
         # followed by per-edge multiplication with stage-based activation.
@@ -256,9 +257,9 @@ class STGNNHANDEdge(nn.Module):
         # hidden → hidden (same dim as GATConv layer 1 input)
         self.hand_msg_linear = nn.Linear(hidden, hidden, bias=False)
         self.hand_msg_norm   = nn.LayerNorm(hidden)
-        # Learnable scalar controlling HAND message magnitude vs river msgs
-        # Initialised at 0 so training begins without HAND contribution
-        # and ramps up only when activation provides reliable signal.
+        # Learnable scalar controlling HAND message magnitude vs river msgs,
+        # used as sigmoid(hand_scale): initialised at 0, i.e. a weight of
+        # 0.5 at the start of training (not zero, as previously stated).
         self.hand_scale = nn.Parameter(torch.zeros(1))
 
         # Projection: hand_agg comes out of hand_msg_norm at [B*N, hidden=64].
@@ -276,6 +277,14 @@ class STGNNHANDEdge(nn.Module):
         )
 
     # ──────────────────────────────────────────────────────────────────
+    @property
+    def conductance_scale(self) -> torch.Tensor:
+        return F.softplus(self.conductance_scale_raw)
+
+    @property
+    def activation_sharpness(self) -> torch.Tensor:
+        return F.softplus(self.activation_sharpness_raw)
+
     def _river_edge_attr(
         self,
         x_last:    torch.Tensor,   # [B, N, F]
@@ -289,11 +298,13 @@ class STGNNHANDEdge(nn.Module):
         B = x_last.shape[0]
         src = edge_index[0]
         Q_src = x_last[:, src, self.discharge_idx]          # [B, E]
-        conductance = torch.sigmoid(
-            self.conductance_scale * (Q_src / self.discharge_ref - 1.0)
-        )
+        Q_ref_src = (self.discharge_ref[src] if self.discharge_ref.shape[0] > 1
+                     else self.discharge_ref)
+        # REVISION AUDIT (M3): log-transformed, as in DynEdge / PC-DFC-GNN
+        # (Eq. 1: "the log-transformed conductance is appended")
+        log_cond = log_conductance(Q_src, Q_ref_src, self.conductance_scale)
         static = edge_attr.unsqueeze(0).expand(B, -1, -1)  # [B, E, 4]
-        return torch.cat([static, conductance.unsqueeze(-1)], dim=-1)
+        return torch.cat([static, log_cond.unsqueeze(-1)], dim=-1)
 
     # ──────────────────────────────────────────────────────────────────
     def _hand_edge_attr(
@@ -333,6 +344,11 @@ class STGNNHANDEdge(nn.Module):
                  + norm_stage_src * self.stage_range[self.hand_src].unsqueeze(0))
         H_dst = (self.gauge_datum[self.hand_dst].unsqueeze(0)
                  + norm_stage_dst * self.stage_range[self.hand_dst].unsqueeze(0))
+
+        # Exclude endpoints whose absolute datum is not verified
+        very_low = torch.full_like(H_src, -1.0e4)
+        H_src = torch.where(self.node_abs_valid[self.hand_src].unsqueeze(0), H_src, very_low)
+        H_dst = torch.where(self.node_abs_valid[self.hand_dst].unsqueeze(0), H_dst, very_low)
 
         # Activation based on the higher of the two endpoints' water surface
         max_H      = torch.maximum(H_src, H_dst)                   # [B, E_hand]
@@ -378,10 +394,7 @@ class STGNNHANDEdge(nn.Module):
         E_river = edge_index.shape[1]
         river_ea = self._river_edge_attr(x_last, edge_index, edge_attr)  # [B, E, 5]
 
-        offsets = torch.arange(B, device=edge_index.device) * N
-        src_b = (edge_index[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        dst_b = (edge_index[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        batched_ei = torch.stack([src_b, dst_b], dim=0)   # [2, B×E_river]
+        batched_ei = batched_graph(edge_index, B, N)       # [2, B×E_river]
         batched_ea = river_ea.reshape(B * E_river, 5)      # [B×E_river, 5]
 
         return batched_ei, batched_ea
@@ -430,7 +443,7 @@ class STGNNHANDEdge(nn.Module):
         # ── Step 5: GATConv on river graph ─────────────────────────────
         h_flat = h.reshape(B * N, self.hidden)
 
-        h1_river = self.gat1(h_flat, batched_ei, batched_ea)  # [B*N, hidden*heads]
+        h1_river = self.gat_stack.layer1(h_flat, batched_ei, batched_ea)  # [B*N, hidden*heads]
 
         # ── Step 5b: activation-gated HAND messages ────────────────────
         # For each HAND edge (src→dst), compute a linear transform of the
@@ -466,15 +479,8 @@ class STGNNHANDEdge(nn.Module):
         h1_combined = (h1_river
                        + torch.sigmoid(self.hand_scale)
                        * self.hand_proj(hand_agg))
-        h1 = F.elu(self.norm1(h1_combined + self.res1(h_flat)))
-
-        h2 = F.elu(self.norm2(
-            self.gat2(h1,    batched_ei, batched_ea) + self.res2(h1)
-        ))
-        h3 = F.elu(self.norm3(
-            self.gat3(h2,    batched_ei, batched_ea) + self.res3(h2)
-        ))
-
+        h1 = self.gat_stack.finish1(h1_combined, h_flat)
+        h3 = self.gat_stack.layer2(h1, batched_ei, batched_ea)   # [B*N, hidden//2]
         h_graph = h3.reshape(B, N, self.hidden // 2)
         delta   = self.head(h_graph)
         return delta.permute(0, 2, 1)                              # [B, T_out, N]

@@ -158,11 +158,11 @@ def load_backwater_edges(logger, graph_dir: Path, nodes_df: pd.DataFrame,
     bw_gate_reference = torch.from_numpy(
         bw["gate_reference_m"].astype(np.float32)).to(device)
 
-    gauge_datum = torch.from_numpy(
-        nodes_df["gauge_datum_mOSGM15"].values.astype(np.float32)).to(device)
-    stage_range = torch.from_numpy(
-        (nodes_df["p90_mAOD"] - nodes_df["gauge_datum_mOSGM15"]).values
-        .astype(np.float32)).to(device)
+    # REVISION AUDIT: shared stage reference (utils.datum) — exact inverse
+    # of build_dataset's normalisation for every node.
+    from src.utils.datum import torch_reference
+    gauge_datum, stage_range, _ = torch_reference(nodes_df)
+    gauge_datum, stage_range = gauge_datum.to(device), stage_range.to(device)
 
     logger.info("  Backwater edges: %d  (bridges: %s)",
                len(bw_src), list(bw["bridge_name"]))
@@ -454,7 +454,7 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
     logger.info("  Saved per_node_metrics.csv")
 
     # ── Aggregate + per-step metrics ───────────────────────────────────
-    with open(ckpt_dir / "test_metrics.json", "w") as f:
+    with open(ckpt_dir / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump({
             **test_metrics,
             "mbe":     round(mbe_global, 6),
@@ -476,7 +476,7 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
             h_dict["persist_nse"] = float("nan")
             h_dict["skill"]       = float("nan")
 
-    with open(ckpt_dir / "per_step_metrics.json", "w") as f:
+    with open(ckpt_dir / "per_step_metrics.json", "w", encoding="utf-8") as f:
         json.dump(per_step, f, indent=2)
     logger.info("  Saved per_step_metrics.json (%d steps)", len(per_step))
 

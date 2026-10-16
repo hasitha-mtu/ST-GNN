@@ -109,6 +109,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+try:
+    from .common import positive_param
+except ImportError:
+    from models.common import positive_param
+
+N_ATTN_LAYERS = 3
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -188,11 +194,21 @@ class UnifiedPhysicalGATConv(nn.Module):
         hand_activation: Tensor,   # [B, E]         ∈ (0,1]; ≡1 for river edges
     ) -> Tensor:                   # [B, N, d_out]
         B, N, _ = h.shape
-        E = edge_index.shape[1]
         H, D = self.n_heads, self.d_head
 
-        src_idx = edge_index[0]
-        dst_idx = edge_index[1]
+        # REVISION AUDIT (M9): always-open self-loops (zero features, both
+        # gates = 1). Without them a node whose incoming edges are ALL gated
+        # (a headwater gauge whose only incoming edge is a HAND edge, or a
+        # gauge whose incoming edges are all uphill) gets softmax weight 1 on
+        # those edges whatever the gate value, i.e. an "inactive" HAND edge
+        # passed its full message.
+        loops = torch.arange(N, device=h.device)
+        E0 = edge_index.shape[1]
+        src_idx = torch.cat([edge_index[0], loops])
+        dst_idx = torch.cat([edge_index[1], loops])
+        edge_attr = torch.cat([edge_attr, edge_attr.new_zeros(B, N, edge_attr.shape[-1])], dim=1)
+        hand_activation = torch.cat([hand_activation, hand_activation.new_ones(B, N)], dim=1)
+        E = E0 + N
 
         # ── Linear projections ─────────────────────────────────────────
         q = self.W_q(h).view(B, N, H, D)
@@ -214,8 +230,9 @@ class UnifiedPhysicalGATConv(nn.Module):
         # ── Hard elevation gate (always active — Class A + B) ──────────
         # g_ij ≈ 1 when elev_src > elev_dst (downhill, physically possible)
         # g_ij ≈ 0 when elev_src < elev_dst (uphill, gated out)
-        elev_diff = node_elev[src_idx] - node_elev[dst_idx]        # [E]
-        elev_gate = torch.sigmoid(elev_diff / self.tau_gate)        # [E]
+        elev_diff = node_elev[edge_index[0]] - node_elev[edge_index[1]]   # [E0]
+        elev_gate = torch.sigmoid(elev_diff / self.tau_gate)
+        elev_gate = torch.cat([elev_gate, elev_gate.new_ones(N)])          # [E]
         score = score + torch.log(elev_gate + 1e-6).unsqueeze(0).unsqueeze(-1)
 
         # ── HAND activation gate (dynamic topology) ─────────────────────
@@ -341,6 +358,7 @@ class DFCGNNUnified(nn.Module):
         discharge_idx:        int   = 3,
         discharge_ref               = 1.0,
         activation_sharpness: float = 5.0,
+        node_abs_valid:       Tensor | None = None,
     ):
         super().__init__()
         assert edge_index is not None and edge_attr_static is not None, \
@@ -394,6 +412,11 @@ class DFCGNNUnified(nn.Module):
         self.register_buffer("z_saddle", z_saddle.float())
         self.register_buffer("gauge_datum", gauge_datum.float())
         self.register_buffer("stage_range", stage_range.float())
+        # REVISION AUDIT: see STGNNHANDEdge — unverified-datum endpoints are
+        # excluded from the H-vs-z_saddle comparison.
+        if node_abs_valid is None:
+            node_abs_valid = torch.ones_like(gauge_datum, dtype=torch.bool)
+        self.register_buffer("node_abs_valid", node_abs_valid.bool())
 
         # ── Combined edge_index, built once (static structure) ─────────
         self.n_river = edge_index.shape[1]
@@ -404,9 +427,9 @@ class DFCGNNUnified(nn.Module):
                               torch.stack([combined_src, combined_dst]))
 
         # ── Learnable physical parameters ───────────────────────────────
-        self.conductance_scale = nn.Parameter(torch.tensor(3.0))
-        self.activation_sharpness = nn.Parameter(
-            torch.tensor(float(activation_sharpness)))
+        # REVISION AUDIT (M5): lambda, alpha > 0 (softplus)
+        self.conductance_scale_raw    = positive_param(3.0)
+        self.activation_sharpness_raw = positive_param(float(activation_sharpness))
 
         # ── 1. Input projection (dynamic features only, no node_attr) ──
         self.input_proj = nn.Linear(f_dyn, d_model)
@@ -421,20 +444,20 @@ class DFCGNNUnified(nn.Module):
         )
 
         # ── 3. Unified physically-biased GAT layer ──────────────────────
-        self.gat = UnifiedPhysicalGATConv(
-            d_in        = d_model,
-            d_out       = d_model,
-            n_heads     = n_heads,
-            n_edge_feat = 5,
-            dropout     = dropout,
-            tau_gate    = tau_gate,
-        )
-
-        self.norm_gru = nn.LayerNorm(d_model)
-        self.norm_gat = nn.LayerNorm(d_model)
-        self.dropout  = nn.Dropout(dropout)
-
-        # ── 4. Stage prediction head (primary task) ─────────────────────
+        # REVISION AUDIT (M7): three stacked attention layers with residual +
+        # LayerNorm (Section 3.6); the submitted model had one.
+        self.gats = nn.ModuleList([
+            UnifiedPhysicalGATConv(
+                d_in        = d_model,
+                d_out       = d_model,
+                n_heads     = n_heads,
+                n_edge_feat = 5,
+                dropout     = dropout,
+                tau_gate    = tau_gate,
+            ) for _ in range(N_ATTN_LAYERS)])
+        self.norm_gru  = nn.LayerNorm(d_model)
+        self.norms_gat = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(N_ATTN_LAYERS)])
+        self.dropout   = nn.Dropout(dropout)
         self.stage_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -466,6 +489,14 @@ class DFCGNNUnified(nn.Module):
                         nn.init.zeros_(p)
 
     # ──────────────────────────────────────────────────────────────────
+    @property
+    def conductance_scale(self) -> Tensor:
+        return F.softplus(self.conductance_scale_raw)
+
+    @property
+    def activation_sharpness(self) -> Tensor:
+        return F.softplus(self.activation_sharpness_raw)
+
     def _build_edge_attr_and_activation(self, x_last: Tensor):
         """
         x_last : [B, N, F_dyn]  last observed timestep
@@ -514,6 +545,9 @@ class DFCGNNUnified(nn.Module):
                  + norm_stage_src * self.stage_range[self.hand_src].unsqueeze(0))
         H_dst = (self.gauge_datum[self.hand_dst].unsqueeze(0)
                  + norm_stage_dst * self.stage_range[self.hand_dst].unsqueeze(0))
+        very_low = torch.full_like(H_src, -1.0e4)
+        H_src = torch.where(self.node_abs_valid[self.hand_src].unsqueeze(0), H_src, very_low)
+        H_dst = torch.where(self.node_abs_valid[self.hand_dst].unsqueeze(0), H_dst, very_low)
         max_H = torch.maximum(H_src, H_dst)
 
         hand_activation = torch.sigmoid(
@@ -556,11 +590,10 @@ class DFCGNNUnified(nn.Module):
         edge_attr, activation = self._build_edge_attr_and_activation(x_last)
 
         # ── Unified physically-biased attention ─────────────────────────
-        h_gat = self.gat(
-            h=h, edge_index=self.edge_index, edge_attr=edge_attr,
-            node_elev=self.node_elev, hand_activation=activation,
-        )
-        h = self.norm_gat(h + self.dropout(h_gat))
+        for gat, norm in zip(self.gats, self.norms_gat):
+            h_gat = gat(h=h, edge_index=self.edge_index, edge_attr=edge_attr,
+                        node_elev=self.node_elev, hand_activation=activation)
+            h = norm(h + self.dropout(h_gat))
 
         # ── Output heads ──────────────────────────────────────────────
         stage = self.stage_head(h)                               # [B, N, T_out]

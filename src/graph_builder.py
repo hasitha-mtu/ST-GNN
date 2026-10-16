@@ -40,7 +40,10 @@ logger = logging.getLogger(__name__)
 
 # ── Paths  (adjust to your local layout) ──────────────────────────────────
 BASE_DIR      = Path(__file__).resolve().parent.parent
-print(BASE_DIR)
+import sys as _sys
+for _p in (BASE_DIR, BASE_DIR / "src"):
+    if str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
 META_JSON     = BASE_DIR / "dataset/graph/graph_metadata.json"   # authoritative topology
 DISCHARGE_DIR = BASE_DIR / "dataset/raw/discharge"               # to detect has_discharge
 OUT_DIR       = BASE_DIR / "dataset/graph"
@@ -248,6 +251,7 @@ def build_graph(
     plot: bool = True,
     use_filesystem_discharge: bool = False,
     catchment_shp: Path | None = None,
+    drop_reverse_edges: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
     """
     Load verified graph from graph_metadata.json, build numpy tensors,
@@ -267,6 +271,25 @@ def build_graph(
 
     # ── 2. Build ref → index mapping ─────────────────────────────────────
     ref_to_idx = {s['ref']: i for i, s in enumerate(stations)}
+
+    # ── 2b. Remove uphill reverse duplicates (revision audit) ────────────
+    # graph_metadata.json lists 19057->19056 and 19058->19059 in addition
+    # to their downhill twins. They create 2-cycles in a graph defined as
+    # upstream->downstream, let messages flow uphill, and made S1/S5 route
+    # synthetic pulses upstream. See utils/graph_checks.py.
+    if drop_reverse_edges:
+        from utils.graph_checks import find_reverse_duplicates
+        _ed = pd.DataFrame([{"src_idx": ref_to_idx[e['src_ref']],
+                             "dst_idx": ref_to_idx[e['dst_ref']],
+                             "elev_drop_m": e.get('elev_drop_m', 0.0)}
+                            for e in edges
+                            if e['src_ref'] in ref_to_idx and e['dst_ref'] in ref_to_idx])
+        _bad = set(find_reverse_duplicates(_ed))
+        if _bad:
+            logger.warning("Dropping %d uphill reverse-duplicate edge(s): %s",
+                           len(_bad), [(edges[i]['src_ref'], edges[i]['dst_ref'])
+                                       for i in sorted(_bad)])
+        edges = [e for i, e in enumerate(edges) if i not in _bad]
 
     # ── 3. Node attribute matrix ──────────────────────────────────────────
     logger.info("Building node attribute matrix …")
@@ -311,8 +334,27 @@ def build_graph(
                 'lon': s.get('lon'),
             }
             row.update(dict(zip(feature_names, node_attr[i].tolist())))
+            # Revision audit: carry the train-only / datum columns written by
+            # data/compute_static_attributes.py through a graph rebuild.
+            for _k in ("p50_mAOD_train", "stage_ref_low_m", "abs_datum_valid"):
+                if _k in s:
+                    row[_k] = s[_k]
             node_rows.append(row)
-        pd.DataFrame(node_rows).to_csv(OUT_DIR / 'nodes.csv', index=False)
+        new_nodes = pd.DataFrame(node_rows)
+        # Preserve columns added by other scripts (e.g. easting_itm /
+        # northing_itm) instead of silently dropping them on a rebuild.
+        _prev = OUT_DIR / 'nodes.csv'
+        if _prev.exists():
+            _old = pd.read_csv(_prev)
+            _extra = [c for c in _old.columns if c not in new_nodes.columns]
+            if _extra:
+                new_nodes = new_nodes.merge(_old[['ref'] + _extra].astype({'ref': str}),
+                                            left_on=new_nodes['ref'].astype(str),
+                                            right_on='ref', how='left',
+                                            suffixes=('', '_old'))
+                new_nodes = new_nodes.drop(columns=[c for c in new_nodes.columns
+                                                    if c in ('key_0', 'ref_old')])
+        new_nodes.to_csv(OUT_DIR / 'nodes.csv', index=False)
 
         # edges.csv — one row per edge, human-readable src/dst refs alongside indices
         edge_rows = []
@@ -346,4 +388,11 @@ def build_graph(
 
 
 if __name__ == '__main__':
-    build_graph(save=True, plot=True)
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--keep-reverse-edges", action="store_true",
+                     help="reproduce the submitted 28-edge graph (not recommended)")
+    _ap.add_argument("--no-plot", action="store_true")
+    _a = _ap.parse_args()
+    build_graph(save=True, plot=not _a.no_plot,
+                drop_reverse_edges=not _a.keep_reverse_edges)

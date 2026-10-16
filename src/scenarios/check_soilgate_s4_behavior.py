@@ -68,6 +68,8 @@ def main():
     else:
         sat_threshold = None
     sat_sharpness = sd.get("sat_sharpness")
+    if sat_sharpness is None and "sat_sharpness_raw" in sd:   # revision: softplus(raw)
+        sat_sharpness = torch.nn.functional.softplus(sd["sat_sharpness_raw"])
     if sat_threshold is None or sat_sharpness is None:
         print("sat_threshold/sat_sharpness not found in state_dict -- "
               "is this actually an st_gnn_soil_gate checkpoint?")

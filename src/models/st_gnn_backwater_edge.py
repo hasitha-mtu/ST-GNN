@@ -44,6 +44,20 @@ directed river graph structurally forbids, conditioned on it being
 physically plausible. It should therefore be read as the opposite kind
 of gate from DFC-GNN's: a permission gate, not a suppression gate.
 
+REVISION AUDIT (M1) -- the gate now gates
+------------------------------------------
+The submitted model passed the gate value to GATConv only as a 5th edge
+ATTRIBUTE. GATConv uses edge attributes inside the attention logit through
+a learned projection, and the message itself is never scaled, so a gate of
+0 did not close the edge: the backwater edges were open in all layers at
+all times and the learned projection decided what the "gate" value meant.
+The gate is now an explicit multiplicative message gate in BOTH GAT layers
+(models/common.GatedGATConv):
+    m_(bridge -> upstream) = gate(t) * alpha * W h_bridge
+River edges have gate 1. The 5th edge attribute is now a constant edge-type
+flag (0 river, 1 backwater) so attention can still distinguish the classes.
+beta is kept positive (softplus) so the gate cannot invert.
+
 Combined edge set (static structure, built once in __init__ from the
 buffers passed in):
     n_river = river edges (from edges.csv)          — always-open, static
@@ -62,7 +76,10 @@ activation above.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+try:
+    from .common import GATStack2, batched_graph, positive_param
+except ImportError:          # run as a script
+    from models.common import GATStack2, batched_graph, positive_param
 
 
 class STGNNBackwaterEdge(nn.Module):
@@ -144,7 +161,9 @@ class STGNNBackwaterEdge(nn.Module):
         # the bridge/constriction node itself, not the upstream target).
         self.register_buffer("bw_gate_node", bw_src.long())
 
-        self.gate_sharpness = nn.Parameter(torch.tensor(float(gate_sharpness)))
+        self.gate_sharpness_raw = positive_param(float(gate_sharpness))
+        edge_type = torch.cat([torch.zeros(n_river), torch.ones(n_bw)])
+        self.register_buffer("edge_type", edge_type.float())
         self.last_gate_mean = torch.tensor(0.0)   # updated every forward() call
 
         # ── Input projection ───────────────────────────────────────────
@@ -163,21 +182,8 @@ class STGNNBackwaterEdge(nn.Module):
 
         # ── GATConv layers — f_edge=5 (4 static + 1 gate value) ────────
         f_edge = 5
-        self.gat1 = GATConv(hidden, hidden, heads=gat_heads, concat=True,
-                            dropout=dropout, edge_dim=f_edge)
-        self.norm1 = nn.LayerNorm(hidden * gat_heads)
-        self.res1  = nn.Linear(hidden, hidden * gat_heads, bias=False)
-
-        self.gat2 = GATConv(hidden * gat_heads, hidden, heads=gat_heads,
-                            concat=False, dropout=dropout, edge_dim=f_edge)
-        self.norm2 = nn.LayerNorm(hidden)
-        self.res2  = nn.Linear(hidden * gat_heads, hidden, bias=False)
-
-        self.gat3 = GATConv(hidden, hidden // 2, heads=2, concat=False,
-                            dropout=dropout, edge_dim=f_edge)
-        self.norm3 = nn.LayerNorm(hidden // 2)
-        self.res3  = nn.Linear(hidden, hidden // 2, bias=False)
-
+        # Two-layer GAT stack with gated messages (Section 3.5; M1, M6)
+        self.gat_stack = GATStack2(hidden, gat_heads, f_edge, dropout)
         self.head = nn.Sequential(
             nn.Linear(hidden // 2, hidden // 4),
             nn.ReLU(),
@@ -217,18 +223,21 @@ class STGNNBackwaterEdge(nn.Module):
         self.last_gate_mean = gate.mean()
         return gate
 
-    def _combined_edge_attr(self, x_last: torch.Tensor) -> torch.Tensor:
-        """Returns [B, n_river+n_bw, 5] — static attrs + per-edge gate value."""
+    @property
+    def gate_sharpness(self) -> torch.Tensor:
+        return torch.nn.functional.softplus(self.gate_sharpness_raw)
+
+    def _combined_edge_attr_and_gate(self, x_last: torch.Tensor):
+        """Returns edge attributes [B, E, 5] (4 static + edge-type flag) and
+        the multiplicative message gate [B, E] (1 for river edges)."""
         B = x_last.shape[0]
         static_tiled = self.static_edge_attr.unsqueeze(0).expand(B, -1, -1)  # [B, E, 4]
-
-        river_gate = torch.ones(B, self.n_river, device=x_last.device)       # always open
+        etype = self.edge_type.view(1, -1, 1).expand(B, -1, 1)
+        river_gate = torch.ones(B, self.n_river, device=x_last.device)
         bw_gate    = self._backwater_gate(x_last)                            # [B, n_bw]
-        gate = torch.cat([river_gate, bw_gate], dim=1).unsqueeze(-1)         # [B, E, 1]
+        gate = torch.cat([river_gate, bw_gate], dim=1)                       # [B, E]
+        return torch.cat([static_tiled, etype], dim=-1), gate
 
-        return torch.cat([static_tiled, gate], dim=-1)                       # [B, E, 5]
-
-    # ──────────────────────────────────────────────────────────────────
     def forward(
         self,
         x_seq:      torch.Tensor,   # [B, T_in, N, F_dyn]
@@ -261,20 +270,12 @@ class STGNNBackwaterEdge(nn.Module):
         h = self.gru_dropout(gru_out[:, -1, :]).reshape(B, N, self.hidden)
 
         x_last = x_seq[:, -1, :, :]                        # [B, N, F_dyn]
-        combined_ea = self._combined_edge_attr(x_last)       # [B, E, 5]
-
+        combined_ea, gate = self._combined_edge_attr_and_gate(x_last)   # [B,E,5], [B,E]
         E = self.edge_index.shape[1]
         h_flat = h.reshape(B * N, self.hidden)
-        offsets = torch.arange(B, device=x_seq.device) * N
-        src_b = (self.edge_index[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        dst_b = (self.edge_index[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        batched_ei = torch.stack([src_b, dst_b], dim=0)
+        batched_ei = batched_graph(self.edge_index, B, N)
         batched_ea = combined_ea.reshape(B * E, -1)
-
-        h1 = F.elu(self.norm1(self.gat1(h_flat, batched_ei, batched_ea) + self.res1(h_flat)))
-        h2 = F.elu(self.norm2(self.gat2(h1,     batched_ei, batched_ea) + self.res2(h1)))
-        h3 = F.elu(self.norm3(self.gat3(h2,     batched_ei, batched_ea) + self.res3(h2)))
-
+        h3 = self.gat_stack(h_flat, batched_ei, batched_ea, gate.reshape(B * E))
         h_graph = h3.reshape(B, N, self.hidden // 2)
         delta = self.head(h_graph)
         return delta.permute(0, 2, 1)                       # [B, T_out, N]
@@ -315,7 +316,7 @@ if __name__ == "__main__":
     print(f"Output: {tuple(out.shape)}  \u2713")
 
     out.sum().backward()
-    assert model.gate_sharpness.grad is not None, "gate_sharpness has no grad"
+    assert model.gate_sharpness_raw.grad is not None, "gate_sharpness has no grad"
     print("Backward pass + gate_sharpness gradient flow:  \u2713")
 
     # Gate responsiveness check: bridge stage well above vs below its

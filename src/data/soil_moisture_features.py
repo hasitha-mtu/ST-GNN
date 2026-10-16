@@ -351,6 +351,7 @@ def compute_sm_features(
     era5_nc_path: str,
     layers: list[str] = ACTIVE_LAYERS,
     climatology_window_days: int = 15,
+    climatology_end: "pd.Timestamp | str | None" = None,
 ) -> xr.Dataset:
     """
     Load ERA5-Land netCDF and compute per-node or per-cell soil moisture features.
@@ -380,6 +381,14 @@ def compute_sm_features(
         Soil water layer identifiers, e.g. ['swvl1', 'swvl2'].
     climatology_window_days : int
         Smoothing window (days) for the DOY climatology. Default 15.
+    climatology_end : timestamp or None
+        REVISION AUDIT: the day-of-year climatology used for the anomaly
+        feature was previously averaged over the WHOLE record, so test-period
+        soil moisture entered every anomaly value (including training inputs)
+        and each test value partly referenced itself. When given, only
+        timestamps strictly before `climatology_end` (the training-split
+        boundary) are used to build the climatology. build_dataset.py
+        passes the training boundary.
     """
     ds = xr.open_dataset(era5_nc_path, engine="netcdf4")
     print(ds.dims)
@@ -422,7 +431,8 @@ def compute_sm_features(
             )
 
     # Confirm 'time' now has the expected number of steps
-    if ds.dims.get("time", 0) <= 1:
+    # if ds.dims.get("time", 0) <= 1:
+    if ds.sizes.get("time", 0) <= 1:
         raise ValueError(
             f"Time dimension has only {ds.dims.get('time',0)} step(s) after "
             f"normalisation — cannot compute day-of-year climatology.\n"
@@ -482,7 +492,15 @@ def compute_sm_features(
         #   Using doy_smooth.values[row_indices] bypasses xarray entirely,
         #   giving a plain numpy array that is safe to wrap in a new DataArray
         #   with the original (time, ...) dims.
-        doy_mean = vwc.groupby("time.dayofyear").mean("time")
+        vwc_clim = vwc
+        if climatology_end is not None:
+            _end = np.datetime64(pd.Timestamp(climatology_end).tz_localize(None)
+                                 if pd.Timestamp(climatology_end).tzinfo else
+                                 pd.Timestamp(climatology_end))
+            vwc_clim = vwc.where(vwc.time < _end, drop=True)
+            if vwc_clim.sizes.get("time", 0) == 0:
+                raise ValueError("No ERA5 timestamps before climatology_end")
+        doy_mean = vwc_clim.groupby("time.dayofyear").mean("time")
         # doy_mean: (dayofyear, node) or (dayofyear, lat, lon)
 
         half = climatology_window_days // 2
@@ -594,6 +612,26 @@ def build_node_sm_lookup(
 
 
 
+# ── Causal (backward-only) temporal alignment ──────────────────────────
+ERA5_ALIGN_TOLERANCE = pd.Timedelta("1h")
+
+
+def causal_align(series: pd.Series, target_index: pd.DatetimeIndex,
+                 tolerance: pd.Timedelta = ERA5_ALIGN_TOLERANCE) -> pd.Series:
+    """Align an hourly series to a 15-min index using ONLY values valid at
+    or before each target time (last observation carried forward, at most
+    `tolerance` old).
+
+    REVISION AUDIT: the previous `reindex(method="nearest", tolerance="1h")`
+    mapped e.g. 10:45 to the 11:00 ERA5 value, i.e. a soil-moisture state up
+    to 59 minutes AFTER the forecast issue time (manuscript Section 5.5).
+    `method="ffill"` can never look forward. tests/test_soil_moisture.py
+    checks this property explicitly.
+    """
+    s = series[~series.index.duplicated(keep="last")].sort_index()
+    return s.reindex(target_index, method="ffill", tolerance=tolerance)
+
+
 # ── Step 4: Extract time series per node and build feature matrix ──────
 def extract_node_sm_features(
     ds_features: xr.Dataset,
@@ -651,10 +689,7 @@ def extract_node_sm_features(
             for node_idx in range(N_nodes):
                 node_series = feat_da.isel(node=node_idx).values
                 node_ts     = pd.Series(node_series, index=era5_times)
-                # ERA5-Land is hourly; align to 15-min target with nearest-hour fill
-                node_aligned = node_ts.reindex(
-                    target_timestamps, method="nearest", tolerance="1h"
-                )
+                node_aligned = causal_align(node_ts, target_timestamps)
                 sm_matrix[:, node_idx, feat_idx] = node_aligned.values
 
     # ── Format A: spatial grid with lookup ────────────────────────────
@@ -685,9 +720,7 @@ def extract_node_sm_features(
             for node_idx, (lat_i, lon_i) in node_lookup.items():
                 node_series = feat_da.isel(lat=lat_i, lon=lon_i).values
                 node_ts     = pd.Series(node_series, index=era5_times)
-                node_aligned = node_ts.reindex(
-                    target_timestamps, method="nearest", tolerance="1h"
-                )
+                node_aligned = causal_align(node_ts, target_timestamps)
                 sm_matrix[:, node_idx, feat_idx] = node_aligned.values
 
     nan_rate = float(np.isnan(sm_matrix).mean())

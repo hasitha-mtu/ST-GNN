@@ -320,64 +320,26 @@ def load_gauge_datum_and_stage_range(
     logger,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build per-node gauge_datum [N] and stage_range [N] (= p90 - gauge_datum)
-    from nodes.csv, for the option-3 datum-consistent HAND activation gate.
+    REVISION AUDIT: returns (stage_ref_low [N], stage_range [N]) from
+    utils.datum.stage_reference() — the SAME pair build_dataset.py uses to
+    compute normalised_stage, so H = low + norm * range reproduces the
+    observed stage exactly at every node.
 
-    Applies a fallback for nodes with a known-bad gauge_datum_mOSGM15 (0.0,
-    physically inconsistent with their p90_mAOD — see
-    RESERVOIR_DATUM_FALLBACK_REFS): substitutes the DEM-sampled node_elev
-    for gauge_datum at those nodes specifically, with a loud warning. This
-    is an approximation, not a verified station datum — replace with the
-    real value if/when available.
-
-    nodes_df must be in the SAME row order as node_elev / edge_index /
-    X.npy's node axis (i.e. loaded via the same nodes.csv used everywhere
-    else in the pipeline).
+    The previous version substituted the DEM elevation for the two headrace
+    datums and forced their range to 1.5 m, while the feature itself had been
+    normalised with datum 0.0 and range ~45-61 m. The reconstructed headrace
+    H was therefore almost constant. Nodes whose absolute datum is not
+    verified are now excluded from terrain comparisons instead (see
+    node_abs_valid in the model), not patched with a DEM value.
+    `node_elev` is kept in the signature for call-site compatibility only.
     """
-    gauge_datum = nodes_df["gauge_datum_mOSGM15"].to_numpy(dtype=np.float32).copy()
-    p90         = nodes_df["p90_mAOD"].to_numpy(dtype=np.float32).copy()
-    refs        = nodes_df["ref"].astype(str).to_numpy()
-
-    fallback_idx = [i for i, r in enumerate(refs) if r in RESERVOIR_DATUM_FALLBACK_REFS]
-    if fallback_idx:
-        node_elev_np = node_elev.detach().cpu().numpy()
-        for i in fallback_idx:
-            logger.warning(
-                "  gauge_datum fallback: node ref=%s (%s) has gauge_datum_"
-                "mOSGM15=%.2f m paired with p90_mAOD=%.2f m — physically "
-                "inconsistent (implausible stage range). Substituting "
-                "DEM-sampled node_elev=%.2f m OD as an APPROXIMATION. "
-                "Replace with the real station datum if available.",
-                refs[i], nodes_df.iloc[i].get("name", "?"),
-                gauge_datum[i], p90[i], node_elev_np[i],
-            )
-            gauge_datum[i] = node_elev_np[i]
-            # p90 wasn't the broken value for these nodes, but stage_range
-            # must still be positive and physically reasonable — reuse the
-            # typical stage_range magnitude seen elsewhere rather than the
-            # (now stale) original p90-gauge_datum gap for this node.
-            p90[i] = gauge_datum[i] + 1.5   # ~1.5 m default range, mid-pack
-                                             # of the observed 0.18-60.9 m
-                                             # range prior to this fallback
-
-    stage_range = p90 - gauge_datum
-    bad = stage_range <= 0.01
-    if bad.any():
-        logger.warning(
-            "  %d node(s) have non-positive stage_range after fallback — "
-            "clamping to 1.0 m: refs=%s",
-            int(bad.sum()), refs[bad].tolist(),
-        )
-        stage_range[bad] = 1.0
-
-    logger.info(
-        "  gauge_datum: [%.2f, %.2f] m OD   stage_range: [%.2f, %.2f] m",
-        gauge_datum.min(), gauge_datum.max(),
-        stage_range.min(), stage_range.max(),
-    )
-
-    return (torch.from_numpy(gauge_datum).float(),
-            torch.from_numpy(stage_range).float())
+    from src.utils.datum import torch_reference
+    low, rng, valid = torch_reference(nodes_df)
+    logger.info("  stage_ref_low: [%.2f, %.2f] m   stage_range: [%.2f, %.2f] m   "
+                "abs-datum-valid nodes: %d/%d",
+                float(low.min()), float(low.max()), float(rng.min()),
+                float(rng.max()), int(valid.sum()), int(valid.numel()))
+    return low, rng
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -554,7 +516,12 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     gauge_datum, stage_range = load_gauge_datum_and_stage_range(
         nodes_df, node_elev_cpu, logger,
     )
-    z_saddle = hand_data["z_saddle_m"]
+    from src.utils.datum import abs_datum_valid
+    from src.data.compute_static_attributes import load_datum_config
+    node_abs_valid = torch.from_numpy(abs_datum_valid(nodes_df))
+    # DEM (EGM2008) -> Malin Head offset, 0.0 unless configured
+    z_saddle = hand_data["z_saddle_m"] + float(
+        load_datum_config().get("dem_vertical_offset_to_malin_m", 0.0))
 
     # ── SAR encoder + cache ────────────────────────────────────────────
     sar_cache    = None
@@ -650,9 +617,14 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     discharge_col = 3
 
     t1, _ = get_split_boundary(T)  # same boundary make_gpu_loaders used
-    q_ref = float(X[:t1, :, discharge_col].mean())
-    q_ref = max(q_ref, 0.01)
-    logger.info("  Discharge reference Q_ref=%.4f (log1p-transformed)", q_ref)
+    # REVISION AUDIT (M2): per-node Q_ref (training period, valid steps)
+    from src.utils.train_utils import discharge_reference
+    q_ref_np = discharge_reference(X, t1, discharge_col)
+    q_ref = torch.from_numpy(q_ref_np)
+    logger.info("  Discharge reference Q_ref per node: min=%.3f median=%.3f max=%.3f "
+                "(log-transformed; %d nodes without discharge -> 1.0)",
+                q_ref_np.min(), float(np.median(q_ref_np)), q_ref_np.max(),
+                int((q_ref_np == 1.0).sum()))
 
     model = STGNNHANDEdge(
         f_dyn=F,
@@ -665,6 +637,7 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
         z_saddle=z_saddle,
         gauge_datum=gauge_datum,
         stage_range=stage_range,
+        node_abs_valid=node_abs_valid,
         hidden=HIDDEN_DIM,
         gat_heads=GAT_HEADS,
         gru_layers=GRU_LAYERS,

@@ -108,6 +108,9 @@ from torch import Tensor
 # 1. Physically-Biased GAT Convolution
 # ═════════════════════════════════════════════════════════════════════
 
+N_ATTN_LAYERS = 3
+
+
 class PhysicallyBiasedGATConv(nn.Module):
     """
     Graph Attention Convolution biased by four physical edge features.
@@ -203,12 +206,20 @@ class PhysicallyBiasedGATConv(nn.Module):
         h_out   Aggregated node representations [B, N, d_out].
         """
         B, N, _ = h.shape
-        E = edge_index.shape[1]
         H = self.n_heads
         D = self.d_head
 
-        src_idx = edge_index[0]   # [E]
-        dst_idx = edge_index[1]   # [E]
+        # REVISION AUDIT (M9): always-open self-loops (as in GATConv). Without
+        # them the softmax over a node's incoming edges re-normalises the
+        # gated scores, so when EVERY incoming edge is gated (e.g. the
+        # highest gauge, all of whose incoming edges are uphill) the gate has
+        # no effect at all. Self-loops carry zero edge features and gate 1.
+        loops = torch.arange(N, device=h.device)
+        E0 = edge_index.shape[1]
+        src_idx = torch.cat([edge_index[0], loops])   # [E0+N]
+        dst_idx = torch.cat([edge_index[1], loops])
+        edge_attr = torch.cat([edge_attr, edge_attr.new_zeros(N, edge_attr.shape[1])])
+        E = E0 + N
 
         # ── Linear projections ─────────────────────────────────────────
         q = self.W_q(h).view(B, N, H, D)  # [B, N, H, D]
@@ -234,8 +245,9 @@ class PhysicallyBiasedGATConv(nn.Module):
         # ── Hard elevation gate ────────────────────────────────────────
         # g_ij ≈ 1 when elev_src > elev_dst (downhill — physically possible)
         # g_ij ≈ 0 when elev_src < elev_dst (uphill — gated out)
-        elev_diff = node_elev[src_idx] - node_elev[dst_idx]     # [E]
-        gate = torch.sigmoid(elev_diff / self.tau_gate)          # [E]
+        elev_diff = node_elev[edge_index[0]] - node_elev[edge_index[1]]   # [E0]
+        gate = torch.sigmoid(elev_diff / self.tau_gate)
+        gate = torch.cat([gate, gate.new_ones(N)])               # [E]
         # Broadcast: [B, E, H]
         gate = gate.unsqueeze(0).unsqueeze(-1).expand(B, E, H)
 
@@ -374,22 +386,23 @@ class DFCGNNFlood(nn.Module):
 
         # ── 3. Physically-biased GAT layer ─────────────────────────────
         n_ef = edge_attr.shape[1] if edge_attr is not None else 4
-        self.gat = PhysicallyBiasedGATConv(
-            d_in        = d_model,
-            d_out       = d_model,
-            n_heads     = n_heads,
-            n_edge_feat = n_ef,
-            dropout     = dropout,
-            tau_gate    = tau_gate,
-        )
-
-        # Layer norms + residual connection
-        self.norm_gru = nn.LayerNorm(d_model)
-        self.norm_gat = nn.LayerNorm(d_model)
-        self.dropout  = nn.Dropout(dropout)
-
-        # ── 4. Stage prediction head (primary task) ────────────────────
-        # [B, N, d_model] → [B, N, T_out]
+        # REVISION AUDIT (M7): three stacked dense-attention layers, each with
+        # a residual connection and LayerNorm (manuscript Section 3.6 and
+        # 3.7.2: "three-layer dense-attention stack"); the submitted model
+        # had a single layer.
+        self.n_attn_layers = N_ATTN_LAYERS
+        self.gats = nn.ModuleList([
+            PhysicallyBiasedGATConv(
+                d_in        = d_model,
+                d_out       = d_model,
+                n_heads     = n_heads,
+                n_edge_feat = n_ef,
+                dropout     = dropout,
+                tau_gate    = tau_gate,
+            ) for _ in range(N_ATTN_LAYERS)])
+        self.norm_gru  = nn.LayerNorm(d_model)
+        self.norms_gat = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(N_ATTN_LAYERS)])
+        self.dropout   = nn.Dropout(dropout)
         self.stage_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -448,15 +461,10 @@ class DFCGNNFlood(nn.Module):
         h = self.norm_gru(h)
 
         # ── Physically-biased GAT ────────────────────────────────────────
-        h_gat = self.gat(
-            h          = h,
-            edge_index = self.edge_index,
-            edge_attr  = self.edge_attr,
-            node_elev  = self.node_elev,
-        )                                  # [B, N, d_model]
-        h = self.norm_gat(h + self.dropout(h_gat))   # residual
-
-        # ── Stage prediction head ────────────────────────────────────────
+        for gat, norm in zip(self.gats, self.norms_gat):
+            h_gat = gat(h=h, edge_index=self.edge_index,
+                        edge_attr=self.edge_attr, node_elev=self.node_elev)
+            h = norm(h + self.dropout(h_gat))          # residual
         stage = self.stage_head(h)         # [B, N, T_out]
         stage = stage.permute(0, 2, 1)    # [B, T_out, N]
 

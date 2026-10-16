@@ -81,10 +81,15 @@ import numpy as np
 import pandas as pd
 
 BASE_DIR      = Path(__file__).resolve().parent.parent.parent
+import sys as _sys
+for _p in (str(BASE_DIR), str(BASE_DIR / "src")):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
 GRAPH_DIR     = BASE_DIR / "dataset/graph"
 STATION_DIR   = BASE_DIR / "dataset/station_data"
 DEM_PATH      = BASE_DIR / "dataset/dem/COP-DEM-30m_itm.tif"
 OUT_PATH      = GRAPH_DIR / "edge_features.npz"
+NODE_ELEVATION_SOURCE = "channel"   # "channel" (revision) or "dem" (submitted)
 
 MAX_DIST_KM   = 80.0   # maximum along-network distance for candidate edges
 CELERITY_SCALE = 5 / 3  # kinematic wave celerity = 5/3 × mean flow velocity
@@ -125,124 +130,70 @@ def load_nodes() -> pd.DataFrame:
     return df
 
 
+NETWORK_SOURCE = "river"   # "river" (revision) or "submitted" (KNN + HAND + Euclidean)
+
+
 def build_network_graph(nodes_df: pd.DataFrame) -> "nx.DiGraph":
     """
-    Build a directed NetworkX graph from edges.csv weighted by
-    overland_dist_km from hand_edges.npz (most accurate distances).
-    Falls back to Euclidean ITM distance if hand_edges.npz is absent.
+    River network for all-pairs along-channel distances.
+
+    REVISION AUDIT (A21): the submitted version never read the river network.
+    edges.csv has columns src_idx/dst_idx, but the parser looked for
+    src/source and dst/target, so every row was skipped (and it would have
+    used straight-line distances anyway). The "river distance" and the
+    travel time between any two gauges were therefore shortest paths over
+    16 HAND overland links plus 60 K-nearest-neighbour straight-line links,
+    which jump across watersheds (e.g. Ballyvourney -> Waterworks Weir
+    48 km instead of 66 km along the river; Coolmuckey -> Gothic Bridge
+    17 km instead of 39 km). The graph is now the 26-edge river tree from
+    edges.csv, undirected, weighted by the along-channel reach length
+    river_dist_km (compute_river_distances.py).
     """
     import networkx as nx
+    from utils.graph_checks import river_edges
 
-    ref_to_idx = {r: i for i, r in enumerate(nodes_df["ref"])}
+    N = len(nodes_df)
+    G = nx.DiGraph()
+    G.add_nodes_from(range(N))
+    if NETWORK_SOURCE != "river":
+        return _build_network_graph_submitted(nodes_df)
+    ep = GRAPH_DIR / "edges.csv"
+    if not ep.exists():
+        raise FileNotFoundError(f"{ep} not found - run graph_builder.py first")
+    ed = river_edges(pd.read_csv(ep))
+    for e in ed.itertuples():
+        s, d, L = int(e.src_idx), int(e.dst_idx), float(e.river_dist_km)
+        G.add_edge(s, d, dist_km=L)
+        G.add_edge(d, s, dist_km=L)
+    comps = list(nx.connected_components(G.to_undirected()))
+    print(f"  River network: {len(ed)} reaches from edges.csv, "
+          f"{len(comps)} connected component(s)")
+    if len(comps) != 1:
+        raise RuntimeError(f"river network is not connected: {comps}")
+    return G
+
+
+def _build_network_graph_submitted(nodes_df: pd.DataFrame) -> "nx.DiGraph":
+    """Submitted behaviour (HAND overland links + KNN straight-line links),
+    kept only for the sensitivity comparison NETWORK_SOURCE = "submitted"."""
+    import networkx as nx
+    from scipy.spatial import cKDTree
     G = nx.DiGraph()
     G.add_nodes_from(range(len(nodes_df)))
-
-    # Primary: distances from hand_edges.npz (flood-adjacency pairs with DEM distances)
     hand_path = GRAPH_DIR / "hand_edges.npz"
     if hand_path.exists():
         data = np.load(hand_path)
         for s, d, dist in zip(data["src"], data["dst"], data["overland_dist_km"]):
             G.add_edge(int(s), int(d), dist_km=float(dist))
             G.add_edge(int(d), int(s), dist_km=float(dist))
-        print(f"  hand_edges.npz: {G.number_of_edges()} directed edges loaded")
-
-    # Ensure full connectivity with a K-nearest-neighbours fallback.
-    #
-    # hand_edges.npz captures flood-adjacency (which nodes can flood each
-    # other through terrain) — it is NOT a spanning tree. With only 14
-    # bidirectional pairs it cannot connect all 27 nodes, leaving 14+
-    # isolated nodes unable to participate in attention propagation.
-    #
-    # We supplement with KNN (K=4) edges in ITM space. For pairs not in
-    # hand_edges.npz the Euclidean ITM distance is used as a proxy for
-    # river distance — a reasonable approximation for <20 km tributaries.
-    # The attention mechanism then learns to down-weight spurious edges.
-    KNN = 4
     coords = nodes_df[["easting_itm", "northing_itm"]].values.astype(float)
-    from scipy.spatial import cKDTree
     tree = cKDTree(coords)
-    n_knn_added = 0
     for i in range(len(nodes_df)):
-        dists_eu, nbrs = tree.query(coords[i], k=KNN + 1)  # +1 to skip self
-        for dist_eu, j in zip(dists_eu[1:], nbrs[1:]):     # skip first (self)
-            dist_km = float(dist_eu) / 1000.0
+        dists_eu, nbrs = tree.query(coords[i], k=5)
+        for dist_eu, j in zip(dists_eu[1:], nbrs[1:]):
             if not G.has_edge(i, j):
-                G.add_edge(i, j, dist_km=dist_km)
-                G.add_edge(j, i, dist_km=dist_km)
-                n_knn_added += 1
-    if n_knn_added:
-        print(f"  KNN (K={KNN}) fallback: {n_knn_added} pairs added → "
-              f"{G.number_of_edges()} total directed edges")
-
-    # Also load edges.csv if it exists (river network from preprocessing)
-    edges_path = GRAPH_DIR / "edges.csv"
-    if edges_path.exists():
-        ref_to_idx = {r: i for i, r in enumerate(nodes_df["ref"])}
-        n_csv = 0
-        edf   = pd.read_csv(edges_path)
-        for _, row in edf.iterrows():
-            def _res(val):
-                v = str(val).strip()
-                if v in ref_to_idx: return ref_to_idx[v]
-                try:
-                    idx = int(float(v))
-                    if 0 <= idx < len(nodes_df): return idx
-                except (ValueError, TypeError): pass
-                return None
-            s = _res(row.get("src", row.get("source")))
-            d = _res(row.get("dst", row.get("target")))
-            if s is None or d is None: continue
-            # Update distance with network value if more accurate
-            se = coords[s]; de = coords[d]
-            dist_km = float(np.linalg.norm(se - de) / 1000)
-            if not G.has_edge(s, d) or G[s][d]["dist_km"] > dist_km:
-                G.add_edge(s, d, dist_km=dist_km)
-                G.add_edge(d, s, dist_km=dist_km)
-                n_csv += 1
-        if n_csv:
-            print(f"  edges.csv: {n_csv} pairs updated/added")
-
-    # Report connected components
-    G_undirected = G.to_undirected()
-    components   = list(nx.connected_components(G_undirected))
-    print(f"  Connected components: {len(components)} "
-          f"(sizes: {sorted([len(c) for c in components], reverse=True)})")
-    if len(components) > 1:
-        isolated = [list(c)[0] for c in components if len(c) == 1]
-        if isolated:
-            iso_refs = [nodes_df.loc[i, "ref"] for i in isolated]
-            print(f"  WARNING: {len(isolated)} isolated nodes: {iso_refs}")
-            print(f"    These nodes cannot participate in attention propagation.")
-            print(f"    Add them to edges.csv or they will have self-attention only.")
-
-    if G.number_of_edges() == 0:
-        raise FileNotFoundError(
-            "No network edges found. Run precompute_hand_edges.py first "
-            "or ensure edges.csv exists in dataset/graph/.")
-
-    return G
-
-    # Fallback: edges.csv with Euclidean distances
-    edges_path = GRAPH_DIR / "edges.csv"
-    if not edges_path.exists():
-        raise FileNotFoundError(
-            f"Neither hand_edges.npz nor edges.csv found in {GRAPH_DIR}.\n"
-            f"Run precompute_hand_edges.py first.")
-
-    edges_df = pd.read_csv(edges_path)
-    for _, row in edges_df.iterrows():
-        s = ref_to_idx.get(str(int(row["src"])))
-        d = ref_to_idx.get(str(int(row["dst"])))
-        if s is None or d is None:
-            continue
-        # Euclidean distance fallback
-        se = nodes_df.loc[s, ["easting_itm", "northing_itm"]].values
-        de = nodes_df.loc[d, ["easting_itm", "northing_itm"]].values
-        dist_km = float(np.linalg.norm(se - de) / 1000)
-        G.add_edge(s, d, dist_km=dist_km)
-        G.add_edge(d, s, dist_km=dist_km)
-
-    print(f"  Network loaded from edges.csv: {G.number_of_edges()} directed edges")
+                G.add_edge(i, j, dist_km=float(dist_eu) / 1000.0)
+                G.add_edge(j, i, dist_km=float(dist_eu) / 1000.0)
     return G
 
 
@@ -333,8 +284,42 @@ def extract_node_elevations(nodes_df: pd.DataFrame) -> np.ndarray:
                 val = datum_val if datum_val is not None else 0.0
         elevations[i] = float(val)
 
+    # REVISION AUDIT: raw-pixel DEM sampling put several gauges on the valley
+    # side rather than the channel (Glen Park +15 m, Glennamought +13 m,
+    # Dripsey +11 m, Cooldaniel +11 m above their gauge datum) and gave
+    # 0.09 / 0.28 DFC elevation-gate values on the two river edges into
+    # Currach Club. The fixed elevation gate now uses the CHANNEL reference:
+    # the gauge datum where the datum is a verified absolute level
+    # (utils.datum.abs_datum_valid), otherwise the channel-snapped DEM
+    # elevation from kirpich_inputs.csv. Set NODE_ELEVATION_SOURCE = "dem"
+    # to reproduce the submitted behaviour.
+    if NODE_ELEVATION_SOURCE == "channel":
+        import sys as _s
+        _s.path.insert(0, str(BASE_DIR / "src"))
+        from utils.datum import abs_datum_valid
+        ok = abs_datum_valid(nodes_df)
+        kp = GRAPH_DIR / "kirpich_inputs.csv"
+        snapped = pd.read_csv(kp).set_index("node_idx")["z_gauge_m"] if kp.exists() else None
+        # Pool gauges (reservoir headraces, local-zero datum): the gauge zero
+        # is tens of metres below the water, so the channel reference is the
+        # training-period median pool level (p50_mAOD_train).
+        low = nodes_df["stage_ref_low_m"].to_numpy(float) if "stage_ref_low_m" in nodes_df \
+            else nodes_df["gauge_datum_mOSGM15"].to_numpy(float)
+        is_pool = np.isfinite(low) & (np.abs(low - nodes_df["gauge_datum_mOSGM15"].to_numpy(float)) > 0.5) \
+            & ~nodes_df.get("is_tidal", pd.Series(0, index=nodes_df.index)).to_numpy().astype(bool)
+        n_pool = 0
+        for i in range(len(nodes_df)):
+            if ok[i] and is_pool[i] and "p50_mAOD_train" in nodes_df \
+                    and np.isfinite(nodes_df.loc[i, "p50_mAOD_train"]):
+                elevations[i] = float(nodes_df.loc[i, "p50_mAOD_train"]); n_pool += 1
+            elif ok[i]:
+                elevations[i] = float(nodes_df.loc[i, "gauge_datum_mOSGM15"])
+            elif snapped is not None:
+                elevations[i] = float(snapped.loc[i])
+        print(f"  Node elevations: channel reference (datum for {int(ok.sum()) - n_pool} nodes, "
+              f"median pool level for {n_pool}, snapped DEM for {int((~ok).sum())})")
     valid = np.isfinite(elevations) & (elevations != 0)
-    print(f"  Node elevations: {valid.sum()}/{len(nodes_df)} sampled from DEM")
+    print(f"  Node elevations: {valid.sum()}/{len(nodes_df)} non-zero")
     print(f"  Range: {elevations[valid].min():.1f} – {elevations[valid].max():.1f} m OD")
     return elevations
 
@@ -370,78 +355,138 @@ def _load_velocity(fp: Path) -> pd.Series | None:
         return None
 
 
+def load_bankfull_readings(nodes_df: pd.DataFrame) -> np.ndarray:
+    """
+    Bankfull STAGE (m above the gauge zero) per node, from
+    bankfull_thresholds_report.csv (derive_bankfull_thresholds.py).
+
+    This is the same reference as the "Stage" column of the OPW gaugings
+    files. Only Tier 1 (gaugings width expansion) and Tier 2 (Gumbel annual
+    maxima, OPW annual-maximum stage) are gauge-zero referenced; other tiers
+    return NaN.
+    """
+    rp = GRAPH_DIR / "bankfull_thresholds_report.csv"
+    out = np.full(len(nodes_df), np.nan, dtype=np.float64)
+    if not rp.exists():
+        warnings.warn("bankfull_thresholds_report.csv not found - run "
+                      "derive_bankfull_thresholds.py; flood-velocity filter disabled")
+        return out
+    rep = pd.read_csv(rp, dtype={"ref": str}).set_index("ref")
+    for i, ref in enumerate(nodes_df["ref"].astype(str)):
+        if ref in rep.index and rep.loc[ref, "tier_used"] in (1, 2):
+            out[i] = float(rep.loc[ref, "bankfull_reading_m"])
+    return out
+
+
+MIN_FLOOD_GAUGINGS = 2
+# Fallback when fewer than MIN_FLOOD_GAUGINGS gaugings lie above bankfull:
+#   "rating" (revision): station velocity-stage line evaluated at the bankfull
+#            stage, bounded below by the top-quartile-stage median and above by
+#            3 m/s; top-quartile median if the line is not usable
+#   "all"    : median of all gaugings (low-flow biased; first revision run)
+VELOCITY_FALLBACK = "rating"
+RATING_MIN_N = 5
+RATING_MAX_EXTRAP = 1.5      # bankfull stage may be at most 1.5x the highest gauged stage
+
+
+def velocity_at_bankfull(stage: np.ndarray, vel: np.ndarray,
+                         h_bf: float) -> tuple[float | None, str]:
+    """Velocity at the bankfull stage from a station's gaugings when too few
+    gaugings lie above bankfull. Pure function (unit-tested)."""
+    ok = np.isfinite(stage) & np.isfinite(vel) & (vel > 0.01) & (vel <= 3.0)
+    st, v = stage[ok], vel[ok]
+    if len(v) < 3:
+        return None, "too few gaugings"
+    # highest-stage quarter of the gaugings, at least 2 (Ballincolly has 4
+    # gaugings: a strict quartile is a single measurement)
+    k = max(2, int(np.ceil(0.25 * len(v))))
+    top = v[np.argsort(st)[-k:]]
+    v_top = float(np.median(top))
+    if (np.isfinite(h_bf) and len(v) >= RATING_MIN_N and np.ptp(st) > 0.05
+            and st.max() > 0 and h_bf <= RATING_MAX_EXTRAP * st.max()):
+        b, a = np.polyfit(st, v, 1)
+        if b > 0:
+            v_bf = float(np.clip(a + b * h_bf, v_top, 3.0))
+            return v_bf, (f"rating-fit n={len(v)} v={a:.2f}+{b:.2f}h at h_bf={h_bf:.2f} m"
+                          f"{' (extrap.)' if h_bf > st.max() else ''}")
+    return v_top, f"gaugings-topQ n={len(top)} (stage>={np.sort(st)[-k]:.2f} m)"
+
+
 def extract_node_velocities(
     nodes_df:    pd.DataFrame,
-    bankfull_thr: np.ndarray,   # [N] bankfull stage anomaly per node
+    bankfull_thr: np.ndarray,   # [N] bankfull stage anomaly (kept for the API)
     verbose:     bool = False,
+    bankfull_stage: np.ndarray | None = None,   # [N] m above gauge zero
 ) -> np.ndarray:
     """
-    Derive per-node mean flood velocity (m/s) from OPW Gaugings CSVs.
+    Per-node flood velocity (m/s) from the OPW gaugings files.
 
-    Flood velocity = median measured velocity during events where
-    Stage > bankfull threshold (i.e. near or above-bank flow).
+    Flood velocity = median measured velocity over gaugings with
+    Stage > bankfull stage (near or above-bank flow).
 
-    For nodes without gaugings or with fewer than 3 flood measurements,
-    a reach-type default is used (see NODE_REACH_TYPE + DEFAULT_VELOCITY).
-
-    Returns [N] array of flood velocities in m/s.
+    REVISION AUDIT (A22): the submitted filter compared the gaugings Stage
+    (m above the gauge zero) with the bankfull ANOMALY (bankfull stage minus
+    median stage), i.e. a threshold too low by the median stage, so
+    sub-bankfull gaugings were counted as flood gaugings. It now uses the
+    bankfull stage itself (load_bankfull_readings). With fewer than
+    MIN_FLOOD_GAUGINGS above bankfull, the station's velocity-stage line is
+    evaluated at the bankfull stage (velocity_at_bankfull; VELOCITY_FALLBACK).
+    The first revision run used the median of ALL gaugings there, which is
+    dominated by low-flow gaugings (Gothic Bridge 0.13 m/s, i.e. a 0.22 m/s
+    celerity and travel times up to 91 h). Nodes without gaugings use the
+    reach-type default. Every node's source is printed.
     """
+    if bankfull_stage is None:
+        bankfull_stage = load_bankfull_readings(nodes_df)
     velocities = np.zeros(len(nodes_df), dtype=np.float32)
-    sources    = []
-
+    sources = []
     for i, row in nodes_df.iterrows():
-        ref  = str(row["ref"])
-        thr  = float(bankfull_thr[i])
+        ref = str(row["ref"])
         rtype = NODE_REACH_TYPE.get(ref, "midland")
-
-        # Try loading from gaugings
+        v_flood, label = None, None
         gp = _find_gaugings(ref)
-        v_flood = None
-
         if gp is not None:
-            vel_series = _load_velocity(gp)
-            if vel_series is not None and len(vel_series) >= 3:
-                # Only use measurements at high stage (flood conditions)
-                try:
-                    df = pd.read_csv(gp, comment="#", skipinitialspace=True,
-                                     encoding="utf-8-sig")
-                    df.columns = df.columns.str.strip()
-                    stage_col = next((c for c in df.columns
-                                      if "stage" in c.lower()), None)
-                    vel_col   = next((c for c in df.columns
-                                      if "velocity" in c.lower()), None)
-                    if stage_col and vel_col:
-                        df["_s"] = pd.to_numeric(df[stage_col], errors="coerce")
-                        df["_v"] = pd.to_numeric(df[vel_col],   errors="coerce")
-                        flood_v  = df.loc[df["_s"] > thr, "_v"].dropna()
-                        # Require at least 2 flood-stage readings
-                    # Cap implausibly high values (> 3 m/s = non-physical)
-                    flood_v = flood_v[flood_v <= 3.0]
-                    if len(flood_v) >= 2:
-                            v_flood = float(flood_v.median())
-                except Exception:
-                    pass
-
-                if v_flood is None:
-                    # Fall back to overall median if no flood-specific rows
-                    v_flood = float(vel_series.median())
-
+            try:
+                df = pd.read_csv(gp, comment="#", skipinitialspace=True,
+                                 encoding="utf-8-sig")
+                df.columns = df.columns.str.strip()
+                stage_col = next((c for c in df.columns if "stage" in c.lower()), None)
+                vel_col = next((c for c in df.columns if "velocity" in c.lower()), None)
+            except Exception:
+                df, stage_col, vel_col = None, None, None
+            if df is not None and vel_col is not None:
+                v = pd.to_numeric(df[vel_col], errors="coerce")
+                ok_v = v.notna() & (v > 0.01) & (v <= 3.0)     # >3 m/s non-physical
+                thr = float(bankfull_stage[i])
+                if stage_col is not None and np.isfinite(thr):
+                    st = pd.to_numeric(df[stage_col], errors="coerce")
+                    flood_v = v[ok_v & (st > thr)]
+                    if len(flood_v) >= MIN_FLOOD_GAUGINGS:
+                        v_flood = float(flood_v.median())
+                        label = f"gaugings>bankfull n={len(flood_v)} (stage>{thr:.2f} m)"
+                if v_flood is None and VELOCITY_FALLBACK == "rating" and stage_col is not None:
+                    st = pd.to_numeric(df[stage_col], errors="coerce")
+                    v_flood, label = velocity_at_bankfull(st.to_numpy(float),
+                                                          v.to_numpy(float), thr)
+                if v_flood is None and ok_v.sum() >= 3:
+                    v_flood = float(v[ok_v].median())
+                    label = f"gaugings-all n={int(ok_v.sum())}"
         if v_flood is not None and 0.01 < v_flood < 5.0:
             velocities[i] = v_flood
-            sources.append(f"  {ref:>7}  {v_flood:.3f} m/s  (gaugings)")
         else:
-            default = DEFAULT_VELOCITY[rtype]
-            velocities[i] = default
-            sources.append(f"  {ref:>7}  {default:.3f} m/s  (default: {rtype})")
+            velocities[i] = DEFAULT_VELOCITY[rtype]
+            label = f"default: {rtype}"
+        sources.append(f"  {ref:>7}  {velocities[i]:.3f} m/s  ({label})")
 
-    n_gauged  = sum(1 for s in sources if "gaugings" in s)
-    n_default = len(sources) - n_gauged
-    print(f"  Velocities: {n_gauged} from gaugings, {n_default} from reach-type defaults")
-
+    n_flood = sum("gaugings>bankfull" in s_ for s_ in sources)
+    n_fit = sum("rating-fit" in s_ or "gaugings-topQ" in s_ or "gaugings-all" in s_
+                for s_ in sources)
+    print(f"  Velocities: {n_flood} from above-bankfull gaugings, {n_fit} from the "
+          f"station velocity-stage data at bankfull ({VELOCITY_FALLBACK}), "
+          f"{len(sources) - n_flood - n_fit} reach-type defaults")
     if verbose:
-        for s in sources:
-            print(s)
-
+        for s_ in sources:
+            print(s_)
     return velocities
 
 

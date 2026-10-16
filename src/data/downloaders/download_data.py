@@ -26,10 +26,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.data.downloaders.rainfall_downloader   import RainfallDownloader
-from src.data.downloaders.waterlevel_downloader import WaterLevelDownloader
+from src.data.downloaders.rainfall_downloader import RainfallDownloader
 from src.data.downloaders.discharge_downloader import DischargeDownloader
-from src.data.processors.timeseries_processor  import TimeSeriesProcessor
+from src.data.downloaders.waterlevel_downloader import WaterLevelDownloader
+from src.data.processors.timeseries_processor import TimeSeriesProcessor
+
 
 from src.utils.config import load_config
 from src.utils.logger import get_logger

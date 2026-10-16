@@ -114,66 +114,50 @@ ACC_THRESH   = 500    # flow accumulation threshold for stream definition
 def fill_pits_priority_flood(
     dem_data: np.ndarray,
     nan_mask: np.ndarray,
+    epsilon: float = 1e-4,
 ) -> np.ndarray:
     """
-    Fill all sinks and depressions in the DEM using the Priority-Flood
-    algorithm (Barnes et al. 2014, Computers & Geosciences 62, 117-127).
+    Priority-Flood + epsilon depression filling (Barnes et al. 2014,
+    Algorithm 3), so every valid cell has a STRICTLY descending path to the
+    edge of the valid data.
 
-    Priority-Flood guarantees that the output surface is hydrologically
-    conditioned: every cell has a downslope path to the DEM boundary,
-    eliminating spurious pits that would otherwise produce undefined D8
-    flow directions and break the accumulation chain.
-
-    The algorithm initialises a min-heap with all DEM border cells and
-    processes cells in order of ascending elevation.  Each unvisited
-    neighbour is assigned max(its own elevation, current cell elevation),
-    ensuring that inward-draining depressions are raised to the lowest
-    outlet elevation that allows drainage.
-
-    Parameters
-    ----------
-    dem_data : [H, W] float64  raw DEM elevations (NaN for nodata)
-    nan_mask : [H, W] bool     True where cell is nodata
-
-    Returns
-    -------
-    filled : [H, W] float64  pit-filled DEM (NaN preserved at nodata)
+    REVISION AUDIT — the submitted version seeded the heap only with cells
+    on the RASTER border. The project DEM is clipped to the catchment, so
+    every raster-border cell is nodata, the heap started empty and the
+    function returned the raw DEM unchanged ("0 cells raised"). D8
+    directions were then computed on an unfilled DEM; the drainage network
+    fragmented (maximum accumulation 13,194 cells = 11.9 km2 for a
+    1,150 km2 catchment), and the HAND surface, the HAND candidate edges
+    (hand_threshold, z_saddle) and the DFC HAND edge feature were derived
+    from that fragmented network. Seeds now include every valid cell that
+    touches nodata or the raster border, and filled cells are raised by
+    epsilon so flats drain (no D8 cycles).
     """
     H, W    = dem_data.shape
     filled  = dem_data.copy().astype(np.float64)
-    visited = np.zeros((H, W), dtype=bool)
-    heap    = []
-
-    # Seed the heap with all valid border cells
-    for r in range(H):
-        for c in [0, W - 1]:
-            if not nan_mask[r, c]:
-                heapq.heappush(heap, (filled[r, c], r, c))
-                visited[r, c] = True
-    for c in range(1, W - 1):
-        for r in [0, H - 1]:
-            if not nan_mask[r, c] and not visited[r, c]:
-                heapq.heappush(heap, (filled[r, c], r, c))
-                visited[r, c] = True
-
-    neighbours = [(-1,-1),(-1, 0),(-1, 1),
-                  ( 0,-1),         ( 0, 1),
-                  ( 1,-1),( 1, 0),( 1, 1)]
-
+    valid   = ~nan_mask
+    pad     = np.pad(nan_mask, 1, constant_values=True)
+    touches_nodata = np.zeros_like(nan_mask)
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            if di or dj:
+                touches_nodata |= pad[1 + di:1 + di + H, 1 + dj:1 + dj + W]
+    seeds = valid & touches_nodata
+    visited = seeds.copy()
+    heap = [(filled[r, c], int(r), int(c)) for r, c in zip(*np.where(seeds))]
+    heapq.heapify(heap)
+    neighbours = [(-1,-1),(-1, 0),(-1, 1),( 0,-1),( 0, 1),( 1,-1),( 1, 0),( 1, 1)]
     while heap:
         elev, r, c = heapq.heappop(heap)
         for dr, dc in neighbours:
             nr, nc = r + dr, c + dc
-            if (0 <= nr < H and 0 <= nc < W
-                    and not visited[nr, nc]
-                    and not nan_mask[nr, nc]):
+            if 0 <= nr < H and 0 <= nc < W and not visited[nr, nc] and valid[nr, nc]:
                 visited[nr, nc] = True
-                # Raise neighbour to at least the current cell's elevation
-                filled[nr, nc]  = max(filled[nr, nc], elev)
+                if filled[nr, nc] <= elev:
+                    filled[nr, nc] = elev + epsilon
                 heapq.heappush(heap, (filled[nr, nc], nr, nc))
-
-    n_raised = int(((filled > dem_data) & ~nan_mask).sum())
-    print(f"  Priority-Flood: {n_raised:,} cells raised to fill depressions")
+    n_raised = int(((filled > dem_data + 1e-9) & valid).sum())
+    print(f"  Priority-Flood+eps: {n_raised:,} cells raised; seeds {int(seeds.sum()):,}")
     return filled
 
 
@@ -186,69 +170,44 @@ def compute_d8_and_accumulation(
     nan_mask:   np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute D8 flow direction and D8 flow accumulation from the
-    pit-filled DEM, following O'Callaghan & Mark (1984) and
-    Jenson & Domingue (1988).
+    D8 flow direction (O'Callaghan & Mark 1984) and accumulation (Jenson &
+    Domingue 1988) on the epsilon-filled DEM.
 
-    D8 assigns each cell to the steepest downslope neighbour among its
-    eight cardinal and diagonal neighbours.  Diagonal slopes are
-    normalised by sqrt(2) to account for the longer diagonal path
-    length (O'Callaghan & Mark 1984).
-
-    Flow accumulation is computed by processing cells in descending
-    elevation order and propagating the accumulation count to the single
-    D8 downstream neighbour (Jenson & Domingue 1988).
-
-    Parameters
-    ----------
-    filled_dem : [H, W] float64  pit-filled DEM
-    nan_mask   : [H, W] bool     True where cell is nodata
-
-    Returns
-    -------
-    dr       : [H, W] int8   row offset to D8 downstream neighbour
-    dc       : [H, W] int8   col offset to D8 downstream neighbour
-    acc      : [H, W] float32 flow accumulation (upstream cell count)
+    REVISION AUDIT: the submitted version initialised the steepest slope at
+    -inf, so every cell — including cells whose neighbours are all higher or
+    equal — received a direction, sometimes uphill or into a flat (cycles).
+    Directions are now assigned only to STRICTLY lower neighbours; cells
+    with none (outlets on the data edge) have no direction. With the
+    epsilon fill every interior cell has one.
     """
     H, W = filled_dem.shape
-
-    # ── D8 flow direction ─────────────────────────────────────────────
-    sentinel = float(np.nanmax(filled_dem)) + 1e6
-    dem_work = filled_dem.copy()
-    dem_work[nan_mask] = sentinel
-
+    sentinel = np.inf
+    dem_work = np.where(nan_mask, sentinel, filled_dem)
     pad = np.pad(dem_work, 1, mode="constant", constant_values=sentinel)
-    dr  = np.zeros((H, W), dtype=np.int8)
-    dc  = np.zeros((H, W), dtype=np.int8)
-    max_slope = np.full((H, W), -np.inf)
-
+    dr = np.zeros((H, W), dtype=np.int8)
+    dc = np.zeros((H, W), dtype=np.int8)
+    max_slope = np.zeros((H, W))          # only strictly positive slopes count
     for di, dj, dist in [(-1,-1,1.4142),(-1, 0,1.0),(-1, 1,1.4142),
-                          ( 0,-1,1.0),              ( 0, 1,1.0),
-                          ( 1,-1,1.4142),( 1, 0,1.0),( 1, 1,1.4142)]:
-        ri   = 1 + di
-        ci   = 1 + dj
-        neigh = pad[ri:ri+H, ci:ci+W]
-        slope = (dem_work - neigh) / dist
-        update = (slope > max_slope) & ~nan_mask
-        dr[update]        = di
-        dc[update]        = dj
-        max_slope[update] = slope[update]
-
-    # ── Flow accumulation ─────────────────────────────────────────────
-    acc = np.ones((H, W), dtype=np.float32)
+                         ( 0,-1,1.0),              ( 0, 1,1.0),
+                         ( 1,-1,1.4142),( 1, 0,1.0),( 1, 1,1.4142)]:
+        neigh = pad[1 + di:1 + di + H, 1 + dj:1 + dj + W]
+        with np.errstate(invalid="ignore"):
+            slope = (dem_work - neigh) / dist
+        update = np.isfinite(slope) & (slope > max_slope) & ~nan_mask
+        dr[update] = di; dc[update] = dj; max_slope[update] = slope[update]
+    acc = np.ones((H, W), dtype=np.float64)
     acc[nan_mask] = 0.0
-
-    flat_order = np.argsort(dem_work.ravel())[::-1]   # high → low
-    for idx in flat_order:
+    order = np.argsort(np.where(nan_mask, -np.inf, filled_dem).ravel())[::-1]
+    for idx in order:
         r, c = divmod(int(idx), W)
         if nan_mask[r, c] or (dr[r, c] == 0 and dc[r, c] == 0):
             continue
         nr, nc = r + int(dr[r, c]), c + int(dc[r, c])
         if 0 <= nr < H and 0 <= nc < W and not nan_mask[nr, nc]:
             acc[nr, nc] += acc[r, c]
-
-    print(f"  Accumulation range: [1, {acc.max():.0f}] cells")
-    return dr, dc, acc
+    print(f"  Accumulation range: [1, {acc.max():.0f}] cells "
+          f"({acc.max() * 9e-4:.1f} km2 at 30 m)")
+    return dr, dc, acc.astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -561,9 +520,13 @@ def load_static_edges(graph_dir: Path) -> np.ndarray | None:
         print(f"  edges.csv not found — no pairs excluded")
         return None
     df = pd.read_csv(edges_csv)
-    if "src" in df.columns and "dst" in df.columns:
-        return np.stack([df["src"].values, df["dst"].values])
-    return None
+    # REVISION AUDIT: edges.csv uses src_idx/dst_idx. The submitted code only
+    # recognised src/dst, returned None, and therefore excluded NO river-
+    # connected pairs from the HAND candidates (contrary to Section 3.2.2).
+    for a, b in (("src_idx", "dst_idx"), ("src", "dst")):
+        if a in df.columns and b in df.columns:
+            return np.stack([df[a].values, df[b].values]).astype(int)
+    raise KeyError(f"edges.csv has no src/dst columns: {list(df.columns)}")
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -1,49 +1,43 @@
 """
-unit_hydrograph.py  —  Calibrate UH parameters for synthetic scenario generation
-==================================================================================
-Derives three parameter sets from data already in the project — no external
-hydraulic model or additional data sources required.
+unit_hydrograph.py  —  Calibrate response-kernel and routing parameters
+========================================================================
+Writes (dataset/graph/):
+    uh_params.json       per-node Tc, Tp, Tb, peak response rate + provenance
+    routing_lags.json    per-edge travel time (15-min steps) + provenance
 
-Outputs (written to dataset/graph/):
-    uh_params.json       per-node time-of-concentration, peak response rate,
-                         and UH shape parameters
-    routing_lags.json    per-edge flood wave travel time (timesteps at 15-min)
-
-Algorithm
----------
-1. Time of concentration (Tc):
-   Kirpich (1940) formula applied using catchment area from nodes.csv and
-   elevation drop from edges.csv. Validated against empirical cross-correlation
-   lags from y.npy; empirical estimate takes precedence where correlation is
-   sufficient (r > 0.50 for at least 50 events).
-
-2. Routing lag:
-   Kinematic wave celerity (Lighthill & Whitham 1955): c = (5/3) × V_mean,
-   Manning V_mean from channel slope (edges.csv) and bankfull hydraulic
-   radius (nodes.csv p90_mAOD − gauge_datum_mOSGM15). Validated against
-   empirical lag from cross-correlation of adjacent gauge stage anomalies.
-
-3. UH peak response rate:
-   Data-driven: for each gauge, identify rainfall events > 5mm/15min in
-   X.npy feature 4, measure peak stage anomaly response within 6 hours in
-   y.npy, compute median(peak_rise / cumulative_rainfall) across all events.
-   This ensures the synthetic stage perturbations are calibrated to the
-   actual rainfall–stage relationship observed at each specific gauge.
-
-References
-----------
-Kirpich, Z.P. (1940). Time of concentration of small agricultural watersheds.
-    Civil Engineering, 10(6), 501.
-Lighthill, M.J., Whitham, G.B. (1955). On kinematic waves I: Flood movement
-    in long rivers. Proceedings of the Royal Society A, 229(1178), 281-316.
-USDA-NRCS (2004). Chapter 16, National Engineering Handbook Part 630.
+REVISION AUDIT — what changed and why
+-------------------------------------
+1. Kirpich units (reviewer Priority 1). Tc[min] = 0.0195 L[m]^0.77 S^-0.385
+   returns MINUTES; hours = minutes / 60 (scenarios/hydro.py). The manuscript
+   text "Tc in hours" is wrong for this form and must be corrected.
+2. Kirpich SLOPE. The submitted code used (bankfull depth or upstream-edge
+   gauge-datum drop) / hydraulic length, which is not a channel slope; most
+   nodes then hit the slope floor and the 8 h Tc ceiling (see
+   data/compute_kirpich_inputs.py). Priority order is now:
+     (a) DEM longest-flow-path L and 10-85 % slope (kirpich_inputs.csv);
+     (b) otherwise L = 1500 sqrt(A) and the median WATER-SURFACE slope of the
+         node's incident, downhill, non-reservoir river reaches.
+   Every node records `slope_source` and whether Tc was clipped. The run
+   warns if more than 25 % of nodes sit on a clipping bound.
+3. Catchment area: nodes.csv stores log(A + 1), so A = exp(.) - 1 (the
+   submitted code used exp(.), adding 1 km2 to every node).
+4. Triangular kernel: Tp = D/2 + 0.6 Tc and the STANDARD SCS base
+   Tb = 2.67 Tp (was 2.67 Tc).
+5. Calibration uses the TRAINING period only (scenario targets are later
+   evaluated on test-period base windows, so the generator must not be
+   fitted on them), and only real (non-gap-filled) observations.
+6. Routing: water-surface slopes; destination depth from utils.datum (the
+   headrace local-zero datum no longer gives a 45-61 m "bankfull depth"
+   that collapsed four reservoir edges to the 1-step minimum lag); for
+   edges INTO a reservoir pool the source reach depth is used. Uphill
+   reverse duplicates are excluded.
+7. Uncalibrated nodes inherit a rate from the GEOGRAPHICALLY nearest
+   calibrated node (ITM coordinates), not the nearest node index.
 
 Usage
 -----
-    python src/scenarios/unit_hydrograph.py
-    python src/scenarios/unit_hydrograph.py --validate  # extra diagnostics
+    python src/scenarios/unit_hydrograph.py [--validate]
 """
-
 from __future__ import annotations
 
 import argparse
@@ -55,496 +49,335 @@ import numpy as np
 import pandas as pd
 from scipy.signal import correlate
 
-# ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR  = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+for _p in (BASE_DIR, BASE_DIR / "src", BASE_DIR / "src/scenarios"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from scenarios.hydro import (STEP_MIN, STEP_HR, kirpich_tc_minutes,
+                             scs_triangle_times)
+from utils.datum import bankfull_depth_proxy
+from utils.graph_checks import river_edges
+
 PROC_DIR  = BASE_DIR / "dataset/processed"
 GRAPH_DIR = BASE_DIR / "dataset/graph"
-OUT_DIR   = GRAPH_DIR          # UH parameters stored alongside graph data
+OUT_DIR   = GRAPH_DIR
 
-STEP_MIN  = 15                 # temporal resolution (minutes)
-STEP_HR   = STEP_MIN / 60.0   # 0.25 hr
-F_RAINFALL   = 4              # index in X.npy: rainfall_mm per 15-min
-F_STAGE_ANOM = 0              # index in X.npy: stage_anomaly
-F_SWVL2_SAT  = 9              # index in X.npy: swvl2_sat_ratio
-MANNING_N    = 0.035           # roughness for natural Irish lowland channel
-MIN_EVENTS   = 3              # minimum events for empirical calibration
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 1 — Time of concentration (Tc) per node
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_tc_kirpich(nodes_df: pd.DataFrame,
-                       edges_df: pd.DataFrame) -> dict[int, float]:
-    """
-    Estimate Tc (hours) for each gauge sub-catchment using the Kirpich formula.
-
-    Tc = 0.0195 × L_m^0.77 × S^-0.385
-
-    where:
-        L_m = hydraulic length of main channel (m), approximated as
-              1.5 × sqrt(A_km2) × 1000  (standard catchment scaling, m)
-        S   = average channel slope (m/m), estimated as
-              sum(elev_drop_m along upstream path) / L_m
-
-    Slope is bounded at 0.0002 m/m (flat urban channels) to prevent
-    unrealistically long Tc on very gentle Lee main stem reaches.
-
-    Returns dict {node_idx: Tc_hours}.
-    """
-    tc_map: dict[int, float] = {}
-
-    # Build a lookup of total upstream elevation drop per node
-    # using the longest upstream edge path through the network
-    elev_drop_per_node: dict[int, float] = {
-        int(r.node_idx): float(r.p90_mAOD - r.gauge_datum_mOSGM15)
-        for _, r in nodes_df.iterrows()
-    }
-
-    for _, row in nodes_df.iterrows():
-        idx      = int(row.node_idx)
-        area_km2 = float(np.exp(row.log_catchment_area_km2))  # undo log
-
-        # Hydraulic length approximation (m)
-        L_m = 1500.0 * np.sqrt(max(area_km2, 0.01))
-
-        # Elevation drop — use bankfull depth above datum as proxy for
-        # total head loss along the main channel
-        head_drop = elev_drop_per_node.get(idx, 1.0)
-        head_drop = max(head_drop, 0.5)   # minimum 0.5m head
-
-        # Also accumulate elevation drops along upstream edges
-        up_edges = edges_df[edges_df.dst_idx == idx]
-        if not up_edges.empty:
-            head_drop = max(head_drop, up_edges.elev_drop_m.max())
-
-        slope = head_drop / L_m
-        slope = max(slope, 0.0002)         # floor for flat reaches
-
-        # BUGFIX (2026-09-22): the metric Kirpich formula with coefficient
-        # 0.0195 and L in metres outputs T_c in MINUTES, not seconds --
-        # confirmed against the Texas DOT Hydraulic Design Manual (K=0.0195
-        # for SI units gives "time of concentration, in minutes"). This was
-        # previously divided by 3600.0 as if the raw output were seconds,
-        # which understated T_c by ~60x and drove the large majority of
-        # non-tidal nodes onto the 0.25h floor below instead of their true
-        # (often multi-hour) response time. Divide by 60.0 to convert
-        # minutes -> hours instead.
-        tc = 0.0195 * (L_m ** 0.77) * (slope ** -0.385) / 60.0
-        tc = float(np.clip(tc, 0.25, 8.0))  # 15 min to 8 hr bounds
-        tc_map[idx] = tc
-
-    return tc_map
+F_RAINFALL   = 4
+F_STAGE_ANOM = 0
+MANNING_N    = 0.035
+MIN_EVENTS   = 3
+TC_BOUNDS_HR = (0.25, 8.0)
+SLOPE_FLOOR  = 0.0002
+CLIP_WARN_FRAC = 0.25
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 2 — Routing lags between adjacent gauge pairs
-# ══════════════════════════════════════════════════════════════════════════════
+def node_area_km2(nodes_df: pd.DataFrame) -> np.ndarray:
+    """nodes.csv stores log(A + 1) (graph_builder.py)."""
+    return np.clip(np.expm1(nodes_df["log_catchment_area_km2"].to_numpy(float)), 0.0, None)
 
-def compute_kinematic_lag(edges_df: pd.DataFrame,
-                          nodes_df: pd.DataFrame) -> dict[tuple, int]:
-    """
-    Estimate flood wave travel time (timesteps) for each directed edge.
 
-    Uses kinematic wave celerity: c = (5/3) × V_mean
-    Manning V_mean = (1/n) × R^(2/3) × S^(1/2)
+def water_surface_level(nodes_df: pd.DataFrame) -> np.ndarray:
+    """Typical water-surface elevation per node for reach slopes."""
+    if "p50_mAOD_train" in nodes_df.columns:
+        ws = nodes_df["p50_mAOD_train"].to_numpy(float)
+        dat = nodes_df["gauge_datum_mOSGM15"].to_numpy(float)
+        return np.where(np.isfinite(ws), ws, dat)
+    return nodes_df["gauge_datum_mOSGM15"].to_numpy(float)
 
-    where:
-        n — Manning roughness coefficient (0.035 for natural channel)
-        R — hydraulic radius at bankfull ≈ 0.6 × bankfull depth
-        S — channel slope = elev_drop_m / (river_dist_km × 1000)
 
-    Returns dict {(src_idx, dst_idx): lag_steps}.
-    """
-    # Build node lookup for p90 and datum
-    node_info = nodes_df.set_index('node_idx')[
-        ['gauge_datum_mOSGM15', 'p90_mAOD']].to_dict('index')
+def reach_slopes(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> pd.Series:
+    """Water-surface slope per edge (NaN where not physically meaningful)."""
+    ws = water_surface_level(nodes_df)
+    is_res = nodes_df["is_reservoir"].to_numpy().astype(bool)
+    is_tid = nodes_df["is_tidal"].to_numpy().astype(bool)
+    from utils.datum import abs_datum_valid
+    ok_datum = abs_datum_valid(nodes_df)
+    out = []
+    for e in edges_df.itertuples():
+        s, d = int(e.src_idx), int(e.dst_idx)
+        L = float(e.river_dist_km) * 1000.0
+        if L < 100 or is_tid[s] or is_tid[d] or not (ok_datum[s] and ok_datum[d]):
+            out.append(np.nan); continue
+        drop = ws[s] - ws[d]
+        out.append(drop / L if drop > 0 else np.nan)
+    return pd.Series(out, index=edges_df.index)
 
-    lag_map: dict[tuple, int] = {}
 
-    for _, edge in edges_df.iterrows():
-        src = int(edge.src_idx)
-        dst = int(edge.dst_idx)
-        dist_m = float(edge.river_dist_km) * 1000.0
+# ══════════════════════════════════════════════════════════════════════════
+# Step 1 — Tc per node
+# ══════════════════════════════════════════════════════════════════════════
 
+def compute_tc_kirpich(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
+                       kirpich_inputs: pd.DataFrame | None = None) -> pd.DataFrame:
+    edges_df = river_edges(edges_df)
+    area = node_area_km2(nodes_df)
+    slopes = reach_slopes(edges_df, nodes_df)
+    is_res = nodes_df["is_reservoir"].to_numpy().astype(bool)
+    median_slope = float(np.nanmedian(slopes)) if np.isfinite(slopes).any() else 0.002
+    rows = []
+    for i in range(len(nodes_df)):
+        src = "fallback_median_reach_slope"
+        L = 1500.0 * np.sqrt(max(area[i], 0.01))
+        S = np.nan
+        if kirpich_inputs is not None and i in set(kirpich_inputs.node_idx):
+            k = kirpich_inputs.set_index("node_idx").loc[i]
+            area_ok = bool(k.get("area_match_ok", True))
+            if area_ok and np.isfinite(k.L_m) and k.L_m > 0:
+                L = float(k.L_m)
+                S = float(k.S_10_85) if np.isfinite(k.S_10_85) and k.S_10_85 > 0 \
+                    else float(k.S_end_to_end)
+                src = "dem_longest_flow_path"
+        if not np.isfinite(S) or S <= 0:
+            inc = edges_df[((edges_df.dst_idx == i) | (edges_df.src_idx == i))]
+            inc = inc[~(is_res[inc.src_idx.to_numpy()] | is_res[inc.dst_idx.to_numpy()])]
+            cand = slopes.loc[inc.index].dropna()
+            if len(cand):
+                S, src = float(cand.median()), "incident_reach_water_surface_slope"
+            else:
+                S = median_slope
+        S_used = max(S, SLOPE_FLOOR)
+        tc_min = kirpich_tc_minutes(L, S_used)
+        tc_hr_raw = tc_min / 60.0
+        tc_hr = float(np.clip(tc_hr_raw, *TC_BOUNDS_HR))
+        rows.append({"node_idx": i, "L_m": L, "S": S, "S_used": S_used,
+                     "slope_source": src, "tc_min_raw": tc_min,
+                     "tc_hr": tc_hr, "tc_clipped": bool(tc_hr != tc_hr_raw),
+                     "slope_floored": bool(S_used != S)})
+    df = pd.DataFrame(rows).set_index("node_idx")
+    tid = nodes_df["is_tidal"].to_numpy().astype(bool)
+    big = node_area_km2(nodes_df) >= 300
+    ordinary = ~tid & ~big
+    n_clip = int(df.tc_clipped[ordinary].sum())
+    print(f"  Tc clipped: {n_clip}/{int(ordinary.sum())} ordinary gauges; "
+          f"{int(df.tc_clipped[big].sum())}/{int(big.sum())} large (>=300 km2) "
+          f"main-stem/reservoir gauges sit on the {TC_BOUNDS_HR[1]} h cap "
+          f"(Kirpich is a small-catchment formula; the cap is binding there); "
+          f"tidal gauges use fixed parameters.")
+    if df.tc_clipped[ordinary].mean() > CLIP_WARN_FRAC:
+        print("  WARNING: Tc is bound-dominated for ordinary gauges - provide "
+              "dataset/graph/kirpich_inputs.csv (compute_kirpich_inputs.py).")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Step 2 — Routing lags
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_kinematic_lag(edges_df: pd.DataFrame, nodes_df: pd.DataFrame) -> pd.DataFrame:
+    from utils.datum import abs_datum_valid
+    edges_df = river_edges(edges_df)
+    depth = bankfull_depth_proxy(nodes_df)
+    # A channel-depth proxy only exists at ordinary river gauges: not at
+    # tidal gauges (no p90) and not at pool gauges with a local-zero datum.
+    depth_ok = abs_datum_valid(nodes_df) & ~nodes_df["is_tidal"].to_numpy().astype(bool)
+    if "stage_ref_low_m" in nodes_df:
+        # pool gauges (local-zero datum): drawdown range is not a channel depth
+        depth_ok &= np.abs(nodes_df["stage_ref_low_m"].to_numpy(float)
+                           - nodes_df["gauge_datum_mOSGM15"].to_numpy(float)) < 0.5
+    med_depth = float(np.median(depth[depth_ok])) if depth_ok.any() else 1.0
+    slopes = reach_slopes(edges_df, nodes_df)
+    med = float(np.nanmedian(slopes)) if np.isfinite(slopes).any() else 0.001
+    rows = []
+    for k, e in edges_df.iterrows():
+        s, d = int(e.src_idx), int(e.dst_idx)
+        dist_m = float(e.river_dist_km) * 1000.0
         if dist_m < 100:
-            lag_map[(src, dst)] = 1
+            rows.append({"src": s, "dst": d, "lag_steps": 1, "source": "short_reach"}); continue
+        S = slopes.loc[k]
+        s_src = "water_surface"
+        if not np.isfinite(S):
+            S, s_src = med, "median_reach_slope"
+        S = max(S, 0.0001)
+        # Depth of the conveying reach: destination gauge if it has a valid
+        # channel-depth proxy, else the source gauge, else the network median.
+        d_bf = depth[d] if depth_ok[d] else (depth[s] if depth_ok[s] else med_depth)
+        d_bf = max(float(d_bf), 0.3)
+        R = 0.6 * d_bf
+        V = max((1.0 / MANNING_N) * R ** (2 / 3) * S ** 0.5, 0.1)
+        c = (5.0 / 3.0) * V
+        lag = max(1, int(round(dist_m / c / (STEP_MIN * 60))))
+        rows.append({"src": s, "dst": d, "lag_steps": lag, "source": "kinematic",
+                     "slope": S, "slope_source": s_src, "depth_m": d_bf,
+                     "celerity_ms": c})
+    return pd.DataFrame(rows)
+
+
+def empirical_routing_lag(stage: np.ndarray, valid: np.ndarray,
+                          edges_df: pd.DataFrame, max_lag_steps: int = 48) -> dict:
+    """Peak normalised cross-correlation lag (training period, real obs)."""
+    edges_df = river_edges(edges_df)
+    out = {}
+    for e in edges_df.itertuples():
+        s, d = int(e.src_idx), int(e.dst_idx)
+        v = valid[:, s] & valid[:, d] & np.isfinite(stage[:, s]) & np.isfinite(stage[:, d])
+        if v.sum() < 500:
             continue
-
-        elev_drop = float(edge.elev_drop_m)
-        slope = max(elev_drop / dist_m, 0.0001)
-
-        # Bankfull hydraulic radius at destination gauge
-        dst_info   = node_info.get(dst, {})
-        depth_bf   = float(dst_info.get('p90_mAOD', 1.0)) - \
-                     float(dst_info.get('gauge_datum_mOSGM15', 0.0))
-        depth_bf   = max(depth_bf, 0.3)
-        R = depth_bf * 0.6    # hydraulic radius ≈ 60% of bankfull depth
-
-        V_mean = (1.0 / MANNING_N) * (R ** (2.0/3.0)) * (slope ** 0.5)
-        V_mean = max(V_mean, 0.1)   # 0.1 m/s minimum
-        c      = (5.0/3.0) * V_mean
-
-        lag_sec   = dist_m / c
-        lag_steps = max(1, round(lag_sec / (STEP_MIN * 60)))
-        lag_map[(src, dst)] = lag_steps
-
-    return lag_map
+        a = np.where(v, stage[:, s] - np.nanmean(stage[v, s]), 0.0)
+        b = np.where(v, stage[:, d] - np.nanmean(stage[v, d]), 0.0)
+        xc = correlate(b, a, mode="full")
+        mid = len(a) - 1
+        win = xc[mid: mid + max_lag_steps + 1]          # non-negative lags only
+        lag = int(np.argmax(win))
+        corr = float(win[lag]) / (np.std(a[v]) * np.std(b[v]) * v.sum() + 1e-12)
+        if corr > 0.50 and lag > 0:
+            out[(s, d)] = (lag, corr)
+    return out
 
 
-def empirical_routing_lag(y: np.ndarray,
-                          edges_df: pd.DataFrame,
-                          max_lag_steps: int = 48) -> dict[tuple, int]:
-    """
-    Estimate routing lags empirically from cross-correlation of stage
-    anomaly time series at adjacent gauge pairs.
+# ══════════════════════════════════════════════════════════════════════════
+# Step 3 — Peak response rate
+# ══════════════════════════════════════════════════════════════════════════
 
-    For each directed edge (src → dst), computes the lag at peak
-    cross-correlation between y[:, src] and y[:, dst]. Only accepts
-    estimates where the peak correlation exceeds 0.50 and at least
-    MIN_EVENTS windows show a consistent lag.
-
-    Returns dict {(src_idx, dst_idx): lag_steps} for edges with
-    sufficient empirical support.
-    """
-    empirical: dict[tuple, int] = {}
-
-    for _, edge in edges_df.iterrows():
-        src = int(edge.src_idx)
-        dst = int(edge.dst_idx)
-
-        s_src = y[:, src].astype(np.float64)
-        s_dst = y[:, dst].astype(np.float64)
-
-        # Remove NaN — use only valid pairs
-        valid = np.isfinite(s_src) & np.isfinite(s_dst)
-        if valid.sum() < 500:
-            continue
-
-        # Identify periods with significant stage rise (potential events)
-        threshold = np.nanpercentile(s_src[valid], 80)
-        event_mask = s_src > threshold
-        if event_mask.sum() < MIN_EVENTS * 4:
-            continue
-
-        # Cross-correlation over the max lag window
-        s1 = s_src - np.nanmean(s_src)
-        s2 = s_dst - np.nanmean(s_dst)
-        s1[~valid] = 0.0
-        s2[~valid] = 0.0
-
-        xcorr = correlate(s2, s1, mode='full')
-        lags  = np.arange(-max_lag_steps, max_lag_steps + 1)
-        mid   = len(xcorr) // 2
-        xcorr_window = xcorr[mid - max_lag_steps : mid + max_lag_steps + 1]
-
-        best_lag  = int(lags[np.argmax(xcorr_window)])
-        best_corr = float(np.max(xcorr_window)) / (
-            np.std(s1[valid]) * np.std(s2[valid]) * valid.sum() + 1e-8)
-
-        if best_corr > 0.50 and best_lag > 0:
-            empirical[(src, dst)] = best_lag
-
-    return empirical
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 3 — UH peak response rate from historical data
-# ══════════════════════════════════════════════════════════════════════════════
-
-def calibrate_uh_peak_rate(X: np.ndarray,
-                           y: np.ndarray,
-                           tc_map: dict[int, float],
-                           n_nodes: int,
-                           nodes_df=None) -> dict[int, float]:
-    """
-    Calibrate per-node unit hydrograph peak response rates from historical data.
-
-    For each gauge n:
-      1. Identify rainfall events where rainfall_mm[t, n] > 5 mm/15-min.
-      2. For each event, accumulate total rainfall over the Tc window.
-      3. Measure peak stage anomaly response in the following 2×Tc window.
-      4. peak_rate[n] = median(peak_response / total_rainfall) across events.
-
-    Returns dict {node_idx: peak_rate (m stage anomaly per mm rainfall)}.
-    """
-    peak_rates: dict[int, float] = {}
-
-    rainfall  = X[:, :, F_RAINFALL]    # [T, N]
-    stage     = y                        # [T, N]
-
-    # Node type flags — extract once before the loop
-    tidal_idx     = set(nodes_df[nodes_df.is_tidal     == 1].node_idx.tolist())
-    reservoir_idx = set(nodes_df[nodes_df.is_reservoir == 1].node_idx.tolist())
-    node_area_map = {int(r.node_idx):
-                     float(np.exp(r.log_catchment_area_km2))
-                     for _, r in nodes_df.iterrows()}
-
-    for n in range(n_nodes):
-        # ── Hard-coded defaults for confounded node types ────────────
-        # Tidal nodes: stage driven by tidal oscillation (±1m per 12.4hr).
-        # Rainfall co-inciding with a rising tide gives spurious rates
-        # (0.077 m/mm observed = 2.3m stage rise per 30mm rain — absurd).
-        # Fix: 0.003 m/mm — tidal gauges DO respond to rainfall but the
-        # signal is strongly attenuated by estuarine dynamics.
-        if n in tidal_idx:
-            peak_rates[n] = 0.003
-            continue
-
-        # Reservoir nodes: stage controlled by ESB operational releases.
-        # Rainfall-stage correlations are meaningless here.
-        if n in reservoir_idx:
-            peak_rates[n] = 0.005   # placeholder; not used in scenarios
-            continue
-
-        tc_steps  = max(1, round(tc_map.get(n, 1.0) / STEP_HR))
-        rain_n    = rainfall[:, n].astype(np.float64)
-        stage_n   = stage[:, n].astype(np.float64)
-
-        # Find timesteps where rainfall exceeds threshold
-        # Threshold: 1.5 mm/15min (moderate Irish rainfall = 6mm/hr)
-        event_starts = np.where(rain_n > 1.5)[0]
-        if len(event_starts) < MIN_EVENTS:
-            peak_rates[n] = None    # mark for inheritance
-            continue
-
-        # Cluster events (consecutive timesteps count as one event)
-        gaps   = np.diff(event_starts)
-        breaks = np.where(gaps > 8)[0]   # > 2hr gap = new event
-        e_starts = [event_starts[0]]
-        for b in breaks:
-            e_starts.append(event_starts[b + 1])
-
+def calibrate_uh_peak_rate(rain: np.ndarray, stage: np.ndarray, valid: np.ndarray,
+                           tc_hr: pd.Series, nodes_df: pd.DataFrame) -> pd.DataFrame:
+    N = len(nodes_df)
+    is_tid = nodes_df["is_tidal"].to_numpy().astype(bool)
+    is_res = nodes_df["is_reservoir"].to_numpy().astype(bool)
+    area = node_area_km2(nodes_df)
+    rows = {}
+    for n in range(N):
+        if is_tid[n]:
+            rows[n] = (0.003, "fixed_tidal", 0); continue
+        if is_res[n]:
+            rows[n] = (0.005, "fixed_reservoir", 0); continue
+        tcs = max(1, int(round(tc_hr.loc[n] / STEP_HR)))
+        r, h, v = rain[:, n].astype(float), stage[:, n].astype(float), valid[:, n]
+        starts = np.where(r > 1.5)[0]
+        if len(starts) < MIN_EVENTS:
+            rows[n] = (None, "no_rain_events", 0); continue
+        brk = np.where(np.diff(starts) > 8)[0]
+        e0 = [starts[0]] + [starts[b + 1] for b in brk]
         rates = []
-        for t0 in e_starts:
-            # Accumulate rainfall over Tc window
-            t1 = min(t0 + tc_steps, len(rain_n))
-            total_rain = float(rain_n[t0:t1].sum())
-            if total_rain < 10.0:
-                continue   # too little rain for reliable calibration
-
-            # Measure peak stage rise in 2×Tc window after event
-            t2 = min(t0 + tc_steps, len(stage_n))
-            t3 = min(t0 + 3 * tc_steps, len(stage_n))
-            if t3 <= t2:
+        for t0 in e0:
+            t1 = min(t0 + tcs, len(r)); t3 = min(t0 + 3 * tcs, len(h))
+            if t3 <= t1 or t0 < 4:
                 continue
-
-            baseline = float(np.nanmean(stage_n[max(0, t0-4):t0]))
-            peak     = float(np.nanmax(stage_n[t2:t3]))
-            rise     = max(0.0, peak - baseline)
-
-            if rise > 0.0:
-                rates.append(rise / total_rain)
-
-        if len(rates) >= MIN_EVENTS // 2:
-            peak_rates[n] = float(np.median(rates))
-        else:
-            peak_rates[n] = None    # mark for inheritance
-
-    # ── Inherit peak_rate from nearest node with valid calibration ──
-    # Nodes with rainfall_mm = 0 (no raingauge in Thiessen polygon)
-    # cannot be calibrated directly. Use the nearest calibrated
-    # neighbour as a proxy, scaled by sqrt(area_ratio) to account
-    # for sub-catchment size differences.
-    node_areas = np.exp(nodes_df.set_index('node_idx')[
-        'log_catchment_area_km2'].values.astype(np.float64))
-    calibrated  = {k: v for k, v in peak_rates.items() if v is not None}
-    uncalibrated = [k for k, v in peak_rates.items() if v is None]
-
-    if uncalibrated and calibrated:
-        cal_arr  = np.array(sorted(calibrated.keys()))
-        for n_idx in uncalibrated:
-            # Find nearest calibrated node by node index proximity
-            # (index order follows spatial ordering in nodes.csv)
-            diffs  = np.abs(cal_arr - n_idx)
-            donor  = int(cal_arr[np.argmin(diffs)])
-            donor_area = max(node_areas[donor], 0.01)
-            own_area   = max(node_areas[n_idx],  0.01)
-            # Smaller catchments respond more sharply to rainfall
-            scale  = np.sqrt(donor_area / own_area)
-            inherited = calibrated[donor] * scale
-            peak_rates[n_idx] = float(np.clip(inherited, 0.001, 0.05))
-        print(f"  Inherited peak_rate for {len(uncalibrated)} "
-              f"nodes with no rainfall data from nearest calibrated "
-              f"neighbours.")
-
-    # Final fallback for any remaining None values
-    for k in peak_rates:
-        if peak_rates[k] is None:
-            peak_rates[k] = 0.005
-
-    # ── Physical bounds enforcement ───────────────────────────────────
-    # Tidal and reservoir nodes keep their fixed defaults unchanged.
-    # For all other nodes, apply:
-#
-    # Floor: area-dependent minimum response rate.
-    #   <25 km²:  0.015 m/mm — small steep Irish headwaters
-    #   <100 km²: 0.010 m/mm — mid-catchment gauges
-    #   ≥100 km²: 0.005 m/mm — large main stem gauges
-#
-    # Cap: 0.030 m/mm — no gauge in the Lee network (1–1200 km²)
-    # should produce more than 90cm rise per 30mm convective pulse.
-    # Values above this are invariably spurious (tidal/urban backwater).
-
-    for n_idx in list(peak_rates.keys()):
-        if n_idx in tidal_idx or n_idx in reservoir_idx:
-            continue    # fixed defaults — do not override
-        area = node_area_map.get(n_idx, 100.0)
-        if area < 25.0:
-            floor = 0.015
-        elif area < 100.0:
-            floor = 0.010
-        else:
-            floor = 0.005
-        peak_rates[n_idx] = float(np.clip(peak_rates[n_idx], floor, 0.030))
-
-    return peak_rates
+            if not (v[t0 - 4:t0].all() and v[t1:t3].mean() > 0.9):
+                continue
+            tot = float(r[t0:t1].sum())
+            if tot < 10.0:
+                continue
+            rise = float(np.nanmax(h[t1:t3]) - np.nanmean(h[t0 - 4:t0]))
+            if rise > 0:
+                rates.append(rise / tot)
+        rows[n] = ((float(np.median(rates)), "calibrated", len(rates))
+                   if len(rates) >= max(1, MIN_EVENTS // 2) else (None, "too_few_events", len(rates)))
+    # Inherit from geographically nearest calibrated node
+    if {"easting_itm", "northing_itm"} <= set(nodes_df.columns):
+        xy = nodes_df[["easting_itm", "northing_itm"]].to_numpy(float)
+    else:
+        xy = nodes_df[["lon", "lat"]].to_numpy(float) * np.array([69e3, 111e3])
+    cal = [k for k, v in rows.items() if v[0] is not None and v[1] == "calibrated"]
+    for n, (val, src, ne) in list(rows.items()):
+        if val is None:
+            if cal:
+                dn = min(cal, key=lambda k: np.hypot(*(xy[k] - xy[n])))
+                scale = np.sqrt(max(area[dn], 0.01) / max(area[n], 0.01))
+                rows[n] = (float(np.clip(rows[dn][0] * scale, 0.001, 0.05)),
+                           f"inherited_from_{dn}", ne)
+            else:
+                rows[n] = (0.005, "default", ne)
+    out = []
+    for n in range(N):
+        val, src, ne = rows[n]
+        bound = None
+        if not (is_tid[n] or is_res[n]):
+            floor = 0.015 if area[n] < 25 else (0.010 if area[n] < 100 else 0.005)
+            clipped = float(np.clip(val, floor, 0.030))
+            bound = "floor" if clipped == floor and val < floor else (
+                "cap" if clipped == 0.030 and val > 0.030 else None)
+            val = clipped
+        out.append({"node_idx": n, "peak_rate_m_per_mm": val, "rate_source": src,
+                    "n_events": ne, "rate_on_bound": bound})
+    df = pd.DataFrame(out).set_index("node_idx")
+    nb = df.rate_on_bound.notna().sum()
+    print(f"  peak_rate on an area-tier bound: {nb}/{N} nodes "
+          f"(manuscript Section 3.8.2 disclosure)")
+    return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # Main
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def main(validate: bool = False) -> None:
-    print("=" * 62)
-    print("Unit hydrograph calibration for synthetic scenario generation")
-    print("=" * 62)
-
-    # ── Load graph data ───────────────────────────────────────────────
+    from utils.train_utils import get_split_boundary
     nodes_df = pd.read_csv(GRAPH_DIR / "nodes.csv")
-    edges_df = pd.read_csv(GRAPH_DIR / "edges.csv")
-    n_nodes  = len(nodes_df)
-    print(f"  Nodes: {n_nodes}   Edges: {len(edges_df)}")
-
-    # ── Load time-series data (mmap — no RAM copy) ────────────────────
-    print("  Loading X.npy and y.npy (mmap) …")
+    edges_df = river_edges(pd.read_csv(GRAPH_DIR / "edges.csv"))
     X = np.load(PROC_DIR / "X.npy", mmap_mode="r")
-    y = np.load(PROC_DIR / "y.npy", mmap_mode="r")
     T = X.shape[0]
-    print(f"  Dataset: T={T:,} steps  N={X.shape[1]}  F={X.shape[2]}")
+    t1, _ = get_split_boundary(T, 0.70, 0.15)
+    print(f"  Calibration on training rows [0, {t1}) of {T}")
+    stage = np.asarray(X[:t1, :, F_STAGE_ANOM], dtype=float)
+    rain = np.asarray(X[:t1, :, F_RAINFALL], dtype=float)
+    ivp = PROC_DIR / "input_valid_mask.npy"
+    valid = (np.load(ivp, mmap_mode="r")[:t1].astype(bool) if ivp.exists()
+             else np.ones_like(stage, dtype=bool))
 
-    # ── Step 1: Kirpich Tc ────────────────────────────────────────────
-    print("\nStep 1: Computing time-of-concentration (Kirpich 1940) …")
-    tc_map = compute_tc_kirpich(nodes_df, edges_df)
-    tc_vals = list(tc_map.values())
-    print(f"  Tc range: [{min(tc_vals):.2f}, {max(tc_vals):.2f}] hr")
+    kin = None
+    kp = GRAPH_DIR / "kirpich_inputs.csv"
+    if kp.exists():
+        kin = pd.read_csv(kp)
+        print(f"  Using DEM Kirpich inputs: {kp.name}")
+    else:
+        print("  [warn] kirpich_inputs.csv not found - using reach-slope fallback")
+    tc = compute_tc_kirpich(nodes_df, edges_df, kin)
+    print(f"  Tc range [{tc.tc_hr.min():.2f}, {tc.tc_hr.max():.2f}] h; "
+          f"clipped {int(tc.tc_clipped.sum())}/{len(tc)}")
 
-    # ── Step 2: Routing lags ──────────────────────────────────────────
-    print("\nStep 2: Computing routing lags …")
     kin_lags = compute_kinematic_lag(edges_df, nodes_df)
-    print(f"  Kinematic lag range: "
-          f"[{min(kin_lags.values())}, {max(kin_lags.values())}] steps")
-
-    print("  Computing empirical cross-correlation lags …")
-    emp_lags = empirical_routing_lag(np.array(y), edges_df)
-    print(f"  Empirical lags validated for {len(emp_lags)} / "
-          f"{len(edges_df)} edges")
-
-    # Merge: empirical takes precedence when available
-    final_lags: dict[str, int] = {}
-    for (src, dst), kin_lag in kin_lags.items():
-        emp_lag = emp_lags.get((src, dst))
-        if emp_lag is not None:
-            lag = emp_lag
-            source = "empirical"
+    emp = empirical_routing_lag(stage, valid, edges_df)
+    lags, lag_meta = {}, {}
+    for r in kin_lags.itertuples():
+        key = f"{r.src}_{r.dst}"
+        if (r.src, r.dst) in emp:
+            lags[key] = int(emp[(r.src, r.dst)][0])
+            lag_meta[key] = {"source": "empirical_xcorr",
+                             "corr": round(emp[(r.src, r.dst)][1], 3),
+                             "kinematic": int(r.lag_steps)}
         else:
-            lag = kin_lag
-            source = "kinematic"
-        final_lags[f"{src}_{dst}"] = int(lag)
+            lags[key] = int(r.lag_steps)
+            lag_meta[key] = {"source": r.source}
         if validate:
-            print(f"    edge {src}→{dst}: lag={lag} steps "
-                  f"({lag*STEP_MIN} min)  [{source}]")
+            print(f"    {key}: {lags[key]} steps [{lag_meta[key]['source']}]")
 
-    # ── Step 3: UH peak response rates ───────────────────────────────
-    print("\nStep 3: Calibrating UH peak response rates from X.npy/y.npy …")
-    peak_rates = calibrate_uh_peak_rate(np.array(X), np.array(y),
-                                        tc_map, n_nodes, nodes_df)
-    rates_vals = list(peak_rates.values())
-    default_count = sum(1 for v in rates_vals if abs(v - 0.005) < 1e-6)
-    print(f"  Peak rate range: [{min(rates_vals):.5f}, "
-          f"{max(rates_vals):.5f}] m/mm")
-    print(f"  Nodes at default fallback (0.005): {default_count}/{n_nodes}")
-    if default_count == n_nodes:
-        print("  WARNING: ALL nodes at default — check rainfall threshold")
-
-    # ── Assemble uh_params.json ───────────────────────────────────────
-    uh_params: dict[str, dict] = {}
-    for _, row in nodes_df.iterrows():
-        idx  = int(row.node_idx)
-        ref  = int(row.ref)
-
-        tc   = tc_map[idx]
-        tp   = 0.6 * tc                    # SCS triangular UH time to peak
-        base = 2.67 * tc                   # UH base width
-        rate = peak_rates[idx]
-        area = float(np.exp(row.log_catchment_area_km2))
-
-        uh_params[str(ref)] = {
-            "node_idx":        idx,
-            "ref":             ref,
-            "name":            row["name"],
-            "tc_hr":           round(tc,   3),
-            "tp_hr":           round(tp,   3),
-            "base_hr":         round(base, 3),
-            "peak_rate_m_per_mm": round(rate, 6),
-            "catchment_area_km2": round(area, 3),
-            "is_reservoir":    bool(row.is_reservoir),
-            "is_tidal":        bool(row.is_tidal),
+    rates = calibrate_uh_peak_rate(rain, stage, valid, tc.tc_hr, nodes_df)
+    area = node_area_km2(nodes_df)
+    params = {}
+    for i, row in nodes_df.iterrows():
+        tp, tb = scs_triangle_times(tc.loc[i, "tc_hr"])
+        params[str(int(row.ref))] = {
+            "node_idx": int(i), "ref": int(row.ref), "name": row["name"],
+            "tc_hr": round(float(tc.loc[i, "tc_hr"]), 4),
+            "tp_hr": round(tp, 4), "base_hr": round(tb, 4),
+            "tc_min_raw": round(float(tc.loc[i, "tc_min_raw"]), 2),
+            "tc_clipped": bool(tc.loc[i, "tc_clipped"]),
+            "L_m": round(float(tc.loc[i, "L_m"]), 1),
+            "slope": float(tc.loc[i, "S_used"]),
+            "slope_source": tc.loc[i, "slope_source"],
+            "peak_rate_m_per_mm": round(float(rates.loc[i, "peak_rate_m_per_mm"]), 6),
+            "rate_source": rates.loc[i, "rate_source"],
+            "rate_on_bound": rates.loc[i, "rate_on_bound"],
+            "catchment_area_km2": round(float(area[i]), 3),
+            "is_reservoir": bool(row.is_reservoir), "is_tidal": bool(row.is_tidal),
         }
-
-    # Save outputs
-    out_uh   = OUT_DIR / "uh_params.json"
-    out_lags = OUT_DIR / "routing_lags.json"
-
-    with open(out_uh, "w") as f:
-        json.dump({
-            "description": (
-                "Per-node unit hydrograph parameters calibrated from "
-                "Lee OPW gauge data (X.npy / y.npy). "
-                "Tc via Kirpich (1940); peak_rate via data-driven "
-                "rainfall-stage regression on historical events."
-            ),
-            "step_min": STEP_MIN,
-            "params":   uh_params,
-        }, f, indent=2)
-
-    with open(out_lags, "w") as f:
-        json.dump({
-            "description": (
-                "Per-edge flood wave routing lags (15-min timesteps). "
-                "Key format: 'src_idx_dst_idx'. "
-                "Kinematic wave celerity (Lighthill & Whitham 1955), "
-                "validated against empirical cross-correlation lags."
-            ),
-            "step_min": STEP_MIN,
-            "lags":     final_lags,
-        }, f, indent=2)
-
-    print(f"\n  Saved: {out_uh.name}")
-    print(f"  Saved: {out_lags.name}")
-
-    # ── Validation summary ────────────────────────────────────────────
-    print("\nPer-node summary (sorted by catchment area):")
-    print(f"  {'ref':>7} {'name':>28} {'Tc(hr)':>7} "
-          f"{'Tp(hr)':>7} {'rate(m/mm)':>11} {'area(km2)':>10}")
-    sorted_refs = sorted(uh_params.keys(),
-                         key=lambda r: uh_params[r]["catchment_area_km2"])
-    for ref in sorted_refs:
-        p = uh_params[ref]
-        flag = " [RES]" if p["is_reservoir"] else (
-               " [TID]" if p["is_tidal"] else "")
-        print(f"  {p['ref']:>7} {p['name'][:28]:>28} "
-              f"{p['tc_hr']:>7.3f} {p['tp_hr']:>7.3f} "
-              f"{p['peak_rate_m_per_mm']:>11.6f} "
-              f"{p['catchment_area_km2']:>10.1f}{flag}")
-
-    print("\nDone. Run scenario_generator.py --all to generate scenarios.")
+    with open(OUT_DIR / "uh_params.json", "w") as f:
+        json.dump({"description": "Per-node response-kernel parameters (revision audit "
+                                  "version; see module docstring).",
+                   "units": {"tc_hr": "hours (Kirpich minutes / 60)",
+                             "tp_hr": "hours, D/2 + 0.6 Tc",
+                             "base_hr": "hours, 2.67 Tp (standard SCS)"},
+                   "calibration_period_rows": [0, int(t1)],
+                   "step_min": STEP_MIN, "params": params}, f, indent=2)
+    with open(OUT_DIR / "routing_lags.json", "w") as f:
+        json.dump({"description": "Per-edge routing lags in 15-min steps; key "
+                                  "'src_dst'. Uphill reverse duplicates excluded.",
+                   "step_min": STEP_MIN, "lags": lags, "provenance": lag_meta}, f, indent=2)
+    print("  Saved uh_params.json, routing_lags.json")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Calibrate unit hydrograph parameters for scenario generation")
-    parser.add_argument("--validate", action="store_true",
-                        help="Print per-edge routing lag details")
-    args = parser.parse_args()
-    main(validate=args.validate)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--validate", action="store_true")
+    main(ap.parse_args().validate)

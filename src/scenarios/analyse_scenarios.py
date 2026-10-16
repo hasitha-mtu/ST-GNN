@@ -149,8 +149,18 @@ def _extract_horizon_hours(value, step_min: int = 15) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
+SCOPE = "observable"   # set by --scope; see load_data()
+
+
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load real and scenario result CSVs."""
+    """Load real and scenario result CSVs.
+
+    REVISION AUDIT: the revised evaluator reports every metric for all
+    forecasts and, with an `observable_` prefix, for forecasts issued after
+    the perturbation became visible in the model inputs. With
+    --scope observable (default) the observable columns are used under the
+    original column names, so every figure below uses them.
+    """
     if not SCEN_CSV.exists():
         print(f"Scenario summary not found: {SCEN_CSV}")
         print("Run: python src/scenarios/scenario_evaluator.py --all-scenarios")
@@ -164,6 +174,12 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     if "model_tag" in df_scen.columns and "model" not in df_scen.columns:
         df_scen = df_scen.rename(columns={"model_tag": "model"})
 
+    if SCOPE == "observable":
+        for c in ("nse_syn", "rmse_syn", "degradation_ratio", "nse_node_mean",
+                  "rmse_node_mean"):
+            if f"observable_{c}" in df_scen.columns:
+                df_scen[c] = df_scen[f"observable_{c}"].fillna(df_scen.get(c))
+        print("Using OBSERVABLE-scope scenario metrics")
     print(f"Scenario rows: {len(df_scen)}")
     print(f"Real-data rows: {len(df_real)}")
     return df_scen, df_real
@@ -708,6 +724,9 @@ def main() -> None:
         description="Analyse synthetic scenario results and produce paper figures")
     parser.add_argument("--no-show", action="store_true",
                         help="Do not display figures (save only)")
+    parser.add_argument("--scope", choices=["observable", "all"], default="observable")
+    global SCOPE
+    SCOPE = parser.parse_args().scope
     print("=" * 60)
     print("Scenario results analysis")
     print("=" * 60)

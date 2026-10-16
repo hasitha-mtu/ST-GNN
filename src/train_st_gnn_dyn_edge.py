@@ -519,9 +519,14 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
     discharge_col = 3
 
     t1, _ = get_split_boundary(T)  # same boundary make_gpu_loaders used
-    q_ref = float(X[:t1, :, discharge_col].mean())
-    q_ref = max(q_ref, 0.01)
-    logger.info("  Discharge reference Q_ref=%.4f (log1p-transformed)", q_ref)
+    # REVISION AUDIT (M2): per-node Q_ref (training period, valid steps)
+    from src.utils.train_utils import discharge_reference
+    q_ref_np = discharge_reference(X, t1, discharge_col)
+    q_ref = torch.from_numpy(q_ref_np)
+    logger.info("  Discharge reference Q_ref per node: min=%.3f median=%.3f max=%.3f "
+                "(log-transformed; %d nodes without discharge -> 1.0)",
+                q_ref_np.min(), float(np.median(q_ref_np)), q_ref_np.max(),
+                int((q_ref_np == 1.0).sum()))
 
     model = STGNNFloodModel(
         f_dyn=F,
@@ -611,7 +616,7 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir = None):
                     "batch_size": BATCH_SIZE, "lr": LR,
                     "sar_emb_dim": SAR_EMB_DIM if use_sar_run else 0,
                     "f_edge_dyn": f_edge + 1,
-                    "discharge_ref": q_ref,
+                    "discharge_ref": [round(float(v), 6) for v in q_ref_np],
                     "fno_width": FNO_WIDTH,
                     "fno_modes_high": FNO_MODES_HIGH,
                     "fno_modes_low":  FNO_MODES_LOW,

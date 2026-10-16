@@ -260,7 +260,7 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     gru_layers     = hp.get("gru_layers", 2),
                     sar_emb_dim    = hp.get("sar_emb_dim", 0),
                     discharge_idx  = hp.get("discharge_idx", 3),
-                    discharge_ref  = hp.get("discharge_ref", 1.0))
+                    discharge_ref  = sd.get("discharge_ref", hp.get("discharge_ref", 1.0)))
     elif tag == "st_gnn_hand_edge":
         # Phase 2: f_edge = raw + 1 (dynamic feature for both edge classes)
         gauge_datum = sd["gauge_datum"].cpu()
@@ -279,7 +279,7 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     gru_layers         = hp.get("gru_layers", 2),
                     sar_emb_dim        = hp.get("sar_emb_dim", 0),
                     discharge_idx      = hp.get("discharge_idx", 3),
-                    discharge_ref      = hp.get("discharge_ref", 1.0),
+                    discharge_ref      = sd.get("discharge_ref", hp.get("discharge_ref", 1.0)),
 
                     z_saddle           = z_saddle,
                     gauge_datum        = gauge_datum,
@@ -311,7 +311,7 @@ def load_model(ckpt_dir: Path, device: torch.device):
                     gru_layers         = hp.get("gru_layers", 2),
                     sar_emb_dim        = hp.get("sar_emb_dim", 0),
                     discharge_idx      = hp.get("discharge_idx", 3),
-                    discharge_ref      = hp.get("discharge_ref", 1.0),
+                    discharge_ref      = sd.get("discharge_ref", hp.get("discharge_ref", 1.0)),
 
                     z_saddle           = z_saddle,
                     gauge_datum        = gauge_datum,
@@ -392,6 +392,7 @@ def load_model(ckpt_dir: Path, device: torch.device):
             dropout      = hp.get("dropout", 0.1),
             lambda_flood = hp.get("lambda_flood", 0.1),
             device       = "cpu",
+            use_sar_edge = bool(hp.get("use_sar_edge", False)),   # A23
         )
     elif tag == "dfc_gnn_unified":
         # DFCGNNUnified: Manning conductance + HAND topology + elevation
@@ -436,11 +437,23 @@ def load_model(ckpt_dir: Path, device: torch.device):
             dropout              = hp.get("dropout", 0.1),
             lambda_flood         = hp.get("lambda_flood", 0.1),
             discharge_idx        = hp.get("discharge_idx", 3),
+            discharge_ref        = sd.get("discharge_ref", hp.get("discharge_ref", 1.0)),
         )
     else:
         raise ValueError(f"Unhandled tag: {tag}. Known: {list(MODEL_REGISTRY)}")
 
     # Load weights — training scripts save under "state_dict"
+    # REVISION AUDIT: checkpoints trained before the datum fix have no
+    # node_abs_valid buffer; back-fill it as all-True (= old behaviour) so
+    # they still load, and say so loudly.
+    _msd = model.state_dict()
+    for _k in _msd:
+        if _k.endswith("node_abs_valid") and _k not in sd:
+            sd[_k] = torch.ones_like(_msd[_k])
+            print(f"  [compat] {ckpt_dir}: {_k} missing (pre-revision "
+                  f"checkpoint) - using all-True; retrain for the datum fix")
+        if _k.endswith("sat_bounds") and _k not in sd:
+            sd[_k] = torch.tensor([0.0, 1.0])   # original unbounded sigmoid
     model.load_state_dict(sd)
     model.eval().to(device)
 
@@ -459,29 +472,41 @@ def load_model(ckpt_dir: Path, device: torch.device):
 # ── Data loading ────────────────────────────────────────────────────────────
 
 def test_dataloader(hp: dict, batch_size: int = 256):
+    """
+    REVISION AUDIT: previously (a) the test split started at int(T*0.85)
+    without the purge gap used by the training-time test loader, and (b)
+    targets were taken from y[t+T_in : ...], one step later than the
+    training convention y[t+T_in-1 : ...]. Both now come from the shared
+    split/alignment helpers, so this loader yields exactly the windows of
+    gpu_sampler.make_gpu_loaders()'s test split.
+    """
+    from src.utils.train_utils import get_split_boundary
+    from src.utils.alignment import target_rows
     X    = np.load(PROC_DIR / "X.npy",         mmap_mode="r")
     y    = np.load(PROC_DIR / "y.npy",          mmap_mode="r")
     mask = np.load(PROC_DIR / "valid_mask.npy", mmap_mode="r")
+    ivp  = PROC_DIR / "input_valid_mask.npy"
+    in_valid = np.load(ivp, mmap_mode="r") if ivp.exists() else None
     T, N, F = X.shape
     T_in    = hp.get("t_in",  32)
     T_out   = hp.get("t_out",  4)
-    test_start = int(T * 0.85)
-    test_end   = T - T_out
+    _, t2   = get_split_boundary(T, 0.70, 0.15)
+    test_start = t2 + T_in + T_out - 1
+    last_start = T - T_in - T_out          # inclusive
+    test_end   = last_start + 1            # exclusive bound on window starts
+    n_windows  = test_end - test_start
 
-    # INDEXING: must match training DataLoader (make_dataset in train_utils.py).
-    # Training uses xs = X[t : t+T_in], yt = y[t+T_in : t+T_in+T_out]
-    # The PREVIOUS version used X[t-T_in:t] which shifted every prediction
-    # T_in = 32 steps (8 hours) early relative to its ground-truth target,
-    # causing NSE ≈ -0.24 instead of the training-verified 0.993.
-    n_windows = test_end - test_start - T_in + 1
     class WDS(torch.utils.data.Dataset):
         def __len__(self): return n_windows
         def __getitem__(self, i):
-            t  = test_start + i          # window start (absolute timestep)
-            xs = torch.from_numpy(X[t   : t+T_in       ].astype(np.float32))
-            yt = torch.from_numpy(y[t+T_in : t+T_in+T_out].astype(np.float32))
-            mk = torch.from_numpy(mask[t+T_in : t+T_in+T_out].astype(np.float32))
-            return xs, yt, mk
+            t   = test_start + i
+            rows = target_rows(t, T_in, T_out)
+            xs = torch.from_numpy(X[t : t + T_in].astype(np.float32))
+            yt = torch.from_numpy(y[rows].astype(np.float32))
+            mk = mask[rows].astype(np.float32)
+            if in_valid is not None:
+                mk = mk * in_valid[t + T_in - 1].astype(np.float32)[None, :]
+            return xs, yt, torch.from_numpy(mk)
 
     import platform
     nw = 0 if platform.system() == "Windows" else 4
@@ -492,21 +517,14 @@ def test_dataloader(hp: dict, batch_size: int = 256):
 
 
 def load_graph(device):
-    """Mirror load_graph() in src/utils/train_utils.py exactly."""
-    nd = pd.read_csv(GRAPH_DIR / "nodes.csv")
-    ed = pd.read_csv(GRAPH_DIR / "edges.csv")
-    node_cols = [
-        "log_catchment_area_km2", "gauge_datum_mOSGM15", "p90_mAOD",
-        "amax_med_mAOD", "is_reservoir", "is_tidal", "has_discharge",
-    ]
-    edge_cols = ["river_dist_km", "area_ratio", "elev_drop_m", "same_tributary"]
-    src_col   = "src_idx" if "src_idx" in ed.columns else "src"
-    dst_col   = "dst_idx" if "dst_idx" in ed.columns else "dst"
-    na = torch.tensor(nd[node_cols].values, dtype=torch.float32)
-    na = (na - na.mean(0)) / na.std(0).clamp(min=1e-6)  # z-score (same as train)
-    na = na.to(device)
-    ei = torch.tensor(ed[[src_col, dst_col]].values.T, dtype=torch.long).to(device)
-    ea = torch.tensor(ed[edge_cols].values, dtype=torch.float32).to(device)
+    """REVISION AUDIT: delegates to utils.train_utils.load_graph_arrays so
+    inference uses exactly the training-time edge attributes (the previous
+    copy omitted the reservoir elev_drop masking)."""
+    from src.utils.train_utils import load_graph_arrays
+    g = load_graph_arrays(GRAPH_DIR)
+    na = torch.from_numpy(g["node_attr"]).float().to(device)
+    ei = torch.from_numpy(g["edge_index"]).long().to(device)
+    ea = torch.from_numpy(g["edge_attr"]).float().to(device)
     return ei, ea, na
 
 
@@ -740,10 +758,18 @@ def compute_extended_metrics(
         # window i, which corresponds to ground truth at ts + i + T_in + T_out - 1.
         # The time-series of last-step targets therefore starts at
         # ts + T_in + T_out - 1 (the first valid last-step target).
-        tgt_start = ts + T_in + T_out - 1
+        # REVISION AUDIT: lead T_out of the window starting at ts+i is
+        # y[ts + i + T_in + T_out - 2] (utils/alignment.py). The previous
+        # "- 1" scored every prediction against lead T_out + 1.
+        from src.utils.alignment import last_target_row
+        tgt_start = int(last_target_row(ts, T_in, T_out))
         n         = min(len(pred), len(y_full) - tgt_start)
         target    = y_full[tgt_start : tgt_start + n].astype(np.float32)
-        mask      = m_full[tgt_start : tgt_start + n]
+        mask      = np.array(m_full[tgt_start : tgt_start + n])
+        _ivp = PROC_DIR / "input_valid_mask.npy"
+        if _ivp.exists():   # anchor (last input) must be a real observation
+            _iv = np.load(_ivp, mmap_mode="r").astype(bool)
+            mask &= _iv[ts + T_in - 1 : ts + T_in - 1 + n]
         p         = pred[:n]
 
         # ── Bankfull thresholds ───────────────────────────────────────
@@ -925,7 +951,8 @@ def infer_one(ckpt_dir: Path, device: torch.device) -> np.ndarray:
         # Option B: align to the last forecast step (T_out-1), matching
         # the delta[:, T_out-1, :] collected in the inference loop.
         # pred[i] corresponds to y[ts + T_in + T_out - 1 + i].
-        _tgt_start = ts + T_in + T_out - 1
+        from src.utils.alignment import last_target_row
+        _tgt_start = int(last_target_row(ts, T_in, T_out))
         n_s      = min(len(pred), len(y_full) - _tgt_start)
         y_s      = y_full[_tgt_start : _tgt_start + n_s].astype(np.float32)
         m_s      = m_full[_tgt_start : _tgt_start + n_s].astype(bool)

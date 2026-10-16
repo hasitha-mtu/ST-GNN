@@ -48,7 +48,10 @@ to use the dynamic path.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+try:
+    from .common import GATStack2, batched_graph, positive_param, log_conductance, as_node_ref
+except ImportError:          # run as a script
+    from models.common import GATStack2, batched_graph, positive_param, log_conductance, as_node_ref
 
 
 class STGNNDynEdge(nn.Module):
@@ -106,17 +109,15 @@ class STGNNDynEdge(nn.Module):
         self.discharge_idx  = discharge_idx
         self.use_dyn_edge   = (f_edge >= 5)
         # Fix 2.2: register per-node Q_ref as buffer (checkpoint-safe, device-aware)
-        if isinstance(discharge_ref, torch.Tensor):
-            self.register_buffer("discharge_ref", discharge_ref.float())
-        else:
-            self.register_buffer("discharge_ref", torch.tensor([float(discharge_ref)]))
-
-        # Learnable scale for sigmoid conductance — initialised to 3.0 so that
-        # a 2× increase in discharge over reference gives conductance ≈ 0.95.
+        # REVISION AUDIT (M2): per-node reference discharge Q_ref,i
+        # (manuscript Eq. 1); the submitted trainer passed one catchment-wide
+        # scalar averaged over all nodes including zero-filled level-only
+        # and tidal nodes.
+        self.register_buffer("discharge_ref", as_node_ref(discharge_ref))
+        # REVISION AUDIT (M5): lambda > 0 (softplus), init 3.0
         if self.use_dyn_edge:
-            self.conductance_scale = nn.Parameter(torch.tensor(3.0))
+            self.conductance_scale_raw = positive_param(3.0)
 
-        # ── Input projection ───────────────────────────────────────────
         self.input_proj = nn.Sequential(
             nn.Linear(f_dyn + f_static, hidden),
             nn.LayerNorm(hidden),
@@ -142,22 +143,8 @@ class STGNNDynEdge(nn.Module):
             )
 
         # ── GATConv layers ─────────────────────────────────────────────
-        self.gat1 = GATConv(hidden, hidden, heads=gat_heads, concat=True,
-                            dropout=dropout, edge_dim=f_edge)
-        self.norm1 = nn.LayerNorm(hidden * gat_heads)
-        self.res1  = nn.Linear(hidden, hidden * gat_heads, bias=False)
-
-        self.gat2 = GATConv(hidden * gat_heads, hidden, heads=gat_heads,
-                            concat=False, dropout=dropout, edge_dim=f_edge)
-        self.norm2 = nn.LayerNorm(hidden)
-        self.res2  = nn.Linear(hidden * gat_heads, hidden, bias=False)
-
-        self.gat3 = GATConv(hidden, hidden // 2, heads=2, concat=False,
-                            dropout=dropout, edge_dim=f_edge)
-        self.norm3 = nn.LayerNorm(hidden // 2)
-        self.res3  = nn.Linear(hidden, hidden // 2, bias=False)
-
-        # ── Output head ───────────────────────────────────────────────
+        # Two-layer GAT stack (manuscript Section 3.5; M6)
+        self.gat_stack = GATStack2(hidden, gat_heads, f_edge, dropout)
         self.head = nn.Sequential(
             nn.Linear(hidden // 2, hidden // 4),
             nn.ReLU(),
@@ -166,6 +153,10 @@ class STGNNDynEdge(nn.Module):
         )
 
     # ──────────────────────────────────────────────────────────────────
+    @property
+    def conductance_scale(self) -> torch.Tensor:
+        return F.softplus(self.conductance_scale_raw)
+
     def _dynamic_edge_attr(
         self,
         x_last:     torch.Tensor,   # [B, N, F_dyn]  last observed timestep
@@ -185,24 +176,11 @@ class STGNNDynEdge(nn.Module):
 
         # Discharge at upstream node for every edge: [B, E]
         Q_src = x_last[:, src, self.discharge_idx]          # [B, E]
-
-        # Fix 2.2a: per-node reference discharge (buffer [1] or [N])
         Q_ref_src = (self.discharge_ref[src] if self.discharge_ref.shape[0] > 1
-                     else self.discharge_ref)   # broadcast or index
-
-        conductance = torch.sigmoid(
-            self.conductance_scale * (Q_src / (Q_ref_src + 1e-8) - 1.0)
-        )                                                     # [B, E]
-
-        # Fix 2.2b: use log(conductance) as the 5th edge feature.
-        # log(conductance) is monotonically related to Q: a positive learned
-        # projection weight in GATConv gives guaranteed Q↑ → attention↑,
-        # addressing the reviewer concern that raw conductance could be
-        # projected with a negative or negligible weight.
-        log_conductance = torch.log(conductance + 1e-6)      # [B, E]
-
+                     else self.discharge_ref)
+        log_cond = log_conductance(Q_src, Q_ref_src, self.conductance_scale)  # [B, E]
         static_tiled = edge_attr.unsqueeze(0).expand(B, -1, -1)  # [B, E, 4]
-        dyn = log_conductance.unsqueeze(-1)                       # [B, E, 1]
+        dyn = log_cond.unsqueeze(-1)                              # [B, E, 1]
         return torch.cat([static_tiled, dyn], dim=-1)             # [B, E, 5]
 
     # ──────────────────────────────────────────────────────────────────
@@ -244,24 +222,10 @@ class STGNNDynEdge(nn.Module):
 
         # ── Step 5: GATConv batched message passing ────────────────────
         E = edge_attr.shape[0]
-        h_flat  = h.reshape(B * N, self.hidden)
-
-        offsets = torch.arange(B, device=edge_index.device) * N
-        src_b   = (edge_index[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        dst_b   = (edge_index[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)
-        batched_ei   = torch.stack([src_b, dst_b], dim=0)          # [2, B×E]
-        batched_ea   = dyn_edge_attr.reshape(B * E, -1)            # [B×E, f_edge]
-
-        h1 = F.elu(self.norm1(
-            self.gat1(h_flat, batched_ei, batched_ea) + self.res1(h_flat)
-        ))
-        h2 = F.elu(self.norm2(
-            self.gat2(h1,    batched_ei, batched_ea) + self.res2(h1)
-        ))
-        h3 = F.elu(self.norm3(
-            self.gat3(h2,    batched_ei, batched_ea) + self.res3(h2)
-        ))
-
+        h_flat     = h.reshape(B * N, self.hidden)
+        batched_ei = batched_graph(edge_index, B, N)               # [2, B×E]
+        batched_ea = dyn_edge_attr.reshape(B * E, -1)            # [B×E, f_edge]
+        h3 = self.gat_stack(h_flat, batched_ei, batched_ea)
         h_graph = h3.reshape(B, N, self.hidden // 2)
         delta   = self.head(h_graph)
         return delta.permute(0, 2, 1)                               # [B, T_out, N]

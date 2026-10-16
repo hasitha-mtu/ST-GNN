@@ -124,57 +124,26 @@ def load_gauge_datum_and_stage_range(
     logger,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build per-node gauge_datum [N] and stage_range [N] (= p90 - gauge_datum)
-    from nodes.csv, for the option-3 datum-consistent HAND activation gate.
-    Identical logic to train_st_gnn_hand_edge.py's version of this helper —
-    duplicated rather than imported, matching this codebase's existing
-    convention of independent, self-contained training scripts (see e.g.
-    make_flood_labels, duplicated between train_dfc_gnn.py and this file).
+    REVISION AUDIT: returns (stage_ref_low [N], stage_range [N]) from
+    utils.datum.stage_reference() — the SAME pair build_dataset.py uses to
+    compute normalised_stage, so H = low + norm * range reproduces the
+    observed stage exactly at every node.
 
-    nodes_df must be in the SAME row order as node_elev / edge_index /
-    X.npy's node axis (i.e. loaded via the same nodes.csv used everywhere
-    else in the pipeline).
+    The previous version substituted the DEM elevation for the two headrace
+    datums and forced their range to 1.5 m, while the feature itself had been
+    normalised with datum 0.0 and range ~45-61 m. The reconstructed headrace
+    H was therefore almost constant. Nodes whose absolute datum is not
+    verified are now excluded from terrain comparisons instead (see
+    node_abs_valid in the model), not patched with a DEM value.
+    `node_elev` is kept in the signature for call-site compatibility only.
     """
-    gauge_datum = nodes_df["gauge_datum_mOSGM15"].to_numpy(dtype=np.float32).copy()
-    p90         = nodes_df["p90_mAOD"].to_numpy(dtype=np.float32).copy()
-    refs        = nodes_df["ref"].astype(str).to_numpy()
-
-    fallback_idx = [i for i, r in enumerate(refs) if r in RESERVOIR_DATUM_FALLBACK_REFS]
-    if fallback_idx:
-        node_elev_np = node_elev.detach().cpu().numpy()
-        for i in fallback_idx:
-            logger.warning(
-                "  gauge_datum fallback: node ref=%s (%s) has gauge_datum_"
-                "mOSGM15=%.2f m paired with p90_mAOD=%.2f m — physically "
-                "inconsistent (implausible stage range). Substituting "
-                "DEM-sampled node_elev=%.2f m OD as an APPROXIMATION. "
-                "Replace with the real station datum if available.",
-                refs[i], nodes_df.iloc[i].get("name", "?"),
-                gauge_datum[i], p90[i], node_elev_np[i],
-            )
-            gauge_datum[i] = node_elev_np[i]
-            p90[i] = gauge_datum[i] + 1.5   # ~1.5 m default range, mid-pack
-                                             # of the observed 0.18-60.9 m
-                                             # range prior to this fallback
-
-    stage_range = p90 - gauge_datum
-    bad = stage_range <= 0.01
-    if bad.any():
-        logger.warning(
-            "  %d node(s) have non-positive stage_range after fallback — "
-            "clamping to 1.0 m: refs=%s",
-            int(bad.sum()), refs[bad].tolist(),
-        )
-        stage_range[bad] = 1.0
-
-    logger.info(
-        "  gauge_datum: [%.2f, %.2f] m OD   stage_range: [%.2f, %.2f] m",
-        gauge_datum.min(), gauge_datum.max(),
-        stage_range.min(), stage_range.max(),
-    )
-
-    return (torch.from_numpy(gauge_datum).float(),
-            torch.from_numpy(stage_range).float())
+    from src.utils.datum import torch_reference
+    low, rng, valid = torch_reference(nodes_df)
+    logger.info("  stage_ref_low: [%.2f, %.2f] m   stage_range: [%.2f, %.2f] m   "
+                "abs-datum-valid nodes: %d/%d",
+                float(low.min()), float(low.max()), float(rng.min()),
+                float(rng.max()), int(valid.sum()), int(valid.numel()))
+    return low, rng
 
 
 def load_bankfull_thresholds(graph_dir: Path, n_nodes: int,
@@ -351,15 +320,25 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
         nodes_df, node_elev.cpu(), logger,
     )
 
+    from src.utils.datum import abs_datum_valid
+    from src.data.compute_static_attributes import load_datum_config
+    _abs_valid = torch.from_numpy(abs_datum_valid(nodes_df))
+    _dem_off = float(load_datum_config().get("dem_vertical_offset_to_malin_m", 0.0))
+
     # ── Load bankfull thresholds (for flood label generation) ──────────
     bankfull_thr = load_bankfull_thresholds(GRAPH_DIR, N, DEVICE)
 
     # ── Discharge reference (train split only, same as STGNNDynEdge) ───
     discharge_col = 3
     t1, _ = get_split_boundary(T)
-    q_ref = float(X[:t1, :, discharge_col].mean())
-    q_ref = max(q_ref, 0.01)
-    logger.info("  Discharge reference Q_ref=%.4f", q_ref)
+    # REVISION AUDIT (M2): per-node Q_ref (training period, valid steps)
+    from src.utils.train_utils import discharge_reference
+    q_ref_np = discharge_reference(X, t1, discharge_col)
+    q_ref = torch.from_numpy(q_ref_np)
+    logger.info("  Discharge reference Q_ref per node: min=%.3f median=%.3f max=%.3f "
+                "(log-transformed; %d nodes without discharge -> 1.0)",
+                q_ref_np.min(), float(np.median(q_ref_np)), q_ref_np.max(),
+                int((q_ref_np == 1.0).sum()))
 
     # ── Dataloaders ───────────────────────────────────────────────────
     train_loader, val_loader, test_loader = make_gpu_loaders(
@@ -375,9 +354,10 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
         hand_src=hand_data["src"].to(DEVICE), hand_dst=hand_data["dst"].to(DEVICE),
         hand_threshold=hand_data["hand_threshold"].to(DEVICE),
         hand_overland_dist=hand_data["overland_dist_km"].to(DEVICE),
-        z_saddle=hand_data["z_saddle_m"].to(DEVICE),
+        z_saddle=(hand_data["z_saddle_m"] + _dem_off).to(DEVICE),
         gauge_datum=gauge_datum.to(DEVICE),
         stage_range=stage_range.to(DEVICE),
+        node_abs_valid=_abs_valid.to(DEVICE),
         n_gru_layers=GRU_LAYERS, dropout=DROPOUT, lambda_flood=LAMBDA_FLOOD,
         tau_gate=TAU_GATE, discharge_idx=discharge_col, discharge_ref=q_ref,
     ).to(DEVICE)
@@ -452,7 +432,7 @@ def train(logger, seed, t_in, t_out, max_epochs, base_dir=None):
                     "gru_layers": GRU_LAYERS, "dropout": DROPOUT,
                     "batch_size": BATCH_SIZE, "lr": LR,
                     "lambda_flood": LAMBDA_FLOOD, "tau_gate": TAU_GATE,
-                    "discharge_ref": q_ref,
+                    "discharge_ref": [round(float(v), 6) for v in q_ref_np],
                     "n_river_edges": edge_index.shape[1],
                     "n_hand_edges": hand_data["src"].shape[0],
                 },

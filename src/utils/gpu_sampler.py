@@ -93,11 +93,18 @@ class GPUSampler:
         batch_size: int,
         device:     torch.device,
         shuffle:    bool = True,
+        input_valid: np.ndarray | None = None,
     ):
         # ── Pre-load entire dataset to GPU once ───────────────────────
         self.X    = torch.from_numpy(X).float().to(device)       # [T, N, F]
         self.y    = torch.from_numpy(y).float().to(device)       # [T, N]
         self.mask = torch.from_numpy(mask.astype(bool)).bool().to(device)  # [T, N]
+        # REVISION AUDIT: the delta target is y - x_last[:, :, 0]. If the
+        # anchor x_last was gap-filled (ffill or zero-fill) the delta is
+        # meaningless even when the target itself is real, so the anchor's
+        # validity is ANDed into the target mask. None = legacy behaviour.
+        self.input_valid = (None if input_valid is None else
+                            torch.from_numpy(input_valid.astype(bool)).bool().to(device))
 
         # Window start indices on GPU — shuffled each epoch
         self.indices    = torch.tensor(indices, dtype=torch.long, device=device)
@@ -150,9 +157,26 @@ class GPUSampler:
         # for those nodes and producing NaN in compute_metrics.
         tgt_idx  = batch_idx.unsqueeze(1) + self.t_in - 1 + self._tout_range  # [B, T_out]
         y_seq    = self.y[tgt_idx]                                 # [B, T_out, N]
-        mask_seq = self.mask[tgt_idx].float()                     # [B, T_out, N]
+        mask_seq = self.mask[tgt_idx]                             # [B, T_out, N]
+        if self.input_valid is not None:
+            anchor = self.input_valid[batch_idx + self.t_in - 1]  # [B, N]
+            mask_seq = mask_seq & anchor.unsqueeze(1)
+        mask_seq = mask_seq.float()
 
         return x_seq, y_seq, mask_seq
+
+
+def _auto_input_valid(T: int, N: int) -> np.ndarray | None:
+    """Load dataset/processed/input_valid_mask.npy if it matches (T, N)."""
+    from pathlib import Path
+    p = Path(__file__).resolve().parents[2] / "dataset/processed/input_valid_mask.npy"
+    if p.exists():
+        a = np.load(p, mmap_mode="r")
+        if a.shape == (T, N):
+            return np.asarray(a)
+    print("  [gpu_sampler] input_valid_mask.npy not found - anchor validity "
+          "NOT enforced (rebuild the dataset with the revised build_dataset.py)")
+    return None
 
 
 # ── Factory function ──────────────────────────────────────────────────────────
@@ -168,6 +192,7 @@ def make_gpu_loaders(
     train_frac: float = 0.70,
     val_frac:   float = 0.15,
     purge:      int | None = None,
+    input_valid: np.ndarray | None = None,
 ) -> tuple[GPUSampler, GPUSampler, GPUSampler]:
     """
     Build train/val/test GPU samplers with the same 70/15/15 split
@@ -199,6 +224,8 @@ def make_gpu_loaders(
     train_loader, val_loader, test_loader : GPUSampler instances
     """
     T = X.shape[0]
+    if input_valid is None:
+        input_valid = _auto_input_valid(X.shape[0], X.shape[1])
 
     # Split boundaries — single source of truth, shared with any script
     # that needs a train-only slice of X (e.g. STGNNDynEdge's Q_ref).
@@ -225,9 +252,12 @@ def make_gpu_loaders(
           f"total={( X.nbytes + y.nbytes + valid_mask.nbytes)/1e6:.0f} MB")
 
     train_loader = GPUSampler(X, y, valid_mask, train_idx,
-                              t_in, t_out, batch_size,     device, shuffle=True)
+                              t_in, t_out, batch_size,     device, shuffle=True,
+                              input_valid=input_valid)
     val_loader   = GPUSampler(X, y, valid_mask, val_idx,
-                              t_in, t_out, batch_size * 2, device, shuffle=False)
+                              t_in, t_out, batch_size * 2, device, shuffle=False,
+                              input_valid=input_valid)
     test_loader  = GPUSampler(X, y, valid_mask, test_idx,
-                              t_in, t_out, batch_size * 2, device, shuffle=False)
+                              t_in, t_out, batch_size * 2, device, shuffle=False,
+                              input_valid=input_valid)
     return train_loader, val_loader, test_loader

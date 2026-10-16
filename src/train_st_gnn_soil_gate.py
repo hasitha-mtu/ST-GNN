@@ -55,10 +55,15 @@ HIDDEN_DIM  = 64
 GAT_HEADS   = 2
 GRU_LAYERS  = 2
 DROPOUT     = 0.10
-BATCH_SIZE  = 512
+# REVISION AUDIT: the submitted code trained SoilGate with batch 512,
+# weight decay 1e-5, early-stopping patience 20 and LR-scheduler patience 15,
+# whereas manuscript Table 1 (and every other architecture) uses 32 / 1e-4 /
+# 38 / 11. The common configuration is restored for a matched comparison.
+BATCH_SIZE  = 32
 LR          = 5e-4
-WEIGHT_DECAY = 1e-5
-PATIENCE    = 20
+WEIGHT_DECAY = 1e-4
+PATIENCE    = 38
+LR_SCHED_PATIENCE = 11
 GRAD_CLIP   = 1.0
 
 # Soil gate initialisation (matched to physical saturation range of the
@@ -66,6 +71,10 @@ GRAD_CLIP   = 1.0
 SAT_THRESHOLD_INIT  = 0.75
 SAT_SHARPNESS_INIT  = 10.0
 SWVL2_SAT_IDX       = 9     # feature index in X.npy
+# Bounded threshold (manuscript Section 5.4). None = original (0,1)
+# parameterisation. "train_q10_q90" = 10th-90th percentile of the
+# TRAINING-period catchment-mean swvl2 saturation ratio.
+SAT_THRESHOLD_BOUNDS = "train_q10_q90"
 
 # Sparsity penalty weight — see st_gnn_soil_gate.py's "Gate collapse"
 # docstring section. Without this, plain MSE gives sat_threshold a
@@ -268,26 +277,29 @@ def train(
         hand["z_saddle_m"].max().item(),
     )
 
-    # ── Per-node gauge_datum and stage_range (for inherited gate buffers) ──
+    # ── Per-node stage reference (for inherited gate buffers) ───────────
+    # REVISION AUDIT: the previous code set gauge_datum = p90 for ALL four
+    # reservoir-flagged nodes (including Inniscarra Tailrace and Ovens
+    # Bridge, whose datums are valid) and kept range = p90 - datum, giving
+    # H = p90 + norm * range. The shared utils.datum reference is used now.
+    # (The SoilGate's own gate uses catchment saturation, not H; these
+    # buffers only matter for consistency of the inherited state.)
+    from src.utils.datum import torch_reference
     nodes_df    = pd.read_csv(GRAPH_DIR / "nodes.csv")
-    gauge_datum = torch.tensor(
-        nodes_df["gauge_datum_mOSGM15"].values, dtype=torch.float32)
-    stage_range = torch.tensor(
-        (nodes_df["p90_mAOD"] - nodes_df["gauge_datum_mOSGM15"]).clip(lower=0.5).values,
-        dtype=torch.float32,
-    )
+    gauge_datum, stage_range, node_abs_valid = torch_reference(nodes_df)
 
-    # Reservoir nodes have placeholder datum 0.0 → use p90 as fallback
-    reservoir_mask = nodes_df["is_reservoir"].values.astype(bool)
-    if reservoir_mask.any():
-        gauge_datum[reservoir_mask] = torch.tensor(
-            nodes_df.loc[reservoir_mask, "p90_mAOD"].values,
-            dtype=torch.float32,
-        )
-        logger.info(
-            "  Reservoir nodes (%d): gauge_datum set to p90_mAOD as fallback",
-            int(reservoir_mask.sum()),
-        )
+    sat_bounds = None
+    if SAT_THRESHOLD_BOUNDS == "train_q10_q90":
+        from src.utils.train_utils import get_split_boundary
+        _t1, _ = get_split_boundary(X.shape[0], 0.70, 0.15)
+        _sbar = np.asarray(X[:_t1, :, SWVL2_SAT_IDX]).mean(axis=1)
+        _lo, _hi = (float(np.quantile(_sbar, 0.10)), float(np.quantile(_sbar, 0.90)))
+        if _hi - _lo > 0.02:
+            sat_bounds = (max(0.0, _lo), min(1.0, _hi))
+        logger.info("  sat_threshold bounds (train q10-q90 of S_bar): %s", sat_bounds)
+    _init = SAT_THRESHOLD_INIT
+    if sat_bounds is not None and not (sat_bounds[0] < _init < sat_bounds[1]):
+        _init = 0.5 * (sat_bounds[0] + sat_bounds[1])
 
     # ── GPU data loaders ───────────────────────────────────────────────
     train_loader, val_loader, test_loader = make_gpu_loaders(
@@ -297,6 +309,9 @@ def train(
     )
 
     # ── Build model ────────────────────────────────────────────────────
+    from src.utils.train_utils import discharge_reference, get_split_boundary
+    q_ref_np = discharge_reference(X, get_split_boundary(X.shape[0], 0.70, 0.15)[0], 3)
+    q_ref = torch.from_numpy(q_ref_np)
     model = STGNNSoilGate(
         f_dyn               = F,
         f_static            = F_static,
@@ -308,6 +323,7 @@ def train(
         z_saddle            = hand["z_saddle_m"],
         gauge_datum         = gauge_datum,
         stage_range         = stage_range,
+        node_abs_valid      = node_abs_valid,
         hidden              = HIDDEN_DIM,
         gat_heads           = GAT_HEADS,
         gru_layers          = GRU_LAYERS,
@@ -315,9 +331,11 @@ def train(
         dropout             = DROPOUT,
         sar_emb_dim         = 0,       # SAR disabled for Experiment 1
         discharge_idx       = 3,
+        discharge_ref       = q_ref,           # M2: per-node, was default 1.0
         swvl2_sat_idx       = SWVL2_SAT_IDX,
-        sat_threshold       = SAT_THRESHOLD_INIT,
+        sat_threshold       = _init,
         sat_sharpness       = SAT_SHARPNESS_INIT,
+        sat_threshold_bounds = sat_bounds,
     ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -329,10 +347,12 @@ def train(
     )
 
     # ── Optimiser & scheduler ──────────────────────────────────────────
-    optimiser = torch.optim.Adam(model.parameters(), lr=LR,
-                                 weight_decay=WEIGHT_DECAY)
+    # REVISION AUDIT (M4): AdamW like the other nine architectures
+    # (manuscript Section 3.7.2); the submitted script used Adam (L2 penalty).
+    optimiser = torch.optim.AdamW(model.parameters(), lr=LR,
+                                  weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="min", factor=0.5, patience=15,
+        optimiser, mode="min", factor=0.5, patience=LR_SCHED_PATIENCE,
         cooldown=2, min_lr=1e-6,
     )
     w_hz = horizon_weights(t_out, DEVICE)
@@ -404,6 +424,7 @@ def train(
                     "f_static":         F_static,
                     "n_nodes":          N,
                     "hidden":           HIDDEN_DIM,
+                    "discharge_ref":    [round(float(v), 6) for v in q_ref_np],
                     "gat_heads":        GAT_HEADS,
                     "gru_layers":       GRU_LAYERS,
                     "dropout":          DROPOUT,

@@ -99,56 +99,68 @@ def make_dataset(X, y, valid_mask, split_range, t_in, t_out):
 #  Graph construction helper
 # ═══════════════════════════════════════════════════════════════════════
 
+STATIC_NODE_COLS = [
+    "log_catchment_area_km2",
+    "gauge_datum_mOSGM15",
+    "p90_mAOD",
+    "amax_med_mAOD",
+    "is_reservoir",
+    "is_tidal",
+    "has_discharge",
+]
+EDGE_COLS = ["river_dist_km", "area_ratio", "elev_drop_m", "same_tributary"]
+
+
+def load_graph_arrays(graph_dir: Path) -> dict:
+    """
+    Numpy version of the static graph used by BOTH training and inference.
+
+    REVISION AUDIT: run_inference.load_graph() (used by run_inference.py AND
+    scenarios/scenario_evaluator.py) previously re-implemented this without
+    the reservoir elev_drop masking applied here at training time. All five
+    GAT ST-GNN variants were therefore evaluated on the synthetic scenarios
+    with edge attributes they never saw in training (elev_drop of 64.7,
+    67.8, 100.5, 66.3, 46.4, -11.3, 9.3, 21.9 and 19.0 m on the nine
+    reservoir-incident edges instead of 0.0). The baselines and DFC models
+    do not consume these attributes. There is now one implementation.
+
+    Also defensively removes uphill reverse-duplicate edges if an old
+    edges.csv is still on disk (utils/graph_checks.py).
+    """
+    from src.utils.graph_checks import river_edges
+    nodes_df = pd.read_csv(graph_dir / "nodes.csv")
+    edges_df = river_edges(pd.read_csv(graph_dir / "edges.csv"))
+
+    node_attr = nodes_df[STATIC_NODE_COLS].to_numpy(dtype=np.float32)
+    node_mean = node_attr.mean(axis=0)
+    node_std = np.clip(node_attr.std(axis=0, ddof=1), 1e-6, None)
+    node_attr = (node_attr - node_mean) / node_std
+
+    edge_index = edges_df[["src_idx", "dst_idx"]].to_numpy(dtype=np.int64).T
+    edge_attr = edges_df[EDGE_COLS].to_numpy(dtype=np.float32).copy()
+    is_res = nodes_df["is_reservoir"].to_numpy()
+    res_edge = (is_res[edge_index[0]] == 1) | (is_res[edge_index[1]] == 1)
+    # Impounded reaches have no meaningful hydraulic gradient (Section 3.2.1).
+    edge_attr[res_edge, 2] = 0.0
+    return {"node_attr": node_attr, "edge_index": edge_index,
+            "edge_attr": edge_attr, "nodes_df": nodes_df, "edges_df": edges_df}
+
+
 def load_graph(logger, graph_dir: Path, device: torch.device) -> tuple[torch.Tensor, ...]:
     """
     Load static graph from CSVs produced by graph_builder.py.
     Returns (edge_index, edge_attr, node_attr) as tensors on device.
     """
-    nodes_df = pd.read_csv(graph_dir / "nodes.csv")
-    edges_df = pd.read_csv(graph_dir / "edges.csv")
-
-    # Node static features — same 7 columns built by graph_builder
-    static_cols = [
-        "log_catchment_area_km2",
-        "gauge_datum_mOSGM15",
-        "p90_mAOD",
-        "amax_med_mAOD",
-        "is_reservoir",
-        "is_tidal",
-        "has_discharge",
-    ]
-    node_attr = torch.tensor(
-        nodes_df[static_cols].values, dtype=torch.float32
-    ).to(device)
-
-    node_mean = node_attr.mean(dim=0)
-    node_std  = node_attr.std(dim=0).clamp(min=1e-6)
-    node_attr = (node_attr - node_mean) / node_std
-
-    # Edge index (src, dst) — already zero-indexed from graph_builder
-    edge_index = torch.tensor(
-        edges_df[["src_idx", "dst_idx"]].values.T, dtype=torch.long
-    ).to(device)
-
-    # Edge attributes
-    edge_cols = ["river_dist_km", "area_ratio", "elev_drop_m", "same_tributary"]
-    edge_attr_np = edges_df[edge_cols].values
-
-    # Mask elev_drop_m (index 2) to 0.0 where source or destination is a reservoir,
-    # because impounded reaches have no meaningful hydraulic gradient.
-    is_res = nodes_df["is_reservoir"].values
-    src_is_res = is_res[edges_df["src_idx"].values]
-    dst_is_res = is_res[edges_df["dst_idx"].values]
-    reservoir_edge_mask = (src_is_res == 1) | (dst_is_res == 1)
-    edge_attr_np[reservoir_edge_mask, 2] = 0.0
-
-    edge_attr = torch.tensor(edge_attr_np, dtype=torch.float32).to(device)
-
-    logger.info(
-        "Graph loaded: %d nodes, %d edges, node_attr %s, edge_attr %s",
-        node_attr.shape[0], edge_index.shape[1],
-        tuple(node_attr.shape), tuple(edge_attr.shape),
-    )
+    g = load_graph_arrays(graph_dir)
+    edge_index = torch.from_numpy(g["edge_index"]).long().to(device)
+    edge_attr = torch.from_numpy(g["edge_attr"]).float().to(device)
+    node_attr = torch.from_numpy(g["node_attr"]).float().to(device)
+    if logger is not None:
+        logger.info(
+            "Graph loaded: %d nodes, %d edges, node_attr %s, edge_attr %s",
+            node_attr.shape[0], edge_index.shape[1],
+            tuple(node_attr.shape), tuple(edge_attr.shape),
+        )
     return edge_index, edge_attr, node_attr
 
 
@@ -411,3 +423,28 @@ def train_slice(
     """
     t1, _ = get_split_boundary(X.shape[0], train_frac, val_frac)
     return X[:t1]
+
+
+def discharge_reference(X: np.ndarray, t1: int, discharge_col: int = 3,
+                        min_valid_frac: float = 0.05) -> np.ndarray:
+    """
+    Per-node reference discharge Q_ref,i for the conductance of manuscript
+    Eq. 1 (REVISION AUDIT M2): mean of the log-transformed discharge
+    feature over the TRAINING period, using only time steps with a
+    discharge value (X stores 0.0 where there is none). Level-only and
+    tidal nodes (no discharge record) get 1.0; their conductance is then the
+    constant sigmoid(-lambda) because Q_i = 0.
+
+    The submitted trainers used ONE scalar for the whole catchment,
+    averaged over all nodes including the zero-filled level-only/tidal
+    nodes (SoilGate used 1.0), so the conductance compared a 1,185 km2
+    main-stem gauge and a 4 km2 tributary against the same reference.
+    """
+    q = np.asarray(X[:t1, :, discharge_col], dtype=np.float64)
+    ref = np.ones(q.shape[1], dtype=np.float32)
+    for n in range(q.shape[1]):
+        v = q[:, n]
+        v = v[np.isfinite(v) & (v != 0.0)]
+        if len(v) >= min_valid_frac * q.shape[0] and float(v.mean()) > 0.01:
+            ref[n] = float(v.mean())
+    return ref

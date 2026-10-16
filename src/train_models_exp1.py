@@ -134,8 +134,10 @@ def compute_persistence_baseline(t_outs: list[int]) -> None:
     mask_full= np.load(proc_dir / "valid_mask.npy").astype(bool)  # [T, N]
     T, N     = y_full.shape
 
-    # Test split: last 15% of T (consistent with make_splits)
-    test_start = int(T * 0.85)
+    # REVISION AUDIT: same test boundary as gpu_sampler (t2 + purge); the
+    # purge depends on T_out, so it is applied inside the horizon loop.
+    from src.utils.train_utils import get_split_boundary
+    _, _t2 = get_split_boundary(T, 0.70, 0.15)
 
     try:
         nodes_df = pd.read_csv(graph_dir / "nodes.csv")
@@ -144,6 +146,7 @@ def compute_persistence_baseline(t_outs: list[int]) -> None:
 
     print(f"\n  Computing persistence baseline (ŷ = y[t], N={N} nodes) …")
     for t_out in t_outs:
+        test_start = _t2 + 32 + t_out - 1     # T_IN = 32
         rows = []
         for node in range(N):
             # Fix 2.7b: aggregate ALL (pred, target) pairs first, then

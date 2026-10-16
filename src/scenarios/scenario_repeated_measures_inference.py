@@ -191,6 +191,12 @@ def bootstrap_median_diff_ci(pivot: pd.DataFrame, model_a: str, model_b: str,
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--csv", type=str, default=str(PER_REALIZATION_CSV))
+    p.add_argument("--scope", choices=["observable", "all"], default="observable",
+                   help="REVISION AUDIT: the evaluator writes one row per realization "
+                        "for ALL forecasts and one for forecasts issued after the "
+                        "perturbation became visible in the inputs ('observable', the "
+                        "primary analysis). Pivoting without this filter would average "
+                        "the two.")
     p.add_argument("--scenario", type=str, help="e.g. S4_SatBreakthrough")
     p.add_argument("--horizon", type=int, help="step count, e.g. 24 for 6hr")
     p.add_argument("--models", type=str, nargs="+", default=None,
@@ -226,6 +232,9 @@ def main():
               f"produced once real per-realization data exists.")
         return
     df = pd.read_csv(csv_path)
+    if "scope" in df.columns:
+        df = df[df["scope"] == args.scope]
+        print(f"Using per-realization rows with scope == '{args.scope}'")
     if df.empty:
         print(f"{csv_path} is empty -- no per-realization data yet.")
         return

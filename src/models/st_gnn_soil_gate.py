@@ -116,6 +116,7 @@ if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
 from models.st_gnn_hand_edge import STGNNHANDEdge
+from models.common import positive_param
 
 
 class STGNNSoilGate(STGNNHANDEdge):
@@ -144,6 +145,7 @@ class STGNNSoilGate(STGNNHANDEdge):
         swvl2_sat_idx: int   = 9,
         sat_threshold:  float = 0.75,
         sat_sharpness:  float = 10.0,
+        sat_threshold_bounds: tuple[float, float] | None = None,
         **kwargs,
     ):
         """
@@ -180,11 +182,30 @@ class STGNNSoilGate(STGNNHANDEdge):
         # penalty is tuned -- the raw parameter can still be pushed
         # arbitrarily by gradient descent, but the EFFECTIVE threshold
         # used in the gate formula below is always in (0,1).
-        sat_threshold = min(max(float(sat_threshold), 1e-4), 1 - 1e-4)
-        self.sat_threshold_raw = nn.Parameter(
-            torch.logit(torch.tensor(sat_threshold)))
-        self.sat_sharpness  = nn.Parameter(torch.tensor(float(sat_sharpness)))
+        # REVISION (manuscript Section 5.4 "remedy"): optionally bound the
+        # effective threshold to [lo, hi] by construction,
+        #     theta = lo + (hi - lo) * sigmoid(raw),
+        # so the optimiser cannot place it outside a defensible range. The
+        # training script sets [lo, hi] to the 10th-90th percentile of the
+        # TRAINING-period catchment-mean saturation, so the gate must be able
+        # to switch within the regime it was trained on. This is
+        # deliberately NOT the S4 test range (that would be circular).
+        # bounds = (0, 1) reproduces the original parameterisation exactly
+        # (also used to load pre-revision checkpoints).
+        lo, hi = sat_threshold_bounds if sat_threshold_bounds is not None else (0.0, 1.0)
+        if not (0.0 <= lo < hi <= 1.0):
+            raise ValueError(f"invalid sat_threshold_bounds {sat_threshold_bounds}")
+        self.register_buffer("sat_bounds", torch.tensor([float(lo), float(hi)]))
+        u = (float(sat_threshold) - lo) / (hi - lo)
+        u = min(max(u, 1e-4), 1 - 1e-4)
+        self.sat_threshold_raw = nn.Parameter(torch.logit(torch.tensor(u)))
+        # REVISION AUDIT (M5): gamma > 0 via softplus, init 10.0
+        self.sat_sharpness_raw = positive_param(float(sat_sharpness))
         self.last_gate_mean = torch.tensor(0.0)   # updated every forward() call
+
+    @property
+    def sat_sharpness(self) -> torch.Tensor:
+        return torch.nn.functional.softplus(self.sat_sharpness_raw)
 
     @property
     def sat_threshold(self) -> torch.Tensor:
@@ -192,7 +213,8 @@ class STGNNSoilGate(STGNNHANDEdge):
         Read-only property -- every existing caller (the gate formula
         below, train_st_gnn_soil_gate.py's model.sat_threshold.item()
         logging, checkpoint hparams) continues to work unchanged."""
-        return torch.sigmoid(self.sat_threshold_raw)
+        lo, hi = self.sat_bounds[0], self.sat_bounds[1]
+        return lo + (hi - lo) * torch.sigmoid(self.sat_threshold_raw)
 
     # ──────────────────────────────────────────────────────────────────
     def _hand_edge_attr(
@@ -302,7 +324,7 @@ if __name__ == "__main__":
 
     out.sum().backward()
     assert model.sat_threshold_raw.grad is not None, "sat_threshold_raw has no grad"
-    assert model.sat_sharpness.grad  is not None, "sat_sharpness has no grad"
+    assert model.sat_sharpness_raw.grad is not None, "sat_sharpness has no grad"
     print("Gradients flow through sat_threshold and sat_sharpness  ✓")
 
     # Key test: activation should respond to soil moisture variation

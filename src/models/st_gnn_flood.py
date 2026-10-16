@@ -16,11 +16,13 @@ Architecture
        If absent (sar_emb is None or sar_emb_dim=0):
          GRU output passes through unchanged (compatible with baseline runs)
 
-  4. Graph message passing
-       GATConv layer 1: hidden → hidden × gat_heads  (concat=True)
-       GATConv layer 2: hidden × gat_heads → hidden  (concat=False)
-       GATConv layer 3: hidden → hidden // 2          (concat=False)
+  4. Graph message passing  (two-layer GAT stack, manuscript Section 3.5)
+       GATConv layer 1: hidden → hidden × gat_heads       (concat=True)
+       GATConv layer 2: hidden × gat_heads → hidden // 2  (concat=False)
        Each layer has residual connection + LayerNorm + ELU
+       REVISION AUDIT (M6): the submitted model had a THIRD GAT layer
+       (hidden → hidden//2), contradicting the two-layer stack described in
+       the manuscript and Table 1; removed (models/common.GATStack2).
 
   5. Output head
        Linear(hidden // 2 → hidden // 4) + ReLU
@@ -28,7 +30,7 @@ Architecture
        Predicts DELTA stage_anomaly (change from last observed value)
 
 Edge attributes (river_dist_km, area_ratio, elev_drop_m, same_tributary)
-are passed to all three GATConv layers via edge_dim. Attention coefficients
+are passed to both GATConv layers via edge_dim. Attention coefficients
 are therefore conditioned on the hydraulic relationship between nodes, not
 just on learned node similarity.
 
@@ -42,7 +44,10 @@ Backward compatibility
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+try:
+    from .common import GATStack2, batched_graph
+except ImportError:          # run as a script
+    from models.common import GATStack2, batched_graph
 
 
 class STGNNFloodModel(nn.Module):
@@ -122,42 +127,8 @@ class STGNNFloodModel(nn.Module):
                 nn.ELU(),
             )
 
-        # ── 4. GATConv layers ──────────────────────────────────────────
-        # Layer 1: expand — hidden → hidden × heads (concat=True)
-        self.gat1 = GATConv(
-            in_channels=hidden,
-            out_channels=hidden,
-            heads=gat_heads,
-            concat=True,
-            dropout=dropout,
-            edge_dim=f_edge,
-        )
-        self.norm1 = nn.LayerNorm(hidden * gat_heads)
-        self.res1  = nn.Linear(hidden, hidden * gat_heads, bias=False)
-
-        # Layer 2: compress — hidden×heads → hidden (concat=False averages)
-        self.gat2 = GATConv(
-            in_channels=hidden * gat_heads,
-            out_channels=hidden,
-            heads=gat_heads,
-            concat=False,
-            dropout=dropout,
-            edge_dim=f_edge,
-        )
-        self.norm2 = nn.LayerNorm(hidden)
-        self.res2  = nn.Linear(hidden * gat_heads, hidden, bias=False)
-
-        # Layer 3: reduce — hidden → hidden//2 (2 heads, concat=False)
-        self.gat3 = GATConv(
-            in_channels=hidden,
-            out_channels=hidden // 2,
-            heads=2,
-            concat=False,
-            dropout=dropout,
-            edge_dim=f_edge,
-        )
-        self.norm3 = nn.LayerNorm(hidden // 2)
-        self.res3  = nn.Linear(hidden, hidden // 2, bias=False)
+        # ── 4. Two-layer GAT stack (shared with every ST-GNN variant) ──
+        self.gat_stack = GATStack2(hidden, gat_heads, f_edge, dropout)
 
         # ── 5. Output head ─────────────────────────────────────────────
         self.head = nn.Sequential(
@@ -229,37 +200,11 @@ class STGNNFloodModel(nn.Module):
         # This reduces CUDA kernel launches from 96 to 3 per forward pass,
         # giving a ~32× throughput improvement for small graphs.
 
-        # Flatten node features: [B, N, hidden] → [B×N, hidden]
-        h_flat = h.reshape(B * N, self.hidden)          # [B×N, hidden]
-
-        # Build batched edge_index: offset each graph by b×N
-        # edge_index: [2, E] → repeated B times with node offsets
-        offsets = torch.arange(B, device=edge_index.device) * N  # [B]
-        # [B, 1] + [1, E] = [B, E] for each side of edge_index
-        src = (edge_index[0].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)  # [B×E]
-        dst = (edge_index[1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1)  # [B×E]
-        batched_edge_index = torch.stack([src, dst], dim=0)      # [2, B×E]
-
-        # Tile edge attributes: [E, F_edge] → [B×E, F_edge]
+        h_flat = h.reshape(B * N, self.hidden)
+        batched_edge_index = batched_graph(edge_index, B, N)
         batched_edge_attr = edge_attr.unsqueeze(0).expand(
-            B, -1, -1
-        ).reshape(B * edge_attr.shape[0], edge_attr.shape[1])    # [B×E, F_edge]
-
-        # Three GATConv layers on the full batched graph
-        h1 = F.elu(self.norm1(
-            self.gat1(h_flat, batched_edge_index, batched_edge_attr)
-            + self.res1(h_flat)
-        ))                                                         # [B×N, hidden×heads]
-
-        h2 = F.elu(self.norm2(
-            self.gat2(h1, batched_edge_index, batched_edge_attr)
-            + self.res2(h1)
-        ))                                                         # [B×N, hidden]
-
-        h3 = F.elu(self.norm3(
-            self.gat3(h2, batched_edge_index, batched_edge_attr)
-            + self.res3(h2)
-        ))                                                         # [B×N, hidden//2]
+            B, -1, -1).reshape(B * edge_attr.shape[0], edge_attr.shape[1])
+        h3 = self.gat_stack(h_flat, batched_edge_index, batched_edge_attr)
 
         # Reshape back to [B, N, hidden//2]
         h_graph = h3.reshape(B, N, self.hidden // 2)

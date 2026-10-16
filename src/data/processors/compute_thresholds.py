@@ -44,6 +44,10 @@ The first and last calendar years in the record are often partial (e.g. dataset
 starting April 2022 means Jan-Mar 2022 is missing). The script flags partial
 years and excludes them from amax calculations by default (safe=True).
 
+NOTE (revision audit): this script computes FULL-RECORD statistics and is
+superseded for model inputs by src/data/compute_static_attributes.py
+(training period only).
+
 Usage
 ─────
   python compute_thresholds.py                          # reads combined CSV, prints table
@@ -242,7 +246,7 @@ def main():
         for s in cfg["subsets"]["lee_full"]["water_level_stations"]:
             station_names[s["ref"]] = s["name"]
 
-    df     = load_data(args.data)
+    df     = load_data(args.dataset)   # was args.data (AttributeError)
     result = compute_thresholds(df, min_year_frac=args.min_completeness)
     print_table(result, station_names)
 

@@ -110,8 +110,20 @@ def find_bridge_backwater_pairs(nd: pd.DataFrame, ed: pd.DataFrame) -> list[dict
     bridge_candidates = nd.loc[bridge_mask, "node_idx"].tolist()
 
     pairs = []
+    # REVISION AUDIT: (1) uphill reverse-duplicate edges are removed first
+    # (utils/graph_checks.py) so a downstream gauge can no longer be taken
+    # as a bridge's "upstream" neighbour; (2) the upstream neighbour is the
+    # NEAREST one along the river (minimum river_dist_km). The previous
+    # `.iloc[0]` picked whichever edge came first in edges.csv, which for
+    # Macroom Town Bridge is Ballymakera, 41.6 km upstream, instead of
+    # Killaclug, 4.2 km upstream.
+    import sys as _sys
+    from pathlib import Path as _P
+    _sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
+    from utils.graph_checks import river_edges
+    ed = river_edges(ed)
     for cand in bridge_candidates:
-        upstream_edges = ed[ed["dst_idx"] == cand]
+        upstream_edges = ed[ed["dst_idx"] == cand].sort_values("river_dist_km")
         if upstream_edges.empty:
             continue
         up_idx = int(upstream_edges.iloc[0]["src_idx"])
